@@ -50,64 +50,106 @@ jobs:
     permissions:
       contents: write
       actions: write
+    env:
+      LC_ALL: C.UTF-8
+      LANG: C.UTF-8
 
     steps:
-      - name: 📥 Download Project ZIP
+      - name: Download Project ZIP
         run: |
-          echo "📥 Mengunduh project dari Release..."
-          echo "🔗 URL: ${{ inputs.zip_url }}"
+          echo "=== Download Project ZIP ==="
+          echo "URL: ${{ inputs.zip_url }}"
+          echo "Tag: ${{ inputs.tag }}"
 
-          # Download with auth header for private repos, follow redirects
+          # Step 1: Download with auth + retry
+          echo "[1/4] Downloading..."
           HTTP_CODE=$(curl -sL -w "%{http_code}" -o project.zip \
+            --retry 3 --retry-delay 5 --retry-connrefused \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/octet-stream" \
             "${{ inputs.zip_url }}")
 
+          echo "HTTP Status: $HTTP_CODE"
+
           if [ "$HTTP_CODE" -ne 200 ]; then
-            echo "❌ Gagal mengunduh ZIP! HTTP Status: $HTTP_CODE"
-            echo "💡 Kemungkinan: URL expired, release belum publish, atau auth gagal."
-            echo "📋 Cek apakah URL mengarah ke file ZIP langsung (bukan halaman HTML)."
-            # Try to show what was downloaded
+            echo "ERROR: Download failed! HTTP $HTTP_CODE"
+            echo "Possible causes: URL expired, release not published, or auth failed."
             if [ -f project.zip ]; then
               FILE_TYPE=$(file project.zip 2>/dev/null || echo "unknown")
-              echo "📋 Tipe file: $FILE_TYPE"
+              echo "File type: $FILE_TYPE"
               if echo "$FILE_TYPE" | grep -qi "html\|text"; then
-                echo "⚠️ File yang diunduh bukan ZIP! Kemungkinan halaman HTML."
-                echo "📋 5 baris pertama:"
+                echo "Downloaded file is NOT a ZIP - likely an HTML page."
                 head -5 project.zip 2>/dev/null || true
               fi
             fi
             exit 1
           fi
 
+          # Step 2: Verify file exists and is not empty
+          echo "[2/4] Verifying file..."
           if [ ! -f project.zip ] || [ ! -s project.zip ]; then
-            echo "❌ File ZIP kosong atau tidak ditemukan!"
+            echo "ERROR: ZIP file is empty or missing!"
             exit 1
           fi
 
-          # Verify it's actually a ZIP file
-          FILE_TYPE=$(file project.zip 2>/dev/null || echo "unknown")
-          echo "📋 Tipe file: $FILE_TYPE"
-          if ! echo "$FILE_TYPE" | grep -qi "zip\|archive"; then
-            echo "❌ File yang diunduh bukan arsip ZIP!"
-            echo "💡 Kemungkinan URL salah atau mengarah ke halaman HTML."
-            echo "📋 5 baris pertama:"
+          FILE_SIZE=$(stat -c%s project.zip 2>/dev/null || echo "0")
+          echo "File size: $FILE_SIZE bytes"
+
+          # Step 3: Verify ZIP magic bytes (PK header = 50 4B)
+          echo "[3/4] Checking ZIP magic bytes..."
+          MAGIC=$(od -A n -t x1 -N 4 project.zip 2>/dev/null | tr -d ' ')
+          echo "Magic bytes: $MAGIC"
+          if ! echo "$MAGIC" | grep -qi "^504b"; then
+            echo "ERROR: Not a valid ZIP file! (Missing PK magic header)"
+            echo "First 16 bytes (hex):"
+            od -A n -t x1 -N 16 project.zip 2>/dev/null || true
+            echo "First 5 lines (text):"
             head -5 project.zip 2>/dev/null || true
             exit 1
           fi
 
-          echo "✅ ZIP berhasil diunduh ($(du -sh project.zip | cut -f1))"
+          # Step 4: Verify with file command
+          echo "[4/4] File type check..."
+          FILE_TYPE=$(file project.zip 2>/dev/null || echo "unknown")
+          echo "File type: $FILE_TYPE"
+          if ! echo "$FILE_TYPE" | grep -qi "zip\|archive"; then
+            echo "WARN: file command doesn't recognize as ZIP, but magic bytes OK. Continuing..."
+          fi
 
-      - name: 📂 Extract Project
+          echo "SUCCESS: ZIP downloaded ($(du -sh project.zip | cut -f1))"
+
+      - name: Extract Project
         run: |
+          echo "=== Extract Project ==="
+
+          # Verify ZIP integrity before extracting
+          echo "Testing ZIP integrity..."
+          if ! unzip -t project.zip > /dev/null 2>&1; then
+            echo "WARN: ZIP integrity test failed. Attempting repair..."
+            zip -F project.zip --out project_fixed.zip 2>/dev/null || true
+            if [ -f project_fixed.zip ] && [ -s project_fixed.zip ]; then
+              mv project_fixed.zip project.zip
+              echo "ZIP repaired successfully."
+            else
+              rm -f project_fixed.zip
+              echo "ERROR: ZIP is corrupt and cannot be repaired."
+              echo "This usually means the download was incomplete or the file was damaged during upload."
+              exit 1
+            fi
+          fi
+
+          # Extract
           mkdir -p project
           if ! unzip -q project.zip -d project; then
-            echo "❌ Gagal mengekstrak ZIP! File mungkin korup."
-            exit 1
+            echo "ERROR: Failed to extract ZIP!"
+            echo "Trying with unzip -o (overwrite)..."
+            if ! unzip -o project.zip -d project; then
+              echo "ERROR: Extraction still failed. ZIP is likely corrupt."
+              exit 1
+            fi
           fi
 
           # Show what's inside
-          echo "📋 Isi ZIP:"
+          echo "ZIP contents:"
           ls -la project/ | head -20
 
           # Check if it's a Flutter project (handle nested structures)
@@ -117,41 +159,44 @@ jobs:
             INNER=$(find project -maxdepth 3 -name "pubspec.yaml" | head -1)
             if [ -n "$INNER" ]; then
               INNER_DIR=$(dirname "$INNER")
-              echo "✅ Flutter project ditemukan di: $INNER_DIR"
+              echo "Flutter project found at: $INNER_DIR"
               cp -r "$INNER_DIR"/* . 2>/dev/null || true
               cp -r "$INNER_DIR"/.* . 2>/dev/null || true
             else
-              echo "❌ Tidak menemukan pubspec.yaml di dalam ZIP!"
-              echo "💡 Pastikan ZIP berisi project Flutter yang valid."
-              echo "📋 Isi ZIP:"
-              ls -la project/ | head -20
+              echo "ERROR: No pubspec.yaml found in ZIP!"
+              echo "Make sure the ZIP contains a valid Flutter project."
+              echo "ZIP contents:"
+              find project -maxdepth 3 -type f | head -30
               exit 1
             fi
           fi
 
-      - name: ☕ Set up JDK 17
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: 🐦 Setup Flutter
+      - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: 'stable'
+          flutter-version: '3.x'
           channel: 'stable'
+          cache: true
 
-      - name: 💾 Cache Flutter pub-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.pub-cache
-            .dart_tool
-          key: flutter-pub-${{ hashFiles('pubspec.lock') }}-${{ hashFiles('pubspec.yaml') }}
-          restore-keys: |
-            flutter-pub-
+      - name: Verify Flutter Install
+        run: |
+          echo "Flutter path: $(which flutter 2>/dev/null || echo 'NOT FOUND')"
+          if ! command -v flutter &> /dev/null; then
+            echo "ERROR: Flutter not found after setup!"
+            echo "JAVA_HOME: $JAVA_HOME"
+            echo "PATH: $PATH"
+            exit 1
+          fi
+          flutter --version
+          flutter doctor -v || true
 
-      - name: 💾 Cache Gradle
+      - name: Cache Gradle
         uses: actions/cache@v4
         with:
           path: |
@@ -162,46 +207,41 @@ jobs:
           restore-keys: |
             gradle-
 
-      - name: 📋 Flutter Info
-        run: |
-          flutter --version
-          flutter doctor -v || true
-
-      - name: 📦 Get Dependencies
+      - name: Get Dependencies
         run: |
           if [ -f "pubspec.yaml" ]; then
-            flutter pub get || echo "⚠️ pub get gagal, mencoba lanjutkan..."
+            flutter pub get || echo "WARN: pub get failed, trying to continue..."
           else
-            echo "❌ Tidak ada pubspec.yaml! Project bukan Flutter app yang valid."
+            echo "ERROR: No pubspec.yaml! Not a valid Flutter project."
             exit 1
           fi
 
-      - name: 🔧 Patch Android Config
+      - name: Patch Android Config
         run: |
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           if [ -f "$MANIFEST" ]; then
             if [ -n "${{ inputs.app_name }}" ] && [ "${{ inputs.app_name }}" != "MyApp" ]; then
               sed -i "s|android:label=\"[^\"]*\"|android:label=\"${{ inputs.app_name }}\"|g" "$MANIFEST"
-              echo "✅ App name patched: ${{ inputs.app_name }}"
+              echo "App name patched: ${{ inputs.app_name }}"
             fi
           fi
 
-      - name: 🔑 Decode Keystore (if configured)
+      - name: Decode Keystore (if configured)
         if: env.KEYSTORE_BASE64 != ''
         run: |
           echo "$KEYSTORE_BASE64" | base64 --decode > android/app/keystore.jks
-          echo "✅ Keystore decoded"
+          echo "Keystore decoded"
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
 
-      - name: 🏗️ Build APK
+      - name: Build APK
         if: inputs.build_format == 'apk' || inputs.build_format == 'both'
         run: |
           if [ "${{ inputs.build_type }}" = "release" ]; then
-            echo "🚀 Building RELEASE APK..."
+            echo "Building RELEASE APK..."
             flutter build apk --release 2>&1 | tee build_output.txt
           else
-            echo "🐞 Building DEBUG APK..."
+            echo "Building DEBUG APK..."
             flutter build apk --debug 2>&1 | tee build_output.txt
           fi
 
@@ -212,42 +252,42 @@ jobs:
 
           if [ -z "$APK_PATH" ]; then
             echo ""
-            echo "❌ BUILD GAGAL! APK tidak ditemukan di output."
+            echo "BUILD FAILED! APK not found in output."
             echo ""
-            echo "📋 Kemungkinan penyebab:"
-            echo "   • Error di kode Dart (cek error di atas)"
-            echo "   • Dependency belum resolve (cek pubspec.yaml)"
-            echo "   • Konfigurasi Android salah (cek build.gradle)"
-            echo "   • Min SDK version tidak compatible"
+            echo "Possible causes:"
+            echo "  - Dart code error (check errors above)"
+            echo "  - Dependency not resolved (check pubspec.yaml)"
+            echo "  - Android config error (check build.gradle)"
+            echo "  - Min SDK version incompatible"
             echo ""
-            echo "📄 10 baris error terakhir:"
-            grep -i "error\|failed\|exception" build_output.txt | tail -10 || echo "(tidak ada error spesifik)"
+            echo "Last 10 error lines:"
+            grep -i "error\|failed\|exception" build_output.txt 2>/dev/null | tail -10 || echo "(no specific errors found)"
             exit 1
           fi
 
-          echo "✅ APK berhasil: $APK_PATH ($(du -sh "$APK_PATH" | cut -f1))"
+          echo "APK built: $APK_PATH ($(du -sh "$APK_PATH" | cut -f1))"
 
-      - name: 📦 Build AAB (App Bundle)
+      - name: Build AAB (App Bundle)
         if: inputs.build_format == 'aab' || inputs.build_format == 'both'
         run: |
           if [ "${{ inputs.build_type }}" = "release" ]; then
-            echo "📦 Building RELEASE AAB..."
+            echo "Building RELEASE AAB..."
             flutter build appbundle --release 2>&1 | tee build_output_aab.txt
           else
-            echo "📦 Building DEBUG AAB..."
+            echo "Building DEBUG AAB..."
             flutter build appbundle --debug 2>&1 | tee build_output_aab.txt
           fi
 
           AAB_PATH=$(find build/app/outputs/bundle -name "*.aab" 2>/dev/null | head -1)
           if [ -z "$AAB_PATH" ]; then
-            echo "❌ AAB tidak ditemukan!"
-            grep -i "error\|failed\|exception" build_output_aab.txt | tail -10 || echo "(tidak ada error spesifik)"
+            echo "AAB not found!"
+            grep -i "error\|failed\|exception" build_output_aab.txt 2>/dev/null | tail -10 || echo "(no specific errors found)"
             exit 1
           fi
 
-          echo "✅ AAB berhasil: $AAB_PATH ($(du -sh "$AAB_PATH" | cut -f1))"
+          echo "AAB built: $AAB_PATH ($(du -sh "$AAB_PATH" | cut -f1))"
 
-      - name: 📤 Upload APK Artifact
+      - name: Upload APK Artifact
         if: inputs.build_format == 'apk' || inputs.build_format == 'both'
         uses: actions/upload-artifact@v4
         with:
@@ -255,7 +295,7 @@ jobs:
           path: build/app/outputs/flutter-apk/*.apk
           retention-days: 7
 
-      - name: 📤 Upload AAB Artifact
+      - name: Upload AAB Artifact
         if: inputs.build_format == 'aab' || inputs.build_format == 'both'
         uses: actions/upload-artifact@v4
         with:
@@ -263,7 +303,7 @@ jobs:
           path: build/app/outputs/bundle/**/*.aab
           retention-days: 7
 
-      - name: 📱 Send Output to Telegram
+      - name: Send Output to Telegram
         if: inputs.chat_id != '' && inputs.bot_token != ''
         run: |
           BUILD_TYPE="${{ inputs.build_type }}"
@@ -275,11 +315,12 @@ jobs:
             APK=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1)
             if [ -n "$APK" ]; then
               SIZE=$(du -sh "$APK" | cut -f1)
+              CAPTION=$(printf 'APK Build Selesai!\n\nApp: %s\nTipe: %s\nSize: %s\n\nby Deruzuan Dev' "$APP_NAME" "$BUILD_TYPE" "$SIZE")
               curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendDocument" \
                 -F chat_id="${{ inputs.chat_id }}" \
                 -F document=@"$APK" \
                 -F parse_mode="HTML" \
-                -F caption="✅ <b>APK Build Selesai!</b>%0A%0A🏷️ <b>App:</b> ${APP_NAME}%0A🔨 <b>Tipe:</b> <code>${BUILD_TYPE}</code>%0A📁 <b>Size:</b> <code>${SIZE}</code>%0A%0A⚡ by Deruzuan Dev"
+                --form-string caption="$CAPTION"
             fi
           fi
 
@@ -288,27 +329,49 @@ jobs:
             AAB=$(find build/app/outputs/bundle -name "*.aab" 2>/dev/null | head -1)
             if [ -n "$AAB" ]; then
               SIZE=$(du -sh "$AAB" | cut -f1)
+              CAPTION=$(printf 'AAB Build Selesai!\n\nApp: %s\nTipe: %s\nSize: %s\n\nby Deruzuan Dev' "$APP_NAME" "$BUILD_TYPE" "$SIZE")
               curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendDocument" \
                 -F chat_id="${{ inputs.chat_id }}" \
                 -F document=@"$AAB" \
                 -F parse_mode="HTML" \
-                -F caption="✅ <b>AAB Build Selesai!</b>%0A%0A🏷️ <b>App:</b> ${APP_NAME}%0A🔨 <b>Tipe:</b> <code>${BUILD_TYPE}</code>%0A📁 <b>Size:</b> <code>${SIZE}</code>%0A%0A⚡ by Deruzuan Dev"
+                --form-string caption="$CAPTION"
             fi
           fi
 
-      - name: ❌ Notify Failure
+      - name: Notify Failure
         if: failure()
         run: |
+          # Collect error summary from available log files
           ERROR_SUMMARY="Build gagal"
           if [ -f build_output.txt ]; then
-            ERROR_SUMMARY=$(grep -i "error\|failed\|exception" build_output.txt | head -5 | tr '\n' ' ')
-          elif [ -f build_output_aab.txt ]; then
-            ERROR_SUMMARY=$(grep -i "error\|failed\|exception" build_output_aab.txt | head -5 | tr '\n' ' ')
+            ERROR_SUMMARY=$(grep -i "error\|failed\|exception" build_output.txt 2>/dev/null | head -5 | tr '\n' ' ')
+            [ -z "$ERROR_SUMMARY" ] && ERROR_SUMMARY="Build gagal (no specific error in APK log)"
+          fi
+          if [ -z "$ERROR_SUMMARY" ] || [ "$ERROR_SUMMARY" = "Build gagal" ]; then
+            if [ -f build_output_aab.txt ]; then
+              ERROR_SUMMARY=$(grep -i "error\|failed\|exception" build_output_aab.txt 2>/dev/null | head -5 | tr '\n' ' ')
+              [ -z "$ERROR_SUMMARY" ] && ERROR_SUMMARY="Build gagal (no specific error in AAB log)"
+            fi
           fi
 
-          if [ "${{ inputs.chat_id }}" != "" ] && [ "${{ inputs.bot_token }}" != "" ]; then
-            curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendMessage" \
-              -d chat_id="${{ inputs.chat_id }}" \
-              -d parse_mode="HTML" \
-              -d text="❌ <b>Build Gagal!</b>%0A%0A🏷️ App: <code>${{ inputs.app_name }}</code>%0A🔨 Tipe: <code>${{ inputs.build_type }}</code>%0A📋 Error: <code>${ERROR_SUMMARY}</code>"
+          # Also check if it's an early failure (download/extract)
+          if [ ! -f build_output.txt ] && [ ! -f build_output_aab.txt ]; then
+            ERROR_SUMMARY="Build gagal di tahap awal (download/extract/project setup). Cek workflow log untuk detail."
           fi
+
+          # Truncate error summary to avoid Telegram API limits
+          ERROR_SUMMARY=$(echo "$ERROR_SUMMARY" | cut -c1-500)
+
+          if [ "${{ inputs.chat_id }}" != "" ] && [ "${{ inputs.bot_token }}" != "" ]; then
+            # Build notification message safely (avoid emoji encoding issues in curl -d)
+            # Use printf + --data-urlencode for proper UTF-8 handling
+            MSG=$(printf 'Build Gagal!\n\nApp: %s\nTipe: %s\nError: %s' "${{ inputs.app_name }}" "${{ inputs.build_type }}" "$ERROR_SUMMARY")
+            curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendMessage" \
+              --data-urlencode "chat_id=${{ inputs.chat_id }}" \
+              --data-urlencode "parse_mode=HTML" \
+              --data-urlencode "text=$MSG"
+          fi
+
+          # Always output to workflow log
+          echo "BUILD FAILED"
+          echo "Error summary: $ERROR_SUMMARY"
