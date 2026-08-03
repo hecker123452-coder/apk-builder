@@ -1,24 +1,14 @@
-name: Build Native APK - Panel
+name: Deruzuan Dev Build APK
 
 on:
   workflow_dispatch:
     inputs:
-      app_name:
-        description: 'Nama Aplikasi'
+      zip_url:
+        description: 'URL ZIP project Flutter (dari GitHub Release)'
         required: true
-        default: 'SyncXxX'
-      package_name:
-        description: 'Package Name (com.xxx.xxx)'
+      tag:
+        description: 'Build tag / identifier'
         required: true
-        default: 'com.example.app'
-      version_name:
-        description: 'Version Name'
-        required: true
-        default: '1.0.0'
-      version_code:
-        description: 'Version Code (angka)'
-        required: true
-        default: '1'
       build_type:
         description: 'Build Type'
         required: true
@@ -27,122 +17,190 @@ on:
         options:
           - release
           - debug
+      app_name:
+        description: 'App Name (optional)'
+        required: false
+        default: 'MyApp'
+      icon_url:
+        description: 'Icon URL (optional, untuk web2apk)'
+        required: false
+        default: ''
+      is_web2apk:
+        description: 'Is Web2APK build?'
+        required: false
+        default: 'false'
       chat_id:
         description: 'Telegram Chat ID'
-        required: true
+        required: false
+        default: ''
       bot_token:
         description: 'Telegram Bot Token'
-        required: true
+        required: false
+        default: ''
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       actions: write
 
     steps:
-      - name: Notify Start
+      - name: 📥 Download Project ZIP
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendMessage" \
-            -d chat_id="${{ inputs.chat_id }}" \
-            -d parse_mode="HTML" \
-            -d text="⏳ <b>Build dimulai!</b>%0A%0A🏷️ App: <code>${{ inputs.app_name }}</code>%0A📦 Package: <code>${{ inputs.package_name }}</code>%0A🔢 Versi: <code>${{ inputs.version_name }}</code>+<code>${{ inputs.version_code }}</code>%0A🔨 Tipe: <code>${{ inputs.build_type }}</code>"
+          echo "📥 Mengunduh project dari Release..."
+          curl -sL -o project.zip "${{ inputs.zip_url }}"
+          if [ ! -f project.zip ] || [ ! -s project.zip ]; then
+            echo "❌ Gagal mengunduh ZIP! File kosong atau tidak ditemukan."
+            echo "💡 Kemungkinan: Release belum publish, atau URL expired."
+            exit 1
+          fi
+          echo "✅ ZIP berhasil diunduh ($(du -sh project.zip | cut -f1))"
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: 📂 Extract Project
+        run: |
+          mkdir -p project
+          unzip -q project.zip -d project
+          echo "📦 Isi project:"
+          ls -la project/ | head -20
 
-      - name: Set up JDK 17
+          # Check if it's a Flutter project
+          if [ -f "project/pubspec.yaml" ]; then
+            echo "✅ Flutter project terdeteksi"
+            cd project
+          elif [ -f "project/android" ] || [ -d "project/android" ]; then
+            echo "✅ Project Android terdeteksi"
+            cd project
+          else
+            # Check nested structure
+            INNER=$(find project -maxdepth 2 -name "pubspec.yaml" | head -1)
+            if [ -n "$INNER" ]; then
+              INNER_DIR=$(dirname "$INNER")
+              echo "✅ Flutter project ditemukan di: $INNER_DIR"
+              cp -r "$INNER_DIR"/* . 2>/dev/null || true
+              cp -r "$INNER_DIR"/.* . 2>/dev/null || true
+            else
+              echo "⚠️ Tidak menemukan pubspec.yaml, mencoba lanjutkan..."
+              cd project
+            fi
+          fi
+
+      - name: ☕ Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: 🐦 Setup Flutter
+        uses: subosito/flutter-action@v2
         with:
-          python-version: '3.11'
+          flutter-version: 'stable'
+          channel: 'stable'
 
-      - name: Install Pillow
-        run: pip install Pillow
-
-      - name: Generate App Icons
-        run: python3 generate_icons.py
-
-      - name: Patch AndroidManifest.xml
+      - name: 📋 Flutter Info
         run: |
+          flutter --version
+          flutter doctor -v || true
+
+      - name: 📦 Get Dependencies
+        run: |
+          if [ -f "pubspec.yaml" ]; then
+            flutter pub get || echo "⚠️ pub get gagal, mencoba lanjutkan..."
+          else
+            echo "❌ Tidak ada pubspec.yaml! Project bukan Flutter app yang valid."
+            echo "💡 Pastikan ZIP berisi project Flutter yang lengkap."
+            exit 1
+          fi
+
+      - name: 🔧 Patch Android Config
+        run: |
+          # Patch AndroidManifest.xml
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           if [ -f "$MANIFEST" ]; then
-            OLD_PKG=$(grep -oP '(?<=package=")[^"]+' "$MANIFEST" | head -1)
-            if [ -n "$OLD_PKG" ]; then
-              sed -i "s|$OLD_PKG|${{ inputs.package_name }}|g" "$MANIFEST"
-              echo "Package: $OLD_PKG -> ${{ inputs.package_name }}"
+            if [ -n "${{ inputs.app_name }}" ] && [ "${{ inputs.app_name }}" != "MyApp" ]; then
+              sed -i "s|android:label=\"[^\"]*\"|android:label=\"${{ inputs.app_name }}\"|g" "$MANIFEST"
+              echo "✅ App name patched: ${{ inputs.app_name }}"
             fi
-            sed -i "s|android:label=\"[^\"]*\"|android:label=\"${{ inputs.app_name }}\"|g" "$MANIFEST"
           fi
 
-      - name: Patch build.gradle
-        run: |
+          # Patch build.gradle if needed
           GRADLE="android/app/build.gradle"
+          if [ ! -f "$GRADLE" ]; then
+            GRADLE="android/app/build.gradle.kts"
+          fi
           if [ -f "$GRADLE" ]; then
-            sed -i "s|applicationId \"[^\"]*\"|applicationId \"${{ inputs.package_name }}\"|" "$GRADLE"
-            sed -i "s|versionCode [0-9]*|versionCode ${{ inputs.version_code }}|" "$GRADLE"
-            sed -i "s|versionName \"[^\"]*\"|versionName \"${{ inputs.version_name }}\"|" "$GRADLE"
+            echo "✅ build.gradle ditemukan"
           fi
 
-      - name: Patch strings.xml
+      - name: 🏗️ Build APK
         run: |
-          STRINGS="android/app/src/main/res/values/strings.xml"
-          if [ -f "$STRINGS" ]; then
-            sed -i "s|<string name=\"app_name\">[^<]*</string>|<string name=\"app_name\">${{ inputs.app_name }}</string>|g" "$STRINGS"
-          fi
-
-      - name: Setup Gradle Wrapper
-        run: |
-          curl -L -o android/gradle/wrapper/gradle-wrapper.jar \
-            "https://github.com/gradle/gradle/raw/v8.4.0/gradle/wrapper/gradle-wrapper.jar"
-          chmod +x android/gradlew
-
-      - name: Build APK
-        run: |
-          cd android
           if [ "${{ inputs.build_type }}" = "release" ]; then
-            ./gradlew assembleRelease --no-daemon
+            echo "🚀 Building RELEASE APK..."
+            flutter build apk --release 2>&1 | tee build_output.txt
           else
-            ./gradlew assembleDebug --no-daemon
+            echo "🐞 Building DEBUG APK..."
+            flutter build apk --debug 2>&1 | tee build_output.txt
           fi
 
-      - name: Rename APK
-        run: |
-          mkdir -p output
-          if [ "${{ inputs.build_type }}" = "release" ]; then
-            APK_SRC="android/app/build/outputs/apk/release"
-          else
-            APK_SRC="android/app/build/outputs/apk/debug"
+          # Check if APK was built
+          APK_PATH=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1)
+          if [ -z "$APK_PATH" ]; then
+            APK_PATH=$(find build/app/outputs/apk -name "*.apk" 2>/dev/null | head -1)
           fi
-          find "$APK_SRC" -name "*.apk" | head -1 | xargs -I{} cp {} output/${{ inputs.app_name }}_v${{ inputs.version_name }}_${{ inputs.build_type }}.apk
 
-      - name: Upload APK Artifact
+          if [ -z "$APK_PATH" ]; then
+            echo ""
+            echo "❌ BUILD GAGAL! APK tidak ditemukan di output."
+            echo ""
+            echo "📋 Kemungkinan penyebab:"
+            echo "   • Error di kode Dart (cek error di atas)"
+            echo "   • Dependency belum resolve (cek pubspec.yaml)"
+            echo "   • Konfigurasi Android salah (cek build.gradle)"
+            echo "   • Min SDK version tidak compatible"
+            echo ""
+            echo "📄 10 baris error terakhir:"
+            grep -i "error\|failed\|exception" build_output.txt | tail -10 || echo "(tidak ada error spesifik)"
+            exit 1
+          fi
+
+          echo "✅ APK berhasil dibuat: $APK_PATH ($(du -sh "$APK_PATH" | cut -f1))"
+
+      - name: 📤 Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.app_name }}-v${{ inputs.version_name }}-${{ inputs.build_type }}
-          path: output/*.apk
-          retention-days: 30
+          name: apk-output
+          path: build/app/outputs/flutter-apk/*.apk
+          retention-days: 7
 
-      - name: Send APK to Telegram
+      - name: 📱 Send APK to Telegram
+        if: inputs.chat_id != '' && inputs.bot_token != ''
         run: |
-          APK=$(find output -name "*.apk" | head -1)
+          APK=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            APK=$(find build/app/outputs/apk -name "*.apk" 2>/dev/null | head -1)
+          fi
           SIZE=$(du -sh "$APK" | cut -f1)
+          BUILD_TYPE="${{ inputs.build_type }}"
+          APP_NAME="${{ inputs.app_name }}"
+
           curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendDocument" \
             -F chat_id="${{ inputs.chat_id }}" \
             -F document=@"$APK" \
             -F parse_mode="HTML" \
-            -F caption="✅ <b>Build Selesai!</b>%0A%0A🏷️ <b>App:</b> ${{ inputs.app_name }}%0A📦 <b>Package:</b> <code>${{ inputs.package_name }}</code>%0A🔢 <b>Versi:</b> <code>${{ inputs.version_name }}</code> (code: ${{ inputs.version_code }})%0A🔨 <b>Tipe:</b> <code>${{ inputs.build_type }}</code>%0A📁 <b>Size:</b> <code>$SIZE</code>%0A%0A⚡ by @Zyvarno1"
+            -F caption="✅ <b>Build Selesai!</b>%0A%0A🏷️ <b>App:</b> ${APP_NAME}%0A🔨 <b>Tipe:</b> <code>${BUILD_TYPE}</code>%0A📁 <b>Size:</b> <code>${SIZE}</code>%0A%0A⚡ by Deruzuan Dev"
 
-      - name: Notify Failure
+      - name: ❌ Notify Failure
         if: failure()
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendMessage" \
-            -d chat_id="${{ inputs.chat_id }}" \
-            -d parse_mode="HTML" \
-            -d text="❌ <b>Build Gagal!</b>%0A%0A🏷️ App: <code>${{ inputs.app_name }}</code>%0A📦 Package: <code>${{ inputs.package_name }}</code>%0A%0A🔗 https://github.com/${{ github.repository }}/actions"
+          # Collect error details
+          ERROR_SUMMARY="Build gagal"
+          if [ -f build_output.txt ]; then
+            ERROR_SUMMARY=$(grep -i "error\|failed\|exception" build_output.txt | head -5 | tr '\n' ' ')
+          fi
+
+          if [ "${{ inputs.chat_id }}" != "" ] && [ "${{ inputs.bot_token }}" != "" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendMessage" \
+              -d chat_id="${{ inputs.chat_id }}" \
+              -d parse_mode="HTML" \
+              -d text="❌ <b>Build Gagal!</b>%0A%0A🏷️ App: <code>${{ inputs.app_name }}</code>%0A🔨 Tipe: <code>${{ inputs.build_type }}</code>%0A📋 Error: <code>${ERROR_SUMMARY}</code>"
+          fi
