@@ -55,24 +55,66 @@ jobs:
       - name: 📥 Download Project ZIP
         run: |
           echo "📥 Mengunduh project dari Release..."
-          curl -sL -o project.zip "${{ inputs.zip_url }}"
-          if [ ! -f project.zip ] || [ ! -s project.zip ]; then
-            echo "❌ Gagal mengunduh ZIP! File kosong atau tidak ditemukan."
-            echo "💡 Kemungkinan: Release belum publish, atau URL expired."
+          echo "🔗 URL: ${{ inputs.zip_url }}"
+
+          # Download with auth header for private repos, follow redirects
+          HTTP_CODE=$(curl -sL -w "%{http_code}" -o project.zip \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/octet-stream" \
+            "${{ inputs.zip_url }}")
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "❌ Gagal mengunduh ZIP! HTTP Status: $HTTP_CODE"
+            echo "💡 Kemungkinan: URL expired, release belum publish, atau auth gagal."
+            echo "📋 Cek apakah URL mengarah ke file ZIP langsung (bukan halaman HTML)."
+            # Try to show what was downloaded
+            if [ -f project.zip ]; then
+              FILE_TYPE=$(file project.zip 2>/dev/null || echo "unknown")
+              echo "📋 Tipe file: $FILE_TYPE"
+              if echo "$FILE_TYPE" | grep -qi "html\|text"; then
+                echo "⚠️ File yang diunduh bukan ZIP! Kemungkinan halaman HTML."
+                echo "📋 5 baris pertama:"
+                head -5 project.zip 2>/dev/null || true
+              fi
+            fi
             exit 1
           fi
+
+          if [ ! -f project.zip ] || [ ! -s project.zip ]; then
+            echo "❌ File ZIP kosong atau tidak ditemukan!"
+            exit 1
+          fi
+
+          # Verify it's actually a ZIP file
+          FILE_TYPE=$(file project.zip 2>/dev/null || echo "unknown")
+          echo "📋 Tipe file: $FILE_TYPE"
+          if ! echo "$FILE_TYPE" | grep -qi "zip\|archive"; then
+            echo "❌ File yang diunduh bukan arsip ZIP!"
+            echo "💡 Kemungkinan URL salah atau mengarah ke halaman HTML."
+            echo "📋 5 baris pertama:"
+            head -5 project.zip 2>/dev/null || true
+            exit 1
+          fi
+
           echo "✅ ZIP berhasil diunduh ($(du -sh project.zip | cut -f1))"
 
       - name: 📂 Extract Project
         run: |
           mkdir -p project
-          unzip -q project.zip -d project
+          if ! unzip -q project.zip -d project; then
+            echo "❌ Gagal mengekstrak ZIP! File mungkin korup."
+            exit 1
+          fi
+
+          # Show what's inside
+          echo "📋 Isi ZIP:"
+          ls -la project/ | head -20
 
           # Check if it's a Flutter project (handle nested structures)
           if [ -f "project/pubspec.yaml" ]; then
             cd project
           else
-            INNER=$(find project -maxdepth 2 -name "pubspec.yaml" | head -1)
+            INNER=$(find project -maxdepth 3 -name "pubspec.yaml" | head -1)
             if [ -n "$INNER" ]; then
               INNER_DIR=$(dirname "$INNER")
               echo "✅ Flutter project ditemukan di: $INNER_DIR"
