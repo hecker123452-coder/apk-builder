@@ -42,6 +42,10 @@ on:
         description: 'Telegram Bot Token'
         required: false
         default: ''
+      flutter_version:
+        description: 'Flutter SDK version (e.g. 3.22.3, 3.24.5, 3.x)'
+        required: false
+        default: '3.22.3'
 
 jobs:
   build:
@@ -203,7 +207,7 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.x'
+          flutter-version: '${{ inputs.flutter_version }}'
           channel: 'stable'
           cache: true
 
@@ -237,6 +241,34 @@ jobs:
           else
             echo "ERROR: No pubspec.yaml! Not a valid Flutter project."
             exit 1
+          fi
+
+      - name: Auto-fix Incompatible Packages
+        run: |
+          echo "=== Auto-fix Incompatible Packages ==="
+          # font_awesome_flutter <10.15.0 breaks on Flutter 3.27+ (IconData is final class)
+          FLUTTER_VER=$(flutter --version 2>/dev/null | head -1 | grep -oP '\d+\.\d+\.\d+' | head -1)
+          FLUTTER_MAJOR=$(echo "$FLUTTER_VER" | cut -d. -f1)
+          FLUTTER_MINOR=$(echo "$FLUTTER_VER" | cut -d. -f2)
+          echo "Detected Flutter: $FLUTTER_VER (major=$FLUTTER_MAJOR, minor=$FLUTTER_MINOR)"
+
+          if [ "$FLUTTER_MAJOR" -ge 3 ] && [ "$FLUTTER_MINOR" -ge 27 ]; then
+            echo "Flutter 3.27+ detected. Checking for incompatible packages..."
+            # Auto-upgrade font_awesome_flutter to compatible version
+            if grep -q 'font_awesome_flutter' pubspec.yaml; then
+              FAF_VER=$(grep 'font_awesome_flutter' pubspec.yaml | grep -oP '\d+\.\d+\.\d+' | head -1)
+              if [ -n "$FAF_VER" ]; then
+                FAF_MAJOR=$(echo "$FAF_VER" | cut -d. -f1)
+                FAF_MINOR=$(echo "$FAF_VER" | cut -d. -f2)
+                if [ "$FAF_MAJOR" -eq 10 ] && [ "$FAF_MINOR" -lt 15 ]; then
+                  echo "font_awesome_flutter $FAF_VER is incompatible with Flutter 3.27+. Upgrading to ^10.15.0..."
+                  sed -i 's/font_awesome_flutter:[^]*$/font_awesome_flutter: \^10.15.0/' pubspec.yaml
+                  flutter pub get || echo "WARN: pub get after auto-fix failed"
+                fi
+              fi
+            fi
+          else
+            echo "Flutter version is compatible, no auto-fix needed."
           fi
 
       - name: Patch Android Config
