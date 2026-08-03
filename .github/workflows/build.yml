@@ -1,0 +1,148 @@
+name: Build Native APK - Panel
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: 'Nama Aplikasi'
+        required: true
+        default: 'SyncXxX'
+      package_name:
+        description: 'Package Name (com.xxx.xxx)'
+        required: true
+        default: 'com.example.app'
+      version_name:
+        description: 'Version Name'
+        required: true
+        default: '1.0.0'
+      version_code:
+        description: 'Version Code (angka)'
+        required: true
+        default: '1'
+      build_type:
+        description: 'Build Type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      chat_id:
+        description: 'Telegram Chat ID'
+        required: true
+      bot_token:
+        description: 'Telegram Bot Token'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      - name: Notify Start
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendMessage" \
+            -d chat_id="${{ inputs.chat_id }}" \
+            -d parse_mode="HTML" \
+            -d text="⏳ <b>Build dimulai!</b>%0A%0A🏷️ App: <code>${{ inputs.app_name }}</code>%0A📦 Package: <code>${{ inputs.package_name }}</code>%0A🔢 Versi: <code>${{ inputs.version_name }}</code>+<code>${{ inputs.version_code }}</code>%0A🔨 Tipe: <code>${{ inputs.build_type }}</code>"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Pillow
+        run: pip install Pillow
+
+      - name: Generate App Icons
+        run: python3 generate_icons.py
+
+      - name: Patch AndroidManifest.xml
+        run: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ]; then
+            OLD_PKG=$(grep -oP '(?<=package=")[^"]+' "$MANIFEST" | head -1)
+            if [ -n "$OLD_PKG" ]; then
+              sed -i "s|$OLD_PKG|${{ inputs.package_name }}|g" "$MANIFEST"
+              echo "Package: $OLD_PKG -> ${{ inputs.package_name }}"
+            fi
+            sed -i "s|android:label=\"[^\"]*\"|android:label=\"${{ inputs.app_name }}\"|g" "$MANIFEST"
+          fi
+
+      - name: Patch build.gradle
+        run: |
+          GRADLE="android/app/build.gradle"
+          if [ -f "$GRADLE" ]; then
+            sed -i "s|applicationId \"[^\"]*\"|applicationId \"${{ inputs.package_name }}\"|" "$GRADLE"
+            sed -i "s|versionCode [0-9]*|versionCode ${{ inputs.version_code }}|" "$GRADLE"
+            sed -i "s|versionName \"[^\"]*\"|versionName \"${{ inputs.version_name }}\"|" "$GRADLE"
+          fi
+
+      - name: Patch strings.xml
+        run: |
+          STRINGS="android/app/src/main/res/values/strings.xml"
+          if [ -f "$STRINGS" ]; then
+            sed -i "s|<string name=\"app_name\">[^<]*</string>|<string name=\"app_name\">${{ inputs.app_name }}</string>|g" "$STRINGS"
+          fi
+
+      - name: Setup Gradle Wrapper
+        run: |
+          curl -L -o android/gradle/wrapper/gradle-wrapper.jar \
+            "https://github.com/gradle/gradle/raw/v8.4.0/gradle/wrapper/gradle-wrapper.jar"
+          chmod +x android/gradlew
+
+      - name: Build APK
+        run: |
+          cd android
+          if [ "${{ inputs.build_type }}" = "release" ]; then
+            ./gradlew assembleRelease --no-daemon
+          else
+            ./gradlew assembleDebug --no-daemon
+          fi
+
+      - name: Rename APK
+        run: |
+          mkdir -p output
+          if [ "${{ inputs.build_type }}" = "release" ]; then
+            APK_SRC="android/app/build/outputs/apk/release"
+          else
+            APK_SRC="android/app/build/outputs/apk/debug"
+          fi
+          find "$APK_SRC" -name "*.apk" | head -1 | xargs -I{} cp {} output/${{ inputs.app_name }}_v${{ inputs.version_name }}_${{ inputs.build_type }}.apk
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.app_name }}-v${{ inputs.version_name }}-${{ inputs.build_type }}
+          path: output/*.apk
+          retention-days: 30
+
+      - name: Send APK to Telegram
+        run: |
+          APK=$(find output -name "*.apk" | head -1)
+          SIZE=$(du -sh "$APK" | cut -f1)
+          curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendDocument" \
+            -F chat_id="${{ inputs.chat_id }}" \
+            -F document=@"$APK" \
+            -F parse_mode="HTML" \
+            -F caption="✅ <b>Build Selesai!</b>%0A%0A🏷️ <b>App:</b> ${{ inputs.app_name }}%0A📦 <b>Package:</b> <code>${{ inputs.package_name }}</code>%0A🔢 <b>Versi:</b> <code>${{ inputs.version_name }}</code> (code: ${{ inputs.version_code }})%0A🔨 <b>Tipe:</b> <code>${{ inputs.build_type }}</code>%0A📁 <b>Size:</b> <code>$SIZE</code>%0A%0A⚡ by @Zyvarno1"
+
+      - name: Notify Failure
+        if: failure()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendMessage" \
+            -d chat_id="${{ inputs.chat_id }}" \
+            -d parse_mode="HTML" \
+            -d text="❌ <b>Build Gagal!</b>%0A%0A🏷️ App: <code>${{ inputs.app_name }}</code>%0A📦 Package: <code>${{ inputs.package_name }}</code>%0A%0A🔗 https://github.com/${{ github.repository }}/actions"
