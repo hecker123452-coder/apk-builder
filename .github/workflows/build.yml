@@ -152,24 +152,47 @@ jobs:
           echo "ZIP contents:"
           ls -la project/ | head -20
 
-          # Check if it's a Flutter project (handle nested structures)
+          # Find Flutter project root and copy ALL files to workspace root
+          # (cd does NOT persist across GitHub Actions steps!)
+          PROJECT_DIR=""
           if [ -f "project/pubspec.yaml" ]; then
-            cd project
+            PROJECT_DIR="project"
           else
             INNER=$(find project -maxdepth 3 -name "pubspec.yaml" | head -1)
             if [ -n "$INNER" ]; then
-              INNER_DIR=$(dirname "$INNER")
-              echo "Flutter project found at: $INNER_DIR"
-              cp -r "$INNER_DIR"/* . 2>/dev/null || true
-              cp -r "$INNER_DIR"/.* . 2>/dev/null || true
-            else
-              echo "ERROR: No pubspec.yaml found in ZIP!"
-              echo "Make sure the ZIP contains a valid Flutter project."
-              echo "ZIP contents:"
-              find project -maxdepth 3 -type f | head -30
-              exit 1
+              PROJECT_DIR=$(dirname "$INNER")
             fi
           fi
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: No pubspec.yaml found in ZIP!"
+            echo "Make sure the ZIP contains a valid Flutter project."
+            echo "ZIP contents:"
+            find project -maxdepth 3 -type f | head -30
+            exit 1
+          fi
+
+          echo "Flutter project found at: $PROJECT_DIR"
+          echo "Copying project files to workspace root..."
+
+          # Copy all files (including hidden like .dart_tool, .packages)
+          rsync -a --remove-source-files "$PROJECT_DIR/" . 2>/dev/null || {
+            # Fallback if rsync not available
+            cp -r "$PROJECT_DIR"/* . 2>/dev/null || true
+            cp -r "$PROJECT_DIR"/.* . 2>/dev/null || true
+          }
+
+          # Verify pubspec.yaml is now in workspace root
+          if [ ! -f "pubspec.yaml" ]; then
+            echo "ERROR: pubspec.yaml not found in workspace after copy!"
+            echo "Workspace contents:"
+            ls -la | head -20
+            exit 1
+          fi
+
+          echo "Project extracted successfully."
+          echo "Workspace contents:"
+          ls -la | head -20
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
