@@ -300,55 +300,96 @@ jobs:
             exit 0
           fi
 
-          echo "Breaking changes in 11.0.0:"
-          echo "  - FaIconData no longer implements IconData"
-          echo "  - FaIcon now strictly requires FaIconData"
-          echo "  - Use FontAwesomeIcons.xxx.data to get IconData"
-          echo "  - .data is a getter (non-const), so remove const on affected lines"
+          echo "Writing Python patcher..."
+          python3 - << 'PYSCRIPT'
+          import os, re
+
+          # Placeholder that won't match FontAwesomeIcons.xxx pattern
+          PH = 'FAARG_DOT_'
+
+          def patch_file(filepath):
+              with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+                  content = f.read()
+              original = content
+
+              # ── Pass 1: Icon(FontAwesomeIcons.xxx → FaIcon(FontAwesomeIcons.xxx
+              content = re.sub(r'\bIcon\(FontAwesomeIcons\.', 'FaIcon(FontAwesomeIcons.', content)
+
+              # ── Pass 2: find.byIcon(FontAwesomeIcons.xxx) → .xxx.data
+              content = re.sub(
+                  r'find\.byIcon\(FontAwesomeIcons\.(\w+)\)',
+                  r'find.byIcon(FontAwesomeIcons.\1.data)', content)
+
+              # ── Pass 3: Add .data to FA refs NOT in FaIcon() first arg
+              # Use placeholder to protect FaIcon first args from .data addition
+              # Step 3a: Replace FaIcon(FontAwesomeIcons.xxx with placeholder
+              content = re.sub(
+                  r'(FaIcon\(\s*)FontAwesomeIcons\.(\w+)',
+                  rf'\1{PH}\2', content)
+              # Step 3b: Replace already .data refs with placeholder
+              content = re.sub(
+                  r'FontAwesomeIcons\.(\w+)\.data',
+                  rf'{PH}\1.data', content)
+              # Step 3c: Add .data to remaining FA refs (unprotected ones)
+              content = re.sub(
+                  r'FontAwesomeIcons\.(\w+)',
+                  r'FontAwesomeIcons.\1.data', content)
+              # Step 3d: Restore placeholders back to FontAwesomeIcons.xxx
+              content = content.replace(PH, 'FontAwesomeIcons.')
+
+              # ── Pass 4: Remove 'const' that breaks with .data (multi-line aware)
+              # .data is a getter → non-const. Find const keywords near FA.data refs and remove.
+              if 'FontAwesomeIcons.' in content:
+                  lines = content.split('\n')
+                  # Mark lines that have FontAwesomeIcons.xxx.data (non-const)
+                  fa_data_lines = set()
+                  for i, line in enumerate(lines):
+                      if re.search(r'FontAwesomeIcons\.\w+\.data', line):
+                          fa_data_lines.add(i)
+                  if fa_data_lines:
+                      # For each FA.data line, search backwards for 'const' keyword
+                      const_removals = set()
+                      for fa_line in fa_data_lines:
+                          for back in range(min(fa_line + 1, 6)):
+                              check_line = fa_line - back
+                              if check_line >= 0 and check_line not in const_removals:
+                                  if re.search(r'\bconst\b', lines[check_line]):
+                                      const_removals.add(check_line)
+                                      break
+                      # Remove const from identified lines
+                      for line_idx in sorted(const_removals, reverse=True):
+                          lines[line_idx] = re.sub(r'\bconst\s+', '', lines[line_idx], count=1)
+                      content = '\n'.join(lines)
+
+              # ── Pass 5: Fix FaIcon(x, ...) where x is NOT a FA ref
+              # These cause "IconData can't be assigned to FaIconData?" errors
+              # Revert FaIcon back to Icon when first arg is not FontAwesomeIcons.xxx
+              content = re.sub(
+                  r'\bFaIcon\((?!FontAwesomeIcons\.)',
+                  'Icon(', content)
+
+              if content != original:
+                  with open(filepath, 'w', encoding='utf-8') as f:
+                      f.write(content)
+                  return True
+              return False
+
+          patched = 0
+          for root, dirs, files in os.walk('lib'):
+              for fname in files:
+                  if fname.endswith('.dart'):
+                      fp = os.path.join(root, fname)
+                      try:
+                          if patch_file(fp):
+                              print(f'  patched: {fp}')
+                              patched += 1
+                      except Exception as e:
+                          print(f'  error: {fp}: {e}')
+          print(f'Total: {patched} files patched')
+          PYSCRIPT
+
           echo ""
-
-          PATCHED=0
-
-          for file in $(find lib -name "*.dart" -type f 2>/dev/null); do
-            BEFORE=$(md5sum "$file" | cut -d' ' -f1)
-
-            # ── Pass 1: Icon(FontAwesomeIcons.xxx → FaIcon(FontAwesomeIcons.xxx
-            # Most common pattern: using Icon widget with FA icons
-            perl -pi -e 's/\bIcon\(FontAwesomeIcons\./FaIcon(FontAwesomeIcons./g' "$file"
-
-            # ── Pass 2: find.byIcon(FontAwesomeIcons.xxx) → add .data
-            perl -pi -e 's/find\.byIcon\(FontAwesomeIcons\.(\w+)\)/find.byIcon(FontAwesomeIcons.\1.data)/g' "$file"
-
-            # ── Pass 3: Add .data to FontAwesomeIcons.xxx not in FaIcon() args
-            # Strategy: mark FaIcon first args, add .data to rest, unmark
-            # Step 3a: Mark FaIcon(FontAwesomeIcons.xxx (first arg)
-            perl -pi -e 's/(FaIcon\(\s*)FontAwesomeIcons\.(\w+)/\1FontAwesomeIcons.\2\x{00}FA\x{00}/g' "$file"
-            # Step 3b: Mark already .data
-            perl -pi -e 's/FontAwesomeIcons\.(\w+)\.data/FontAwesomeIcons.\1\x{00}FA\x{00}.data/g' "$file"
-            # Step 3c: Add .data to remaining FontAwesomeIcons.xxx
-            perl -pi -e 's/FontAwesomeIcons\.(\w+)/FontAwesomeIcons.\1.data/g' "$file"
-            # Step 3d: Remove markers
-            perl -pi -e 's/\x{00}FA\x{00}//g' "$file"
-
-            # ── Pass 4: Remove 'const' keyword on lines with FontAwesomeIcons.xxx.data
-            # .data is a getter (not const), so const expressions break
-            # Remove const before widgets that use FA .data:
-            #   const Icon(FontAwesomeIcons.xxx.data → Icon(FontAwesomeIcons.xxx.data
-            #   const FaIcon(FontAwesomeIcons.xxx → FaIcon(FontAwesomeIcons.xxx (FaIcon arg is fine)
-            #   const Text(...  → keep const (no FA)
-            # Also handle: const [...  lists with FA icons
-            perl -pi -e 's/\bconst\s+(?=[^;]*FontAwesomeIcons\.)/ /g' "$file"
-
-            AFTER=$(md5sum "$file" | cut -d' ' -f1)
-            if [ "$BEFORE" != "$AFTER" ]; then
-              echo "  ✓ $file"
-              PATCHED=$((PATCHED + 1))
-            fi
-          done
-
-          echo ""
-          echo "Total files patched: $PATCHED"
-          if [ "$PATCHED" -gt 0 ]; then
+          if [ "$PATCHED" -gt 0 ] 2>/dev/null; then
             echo "Re-running flutter pub get after source patches..."
             flutter pub get || true
           fi
