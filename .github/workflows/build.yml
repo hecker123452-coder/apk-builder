@@ -43,9 +43,9 @@ on:
         required: false
         default: ''
       flutter_version:
-        description: 'Flutter SDK version (e.g. 3.22.0, 3.24, 3.x)'
+        description: 'Flutter SDK version (internal - do not change)'
         required: false
-        default: '3.24'
+        default: '3.22.0'
 
 jobs:
   build:
@@ -207,9 +207,7 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '${{ inputs.flutter_version }}'
-          channel: 'stable'
-          cache: true
+          flutter-version: '3.22.0'
 
       - name: Verify Flutter Install
         run: |
@@ -243,34 +241,6 @@ jobs:
             exit 1
           fi
 
-      - name: Auto-fix Incompatible Packages
-        run: |
-          echo "=== Auto-fix Incompatible Packages ==="
-          # font_awesome_flutter <10.15.0 breaks on Flutter 3.27+ (IconData is final class)
-          FLUTTER_VER=$(flutter --version 2>/dev/null | head -1 | grep -oP '\d+\.\d+\.\d+' | head -1)
-          FLUTTER_MAJOR=$(echo "$FLUTTER_VER" | cut -d. -f1)
-          FLUTTER_MINOR=$(echo "$FLUTTER_VER" | cut -d. -f2)
-          echo "Detected Flutter: $FLUTTER_VER (major=$FLUTTER_MAJOR, minor=$FLUTTER_MINOR)"
-
-          if [ "$FLUTTER_MAJOR" -ge 3 ] && [ "$FLUTTER_MINOR" -ge 27 ]; then
-            echo "Flutter 3.27+ detected. Checking for incompatible packages..."
-            # Auto-upgrade font_awesome_flutter to compatible version
-            if grep -q 'font_awesome_flutter' pubspec.yaml; then
-              FAF_VER=$(grep 'font_awesome_flutter' pubspec.yaml | grep -oP '\d+\.\d+\.\d+' | head -1)
-              if [ -n "$FAF_VER" ]; then
-                FAF_MAJOR=$(echo "$FAF_VER" | cut -d. -f1)
-                FAF_MINOR=$(echo "$FAF_VER" | cut -d. -f2)
-                if [ "$FAF_MAJOR" -eq 10 ] && [ "$FAF_MINOR" -lt 15 ]; then
-                  echo "font_awesome_flutter $FAF_VER is incompatible with Flutter 3.27+. Upgrading to ^10.15.0..."
-                  sed -i 's/font_awesome_flutter:[^]*$/font_awesome_flutter: \^10.15.0/' pubspec.yaml
-                  flutter pub get || echo "WARN: pub get after auto-fix failed"
-                fi
-              fi
-            fi
-          else
-            echo "Flutter version is compatible, no auto-fix needed."
-          fi
-
       - name: Patch Android Config
         run: |
           MANIFEST="android/app/src/main/AndroidManifest.xml"
@@ -292,6 +262,12 @@ jobs:
       - name: Build APK
         if: inputs.build_format == 'apk' || inputs.build_format == 'both'
         run: |
+          echo "=== Build APK ==="
+          echo "Flutter version: $(flutter --version 2>/dev/null | head -1)"
+          echo "Project dir: $(pwd)"
+          echo "pubspec.yaml exists: $(test -f pubspec.yaml && echo YES || echo NO)"
+          echo ""
+
           if [ "${{ inputs.build_type }}" = "release" ]; then
             echo "Building RELEASE APK..."
             flutter build apk --release 2>&1 | tee build_output.txt
@@ -299,6 +275,7 @@ jobs:
             echo "Building DEBUG APK..."
             flutter build apk --debug 2>&1 | tee build_output.txt
           fi
+          BUILD_EXIT=${PIPESTATUS[0]:-0}
 
           APK_PATH=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1)
           if [ -z "$APK_PATH" ]; then
@@ -307,16 +284,21 @@ jobs:
 
           if [ -z "$APK_PATH" ]; then
             echo ""
-            echo "BUILD FAILED! APK not found in output."
+            echo "=== BUILD FAILED! ==="
             echo ""
-            echo "Possible causes:"
-            echo "  - Dart code error (check errors above)"
-            echo "  - Dependency not resolved (check pubspec.yaml)"
-            echo "  - Android config error (check build.gradle)"
-            echo "  - Min SDK version incompatible"
-            echo ""
-            echo "Last 10 error lines:"
-            grep -i "error\|failed\|exception" build_output.txt 2>/dev/null | tail -10 || echo "(no specific errors found)"
+            if [ -f build_output.txt ] && [ -s build_output.txt ]; then
+              echo "Last 30 lines of build output:"
+              tail -30 build_output.txt
+              echo ""
+              echo "Error lines:"
+              grep -i "error\|failed\|exception" build_output.txt 2>/dev/null | tail -15 || echo "(no specific errors found)"
+            else
+              echo "No build output captured! flutter build may have failed to start."
+              echo "This usually means:"
+              echo "  1. Flutter SDK not properly installed"
+              echo "  2. pubspec.yaml missing or invalid"
+              echo "  3. flutter pub get failed earlier"
+            fi
             exit 1
           fi
 
