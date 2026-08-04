@@ -43,9 +43,9 @@ on:
         required: false
         default: ''
       flutter_version:
-        description: 'Flutter SDK version (e.g. 3.22.3, 3.24.5, 3.x)'
+        description: 'Flutter SDK version (e.g. 3.22.0, 3.24, 3.x)'
         required: false
-        default: '3.22.3'
+        default: '3.24'
 
 jobs:
   build:
