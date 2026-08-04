@@ -207,7 +207,8 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.22.0'
+          channel: 'stable'
+          cache: true
 
       - name: Verify Flutter Install
         run: |
@@ -239,6 +240,44 @@ jobs:
           else
             echo "ERROR: No pubspec.yaml! Not a valid Flutter project."
             exit 1
+          fi
+
+      - name: Auto-fix Incompatible Packages
+        run: |
+          echo "=== Auto-fix Incompatible Packages ==="
+          FLUTTER_VER=$(flutter --version 2>/dev/null | head -1 | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "0.0.0")
+          FLUTTER_MAJOR=$(echo "$FLUTTER_VER" | cut -d. -f1)
+          FLUTTER_MINOR=$(echo "$FLUTTER_VER" | cut -d. -f2)
+          echo "Detected Flutter: $FLUTTER_VER"
+
+          CHANGED=false
+
+          # Fix font_awesome_flutter <10.15.0 (IconData final class in Flutter 3.27+)
+          if [ "$FLUTTER_MAJOR" -ge 3 ] && [ "$FLUTTER_MINOR" -ge 27 ]; then
+            echo "Flutter 3.27+ detected. Checking font_awesome_flutter..."
+            if grep -q 'font_awesome_flutter' pubspec.yaml; then
+              # Replace any version <10.15.0 with ^10.15.0
+              if grep -qP 'font_awesome_flutter.*10\.(0|1|2|3|4|5|6|7|8|9|10|11|12|13|14)\.' pubspec.yaml 2>/dev/null; then
+                echo "Upgrading font_awesome_flutter to ^10.15.0..."
+                sed -i 's/font_awesome_flutter:.*$/font_awesome_flutter: \^10.15.0/' pubspec.yaml
+                CHANGED=true
+              fi
+            fi
+            # Also fix flutter_launcher_icons <0.14.0 which breaks on 3.27+
+            if grep -q 'flutter_launcher_icons' pubspec.yaml; then
+              if grep -qP 'flutter_launcher_icons.*0\.(0|1|2|3|4|5|6|7|8|9|10|11|12|13)\.' pubspec.yaml 2>/dev/null; then
+                echo "Upgrading flutter_launcher_icons to ^0.14.0..."
+                sed -i 's/flutter_launcher_icons:.*$/flutter_launcher_icons: \^0.14.0/' pubspec.yaml
+                CHANGED=true
+              fi
+            fi
+          fi
+
+          if [ "$CHANGED" = true ]; then
+            echo "Re-running flutter pub get after fixes..."
+            flutter pub get || echo "WARN: pub get after auto-fix failed"
+          else
+            echo "No incompatible packages found."
           fi
 
       - name: Patch Android Config
