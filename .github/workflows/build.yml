@@ -289,20 +289,35 @@ jobs:
         run: |
           echo "=== Patching Dart source for font_awesome_flutter 11.0.0 compatibility ==="
 
-          # Only run if font_awesome_flutter ^11 is in pubspec.yaml
-          if ! grep -qP 'font_awesome_flutter.*11\.' pubspec.yaml 2>/dev/null; then
-            echo "font_awesome_flutter 11.x not detected. Skipping source patch."
-            exit 0
-          fi
-
           if [ ! -d "lib" ]; then
-            echo "No lib/ directory. Skipping."
+            echo "No lib/ directory. Skipping patch."
             exit 0
           fi
 
-          echo "Writing Python patcher..."
+          # Check if font_awesome_flutter is used at all
+          FA_USED=false
+          if grep -q 'font_awesome_flutter' pubspec.yaml 2>/dev/null; then
+            FA_USED=true
+            FA_VER=$(grep -oP 'font_awesome_flutter:.*?\K[\^\d.]+|font_awesome_flutter:.*' pubspec.yaml | head -1)
+            echo "Detected font_awesome_flutter: $FA_VER"
+          fi
+
+          # Also check if FontAwesomeIcons is used in source code
+          FA_IN_SRC=false
+          if grep -rq 'FontAwesomeIcons' lib/ 2>/dev/null; then
+            FA_IN_SRC=true
+            echo "FontAwesomeIcons found in source code"
+          fi
+
+          if [ "$FA_USED" != "true" ] && [ "$FA_IN_SRC" != "true" ]; then
+            echo "font_awesome_flutter not detected. Skipping source patch."
+            exit 0
+          fi
+
+          echo "Running Python source patcher..."
+          PATCHED_COUNT=0
           python3 - << 'PYSCRIPT'
-          import os, re
+          import os, re, sys
 
           # Placeholder that won't match FontAwesomeIcons.xxx pattern
           PH = 'FAARG_DOT_'
@@ -311,17 +326,25 @@ jobs:
               with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
                   content = f.read()
               original = content
+              changes = []
 
               # ── Pass 1: Icon(FontAwesomeIcons.xxx → FaIcon(FontAwesomeIcons.xxx
-              content = re.sub(r'\bIcon\(FontAwesomeIcons\.', 'FaIcon(FontAwesomeIcons.', content)
+              new = re.sub(r'\bIcon\(FontAwesomeIcons\.', 'FaIcon(FontAwesomeIcons.', content)
+              if new != content:
+                  changes.append('Pass1: Icon→FaIcon')
+                  content = new
 
               # ── Pass 2: find.byIcon(FontAwesomeIcons.xxx) → .xxx.data
-              content = re.sub(
+              new = re.sub(
                   r'find\.byIcon\(FontAwesomeIcons\.(\w+)\)',
                   r'find.byIcon(FontAwesomeIcons.\1.data)', content)
+              if new != content:
+                  changes.append('Pass2: find.byIcon→.data')
+                  content = new
 
               # ── Pass 3: Add .data to FA refs NOT in FaIcon() first arg
               # Use placeholder to protect FaIcon first args from .data addition
+              before_pass3 = content
               # Step 3a: Replace FaIcon(FontAwesomeIcons.xxx with placeholder
               content = re.sub(
                   r'(FaIcon\(\s*)FontAwesomeIcons\.(\w+)',
@@ -336,6 +359,8 @@ jobs:
                   r'FontAwesomeIcons.\1.data', content)
               # Step 3d: Restore placeholders back to FontAwesomeIcons.xxx
               content = content.replace(PH, 'FontAwesomeIcons.')
+              if content != before_pass3:
+                  changes.append('Pass3: added .data to FA refs')
 
               # ── Pass 4: Remove 'const' that breaks with .data (multi-line aware)
               # .data is a getter → non-const. Find const keywords near FA.data refs and remove.
@@ -347,10 +372,10 @@ jobs:
                       if re.search(r'FontAwesomeIcons\.\w+\.data', line):
                           fa_data_lines.add(i)
                   if fa_data_lines:
-                      # For each FA.data line, search backwards for 'const' keyword
+                      # For each FA.data line, search backwards up to 10 lines for 'const' keyword
                       const_removals = set()
                       for fa_line in fa_data_lines:
-                          for back in range(min(fa_line + 1, 6)):
+                          for back in range(min(fa_line + 1, 10)):
                               check_line = fa_line - back
                               if check_line >= 0 and check_line not in const_removals:
                                   if re.search(r'\bconst\b', lines[check_line]):
@@ -358,21 +383,27 @@ jobs:
                                       break
                       # Remove const from identified lines
                       for line_idx in sorted(const_removals, reverse=True):
+                          old_line = lines[line_idx]
                           lines[line_idx] = re.sub(r'\bconst\s+', '', lines[line_idx], count=1)
+                          if lines[line_idx] != old_line:
+                              changes.append(f'Pass4: removed const at line {line_idx+1}')
                       content = '\n'.join(lines)
 
               # ── Pass 5: Fix FaIcon(x, ...) where x is NOT a FA ref
               # These cause "IconData can't be assigned to FaIconData?" errors
               # Revert FaIcon back to Icon when first arg is not FontAwesomeIcons.xxx
-              content = re.sub(
+              new = re.sub(
                   r'\bFaIcon\((?!FontAwesomeIcons\.)',
                   'Icon(', content)
+              if new != content:
+                  changes.append('Pass5: FaIcon→Icon for non-FA args')
+                  content = new
 
               if content != original:
                   with open(filepath, 'w', encoding='utf-8') as f:
                       f.write(content)
-                  return True
-              return False
+                  return True, changes
+              return False, []
 
           patched = 0
           for root, dirs, files in os.walk('lib'):
@@ -380,16 +411,37 @@ jobs:
                   if fname.endswith('.dart'):
                       fp = os.path.join(root, fname)
                       try:
-                          if patch_file(fp):
-                              print(f'  patched: {fp}')
+                          ok, changes = patch_file(fp)
+                          if ok:
+                              print(f'  PATCHED: {fp}')
+                              for c in changes:
+                                  print(f'    - {c}')
                               patched += 1
+                          else:
+                              # Check if file has FA refs at all
+                              with open(fp, 'r', encoding='utf-8', errors='replace') as f:
+                                  if 'FontAwesomeIcons' in f.read():
+                                      print(f'  UNCHANGED (has FA refs but no pattern matched): {fp}')
                       except Exception as e:
-                          print(f'  error: {fp}: {e}')
-          print(f'Total: {patched} files patched')
+                          print(f'  ERROR: {fp}: {e}')
+
+          print(f'')
+          print(f'=== PATCH SUMMARY ===')
+          print(f'Total files patched: {patched}')
+          if patched > 0:
+              print(f'Source code modified for FA 11.0.0 compatibility.')
+          else:
+              print(f'No files needed patching.')
+          # Write count to file for shell to read
+          with open('/tmp/fa_patched_count.txt', 'w') as f:
+              f.write(str(patched))
           PYSCRIPT
 
           echo ""
-          if [ "$PATCHED" -gt 0 ] 2>/dev/null; then
+          PATCHED_COUNT=$(cat /tmp/fa_patched_count.txt 2>/dev/null || echo "0")
+          echo "Files patched: $PATCHED_COUNT"
+
+          if [ "$PATCHED_COUNT" -gt 0 ] 2>/dev/null; then
             echo "Re-running flutter pub get after source patches..."
             flutter pub get || true
           fi
