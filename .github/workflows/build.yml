@@ -60,6 +60,8 @@ jobs:
       INPUT_BOT_TOKEN: ${{ inputs.bot_token }}
       INPUT_TAG: ${{ inputs.tag }}
       INPUT_ICON_URL: ${{ inputs.icon_url }}
+      INPUT_BUILD_TYPE: ${{ inputs.build_type }}
+      INPUT_BUILD_FORMAT: ${{ inputs.build_format }}
 
     steps:
       - name: Download Project ZIP
@@ -254,13 +256,15 @@ jobs:
 
           CHANGED=false
 
-          # Fix font_awesome_flutter <10.15.0 (IconData final class in Flutter 3.27+)
+          # Fix font_awesome_flutter <11.0.0 (IconData final class in Flutter 3.27+)
+          # Changelog: 11.0.0 - FaIconData no longer implements IconData (fixes flutter/flutter#181342)
           if [ "$FLUTTER_MAJOR" -ge 3 ] && [ "$FLUTTER_MINOR" -ge 27 ]; then
             echo "Flutter 3.27+ detected. Checking font_awesome_flutter..."
             if grep -q 'font_awesome_flutter' pubspec.yaml; then
-              if grep -qP 'font_awesome_flutter.*10\.(0|1|2|3|4|5|6|7|8|9|10|11|12|13|14)\.' pubspec.yaml 2>/dev/null; then
-                echo "Upgrading font_awesome_flutter to ^10.15.0..."
-                sed -i 's/font_awesome_flutter:.*$/font_awesome_flutter: \^10.15.0/' pubspec.yaml
+              # Match any 10.x.x version (all 10.x are incompatible with Flutter 3.27+)
+              if grep -qP 'font_awesome_flutter.*\^?10\.' pubspec.yaml 2>/dev/null; then
+                echo "Upgrading font_awesome_flutter to ^11.0.0 (fixes IconData final class)..."
+                sed -i 's/font_awesome_flutter:.*$/font_awesome_flutter: \^11.0.0/' pubspec.yaml
                 CHANGED=true
               fi
             fi
@@ -310,7 +314,7 @@ jobs:
           echo "pubspec.yaml exists: $(test -f pubspec.yaml && echo YES || echo NO)"
           echo ""
 
-          if [ "${{ inputs.build_type }}" = "release" ]; then
+          if [ "$INPUT_BUILD_TYPE" = "release" ]; then
             echo "Building RELEASE APK..."
             flutter build apk --release 2>&1 | tee build_output.txt
           else
@@ -344,7 +348,7 @@ jobs:
       - name: Build AAB (App Bundle)
         if: inputs.build_format == 'aab' || inputs.build_format == 'both'
         run: |
-          if [ "${{ inputs.build_type }}" = "release" ]; then
+          if [ "$INPUT_BUILD_TYPE" = "release" ]; then
             echo "Building RELEASE AAB..."
             flutter build appbundle --release 2>&1 | tee build_output_aab.txt
           else
@@ -380,8 +384,8 @@ jobs:
       - name: Send Output to Telegram
         if: inputs.chat_id != '' && inputs.bot_token != ''
         run: |
-          BUILD_TYPE="${{ inputs.build_type }}"
-          BUILD_FORMAT="${{ inputs.build_format }}"
+          BUILD_TYPE="$INPUT_BUILD_TYPE"
+          BUILD_FORMAT="$INPUT_BUILD_FORMAT"
           # Sanitize app_name for caption
           SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
 
@@ -439,7 +443,7 @@ jobs:
 
           if [ -n "$INPUT_CHAT_ID" ] && [ -n "$INPUT_BOT_TOKEN" ]; then
             SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
-            MSG=$(printf 'Build Gagal!\n\nApp: %s\nTipe: %s\nError: %s' "$SAFE_APP_NAME" "${{ inputs.build_type }}" "$ERROR_SUMMARY")
+            MSG=$(printf 'Build Gagal!\n\nApp: %s\nTipe: %s\nError: %s' "$SAFE_APP_NAME" "$INPUT_BUILD_TYPE" "$ERROR_SUMMARY")
             curl -s -X POST "https://api.telegram.org/bot${INPUT_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${INPUT_CHAT_ID}" \
               --data-urlencode "parse_mode=HTML" \
