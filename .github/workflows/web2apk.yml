@@ -77,7 +77,7 @@ jobs:
           echo "Web URL    : $INPUT_WEB_URL"
 
           # Create Flutter project using flutter create (generates correct Android files)
-          flutter create --project-name "$PROJ_NAME" --org "$(echo "$SAFE_PKG" | rev | cut -d. -f2- | rev)" --project-desc "WebView APK by Deruzuan Dev" "$PROJ_NAME"
+          flutter create --project-name "$PROJ_NAME" --org "$(echo "$SAFE_PKG" | rev | cut -d. -f2- | rev)" "$PROJ_NAME"
 
           cd "$PROJ_NAME"
 
