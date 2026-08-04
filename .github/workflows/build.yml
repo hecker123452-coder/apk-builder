@@ -42,10 +42,6 @@ on:
         description: 'Telegram Bot Token'
         required: false
         default: ''
-      flutter_version:
-        description: 'Flutter SDK version (internal - do not change)'
-        required: false
-        default: '3.22.0'
 
 jobs:
   build:
@@ -57,20 +53,26 @@ jobs:
     env:
       LC_ALL: C.UTF-8
       LANG: C.UTF-8
+      # ── Pass ALL free-text inputs through env to prevent script injection ──
+      INPUT_APP_NAME: ${{ inputs.app_name }}
+      INPUT_ZIP_URL: ${{ inputs.zip_url }}
+      INPUT_CHAT_ID: ${{ inputs.chat_id }}
+      INPUT_BOT_TOKEN: ${{ inputs.bot_token }}
+      INPUT_TAG: ${{ inputs.tag }}
+      INPUT_ICON_URL: ${{ inputs.icon_url }}
 
     steps:
       - name: Download Project ZIP
         run: |
           echo "=== Download Project ZIP ==="
-          echo "URL: ${{ inputs.zip_url }}"
-          echo "Tag: ${{ inputs.tag }}"
+          echo "Tag: $INPUT_TAG"
 
           # Step 1: Download with auth + retry
           echo "[1/4] Downloading..."
           HTTP_CODE=$(curl -sL -w "%{http_code}" -o project.zip \
             --retry 3 --retry-delay 5 --retry-connrefused \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "${{ inputs.zip_url }}")
+            "$INPUT_ZIP_URL")
 
           echo "HTTP Status: $HTTP_CODE"
 
@@ -256,7 +258,6 @@ jobs:
           if [ "$FLUTTER_MAJOR" -ge 3 ] && [ "$FLUTTER_MINOR" -ge 27 ]; then
             echo "Flutter 3.27+ detected. Checking font_awesome_flutter..."
             if grep -q 'font_awesome_flutter' pubspec.yaml; then
-              # Replace any version <10.15.0 with ^10.15.0
               if grep -qP 'font_awesome_flutter.*10\.(0|1|2|3|4|5|6|7|8|9|10|11|12|13|14)\.' pubspec.yaml 2>/dev/null; then
                 echo "Upgrading font_awesome_flutter to ^10.15.0..."
                 sed -i 's/font_awesome_flutter:.*$/font_awesome_flutter: \^10.15.0/' pubspec.yaml
@@ -282,11 +283,13 @@ jobs:
 
       - name: Patch Android Config
         run: |
+          # Sanitize app_name: strip anything that isn't alphanumeric, space, dash, underscore, dot
+          SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           if [ -f "$MANIFEST" ]; then
-            if [ -n "${{ inputs.app_name }}" ] && [ "${{ inputs.app_name }}" != "MyApp" ]; then
-              sed -i "s|android:label=\"[^\"]*\"|android:label=\"${{ inputs.app_name }}\"|g" "$MANIFEST"
-              echo "App name patched: ${{ inputs.app_name }}"
+            if [ -n "$SAFE_APP_NAME" ] && [ "$SAFE_APP_NAME" != "MyApp" ]; then
+              sed -i "s|android:label=\"[^\"]*\"|android:label=\"$SAFE_APP_NAME\"|g" "$MANIFEST"
+              echo "App name patched: $SAFE_APP_NAME"
             fi
           fi
 
@@ -314,7 +317,6 @@ jobs:
             echo "Building DEBUG APK..."
             flutter build apk --debug 2>&1 | tee build_output.txt
           fi
-          BUILD_EXIT=${PIPESTATUS[0]:-0}
 
           APK_PATH=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1)
           if [ -z "$APK_PATH" ]; then
@@ -333,10 +335,6 @@ jobs:
               grep -i "error\|failed\|exception" build_output.txt 2>/dev/null | tail -15 || echo "(no specific errors found)"
             else
               echo "No build output captured! flutter build may have failed to start."
-              echo "This usually means:"
-              echo "  1. Flutter SDK not properly installed"
-              echo "  2. pubspec.yaml missing or invalid"
-              echo "  3. flutter pub get failed earlier"
             fi
             exit 1
           fi
@@ -383,20 +381,21 @@ jobs:
         if: inputs.chat_id != '' && inputs.bot_token != ''
         run: |
           BUILD_TYPE="${{ inputs.build_type }}"
-          APP_NAME="${{ inputs.app_name }}"
           BUILD_FORMAT="${{ inputs.build_format }}"
+          # Sanitize app_name for caption
+          SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
 
           # Send APK
           if [ "$BUILD_FORMAT" = "apk" ] || [ "$BUILD_FORMAT" = "both" ]; then
             APK=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1)
             if [ -n "$APK" ]; then
               SIZE=$(du -sh "$APK" | cut -f1)
-              CAPTION=$(printf 'APK Build Selesai!\n\nApp: %s\nTipe: %s\nSize: %s\n\nby Deruzuan Dev' "$APP_NAME" "$BUILD_TYPE" "$SIZE")
-              curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendDocument" \
-                -F chat_id="${{ inputs.chat_id }}" \
-                -F document=@"$APK" \
-                -F parse_mode="HTML" \
-                --form-string caption="$CAPTION"
+              CAPTION=$(printf 'APK Build Selesai!\n\nApp: %s\nTipe: %s\nSize: %s\n\nby Deruzuan Dev' "$SAFE_APP_NAME" "$BUILD_TYPE" "$SIZE")
+              curl -s -X POST "https://api.telegram.org/bot${INPUT_BOT_TOKEN}/sendDocument" \
+                -F "chat_id=${INPUT_CHAT_ID}" \
+                -F "document=@$APK" \
+                -F "parse_mode=HTML" \
+                --form-string "caption=$CAPTION"
             fi
           fi
 
@@ -405,12 +404,12 @@ jobs:
             AAB=$(find build/app/outputs/bundle -name "*.aab" 2>/dev/null | head -1)
             if [ -n "$AAB" ]; then
               SIZE=$(du -sh "$AAB" | cut -f1)
-              CAPTION=$(printf 'AAB Build Selesai!\n\nApp: %s\nTipe: %s\nSize: %s\n\nby Deruzuan Dev' "$APP_NAME" "$BUILD_TYPE" "$SIZE")
-              curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendDocument" \
-                -F chat_id="${{ inputs.chat_id }}" \
-                -F document=@"$AAB" \
-                -F parse_mode="HTML" \
-                --form-string caption="$CAPTION"
+              CAPTION=$(printf 'AAB Build Selesai!\n\nApp: %s\nTipe: %s\nSize: %s\n\nby Deruzuan Dev' "$SAFE_APP_NAME" "$BUILD_TYPE" "$SIZE")
+              curl -s -X POST "https://api.telegram.org/bot${INPUT_BOT_TOKEN}/sendDocument" \
+                -F "chat_id=${INPUT_CHAT_ID}" \
+                -F "document=@$AAB" \
+                -F "parse_mode=HTML" \
+                --form-string "caption=$CAPTION"
             fi
           fi
 
@@ -438,12 +437,11 @@ jobs:
           # Truncate error summary to avoid Telegram API limits
           ERROR_SUMMARY=$(echo "$ERROR_SUMMARY" | cut -c1-500)
 
-          if [ "${{ inputs.chat_id }}" != "" ] && [ "${{ inputs.bot_token }}" != "" ]; then
-            # Build notification message safely (avoid emoji encoding issues in curl -d)
-            # Use printf + --data-urlencode for proper UTF-8 handling
-            MSG=$(printf 'Build Gagal!\n\nApp: %s\nTipe: %s\nError: %s' "${{ inputs.app_name }}" "${{ inputs.build_type }}" "$ERROR_SUMMARY")
-            curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendMessage" \
-              --data-urlencode "chat_id=${{ inputs.chat_id }}" \
+          if [ -n "$INPUT_CHAT_ID" ] && [ -n "$INPUT_BOT_TOKEN" ]; then
+            SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
+            MSG=$(printf 'Build Gagal!\n\nApp: %s\nTipe: %s\nError: %s' "$SAFE_APP_NAME" "${{ inputs.build_type }}" "$ERROR_SUMMARY")
+            curl -s -X POST "https://api.telegram.org/bot${INPUT_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${INPUT_CHAT_ID}" \
               --data-urlencode "parse_mode=HTML" \
               --data-urlencode "text=$MSG"
           fi
