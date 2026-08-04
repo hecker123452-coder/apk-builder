@@ -304,6 +304,7 @@ jobs:
           echo "  - FaIconData no longer implements IconData"
           echo "  - FaIcon now strictly requires FaIconData"
           echo "  - Use FontAwesomeIcons.xxx.data to get IconData"
+          echo "  - .data is a getter (non-const), so remove const on affected lines"
           echo ""
 
           PATCHED=0
@@ -329,11 +330,14 @@ jobs:
             # Step 3d: Remove markers
             perl -pi -e 's/\x{00}FA\x{00}//g' "$file"
 
-            # ── Pass 4: Fix IconData variable types on FA lines
-            # IconData? varName → FaIconData? varName (when line has FontAwesomeIcons)
-            perl -pi -e 's/\bIconData\?\s+/FaIconData? /g if /FontAwesomeIcons/' "$file"
-            # IconData varName = → FaIconData varName = (when line has FontAwesomeIcons)
-            perl -pi -e 's/\bIconData\s+(\w+\s*=)/FaIconData \1/g if /FontAwesomeIcons/' "$file"
+            # ── Pass 4: Remove 'const' keyword on lines with FontAwesomeIcons.xxx.data
+            # .data is a getter (not const), so const expressions break
+            # Remove const before widgets that use FA .data:
+            #   const Icon(FontAwesomeIcons.xxx.data → Icon(FontAwesomeIcons.xxx.data
+            #   const FaIcon(FontAwesomeIcons.xxx → FaIcon(FontAwesomeIcons.xxx (FaIcon arg is fine)
+            #   const Text(...  → keep const (no FA)
+            # Also handle: const [...  lists with FA icons
+            perl -pi -e 's/\bconst\s+(?=[^;]*FontAwesomeIcons\.)/ /g' "$file"
 
             AFTER=$(md5sum "$file" | cut -d' ' -f1)
             if [ "$BEFORE" != "$AFTER" ]; then
