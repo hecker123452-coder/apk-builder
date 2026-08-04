@@ -285,6 +285,70 @@ jobs:
             echo "No incompatible packages found."
           fi
 
+      - name: Patch Source for FA 11.0.0
+        run: |
+          echo "=== Patching Dart source for font_awesome_flutter 11.0.0 compatibility ==="
+
+          # Only run if font_awesome_flutter ^11 is in pubspec.yaml
+          if ! grep -qP 'font_awesome_flutter.*11\.' pubspec.yaml 2>/dev/null; then
+            echo "font_awesome_flutter 11.x not detected. Skipping source patch."
+            exit 0
+          fi
+
+          if [ ! -d "lib" ]; then
+            echo "No lib/ directory. Skipping."
+            exit 0
+          fi
+
+          echo "Breaking changes in 11.0.0:"
+          echo "  - FaIconData no longer implements IconData"
+          echo "  - FaIcon now strictly requires FaIconData"
+          echo "  - Use FontAwesomeIcons.xxx.data to get IconData"
+          echo ""
+
+          PATCHED=0
+
+          for file in $(find lib -name "*.dart" -type f 2>/dev/null); do
+            BEFORE=$(md5sum "$file" | cut -d' ' -f1)
+
+            # ── Pass 1: Icon(FontAwesomeIcons.xxx → FaIcon(FontAwesomeIcons.xxx
+            # Most common pattern: using Icon widget with FA icons
+            perl -pi -e 's/\bIcon\(FontAwesomeIcons\./FaIcon(FontAwesomeIcons./g' "$file"
+
+            # ── Pass 2: find.byIcon(FontAwesomeIcons.xxx) → add .data
+            perl -pi -e 's/find\.byIcon\(FontAwesomeIcons\.(\w+)\)/find.byIcon(FontAwesomeIcons.\1.data)/g' "$file"
+
+            # ── Pass 3: Add .data to FontAwesomeIcons.xxx not in FaIcon() args
+            # Strategy: mark FaIcon first args, add .data to rest, unmark
+            # Step 3a: Mark FaIcon(FontAwesomeIcons.xxx (first arg)
+            perl -pi -e 's/(FaIcon\(\s*)FontAwesomeIcons\.(\w+)/\1FontAwesomeIcons.\2\x{00}FA\x{00}/g' "$file"
+            # Step 3b: Mark already .data
+            perl -pi -e 's/FontAwesomeIcons\.(\w+)\.data/FontAwesomeIcons.\1\x{00}FA\x{00}.data/g' "$file"
+            # Step 3c: Add .data to remaining FontAwesomeIcons.xxx
+            perl -pi -e 's/FontAwesomeIcons\.(\w+)/FontAwesomeIcons.\1.data/g' "$file"
+            # Step 3d: Remove markers
+            perl -pi -e 's/\x{00}FA\x{00}//g' "$file"
+
+            # ── Pass 4: Fix IconData variable types on FA lines
+            # IconData? varName → FaIconData? varName (when line has FontAwesomeIcons)
+            perl -pi -e 's/\bIconData\?\s+/FaIconData? /g if /FontAwesomeIcons/' "$file"
+            # IconData varName = → FaIconData varName = (when line has FontAwesomeIcons)
+            perl -pi -e 's/\bIconData\s+(\w+\s*=)/FaIconData \1/g if /FontAwesomeIcons/' "$file"
+
+            AFTER=$(md5sum "$file" | cut -d' ' -f1)
+            if [ "$BEFORE" != "$AFTER" ]; then
+              echo "  ✓ $file"
+              PATCHED=$((PATCHED + 1))
+            fi
+          done
+
+          echo ""
+          echo "Total files patched: $PATCHED"
+          if [ "$PATCHED" -gt 0 ]; then
+            echo "Re-running flutter pub get after source patches..."
+            flutter pub get || true
+          fi
+
       - name: Patch Android Config
         run: |
           # Sanitize app_name: strip anything that isn't alphanumeric, space, dash, underscore, dot
