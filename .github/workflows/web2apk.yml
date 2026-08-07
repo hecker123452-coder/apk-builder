@@ -1,21 +1,21 @@
-name: Deruzuan Dev Web2APK
+name: Web2APK
 
 on:
   workflow_dispatch:
     inputs:
       web_url:
-        description: 'URL website yang ingin dijadikan APK'
+        description: 'URL website'
         required: true
       app_name:
         description: 'Nama Aplikasi'
         required: true
         default: 'WebApp'
       package_name:
-        description: 'Package Name (com.xxx.xxx)'
+        description: 'Package Name'
         required: false
         default: 'com.deruzuan.webapp'
       icon_url:
-        description: 'Icon URL (opsional)'
+        description: 'Icon URL'
         required: false
         default: ''
       chat_id:
@@ -30,7 +30,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     permissions:
       contents: write
       actions: write
@@ -45,58 +45,46 @@ jobs:
       INPUT_BOT_TOKEN: ${{ inputs.bot_token }}
 
     steps:
-      - name: Set up JDK 17
+      - name: Setup JDK
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Flutter
+      - name: Install Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
           cache: true
 
-      - name: Cache Gradle
+      - name: Cache Gradle + Pub
         uses: actions/cache@v4
         with:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-web2apk-${{ hashFiles('**/gradle-wrapper.properties') }}
+            ~/.pub-cache
+            .dart_tool
+          key: w2a-${{ hashFiles('**/gradle-wrapper.properties', '**/pubspec.yaml') }}
           restore-keys: |
-            gradle-web2apk-
+            w2a-
 
-      - name: Create Flutter Project & Add WebView
+      - name: Create Project + WebView + Icon + Build
         run: |
-          echo "=== Creating Flutter WebView Project ==="
-
-          # Sanitize inputs
           SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
           SAFE_PKG=$(echo "$INPUT_PACKAGE_NAME" | sed 's/[^a-zA-Z0-9.]//g' | sed 's/^\.*//' | sed 's/\.*$//')
           [ -z "$SAFE_PKG" ] && SAFE_PKG="com.deruzuan.webapp"
           [ -z "$SAFE_APP_NAME" ] && SAFE_APP_NAME="WebApp"
 
-          # Derive Flutter project name from package (must be lowercase, no dots)
           PROJ_NAME=$(echo "$SAFE_PKG" | rev | cut -d. -f1 | rev | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]//g')
           [ -z "$PROJ_NAME" ] && PROJ_NAME="webapp"
 
-          echo "App Name   : $SAFE_APP_NAME"
-          echo "Package    : $SAFE_PKG"
-          echo "Project    : $PROJ_NAME"
-          echo "Web URL    : $INPUT_WEB_URL"
+          echo "App: $SAFE_APP_NAME | Pkg: $SAFE_PKG | Proj: $PROJ_NAME | URL: $INPUT_WEB_URL"
 
-          # Create Flutter project using flutter create (generates correct Android files)
           flutter create --project-name "$PROJ_NAME" --org "$(echo "$SAFE_PKG" | rev | cut -d. -f2- | rev)" "$PROJ_NAME"
-
           cd "$PROJ_NAME"
-
-          # Add webview_flutter dependency
-          echo "Adding webview_flutter dependency..."
-          cat pubspec.yaml | head -20
           flutter pub add webview_flutter
 
-          # Write main.dart with WebView
           cat > lib/main.dart << 'DART_EOF'
           import 'package:flutter/material.dart';
           import 'package:webview_flutter/webview_flutter.dart';
@@ -173,123 +161,46 @@ jobs:
           }
           DART_EOF
 
-          # Replace placeholder with actual URL
           sed -i "s|WEBURL_PLACEHOLDER|$(echo "$INPUT_WEB_URL" | sed 's/[&/\]/\\&/g')|g" lib/main.dart
 
-          # Patch app name in Android
+          # Patch Android
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           if [ -f "$MANIFEST" ]; then
             sed -i "s|android:label=\"[^\"]*\"|android:label=\"$SAFE_APP_NAME\"|g" "$MANIFEST"
-            echo "Patched AndroidManifest.xml: label=$SAFE_APP_NAME"
-          fi
-
-          # Patch app name in Android strings.xml
-          STRINGS_XML="android/app/src/main/res/values/strings.xml"
-          if [ -f "$STRINGS_XML" ]; then
-            sed -i "s|<string name=\"app_name\">[^<]*</string>|<string name=\"app_name\">$SAFE_APP_NAME</string>|g" "$STRINGS_XML"
-          fi
-
-          # Add INTERNET permission to AndroidManifest
-          if [ -f "$MANIFEST" ]; then
             if ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
               sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />\n    <application|' "$MANIFEST"
-              echo "Added INTERNET permissions"
             fi
-            # Allow cleartext traffic (HTTP URLs)
             if ! grep -q "usesCleartextTraffic" "$MANIFEST"; then
               sed -i 's|android:allowBackup="[^"]*"|android:allowBackup="false"\n        android:usesCleartextTraffic="true"|' "$MANIFEST"
-              echo "Added cleartext traffic permission"
             fi
           fi
 
-          echo ""
-          echo "=== Project created successfully ==="
-          echo "Project dir: $(pwd)"
-          ls -la
-
-      - name: Download Icon (if provided)
-        run: |
-          echo "=== Download Icon ==="
-          # Find the project directory
-          PROJ_DIR=$(find . -maxdepth 1 -name "com.*" -o -name "webapp" -o -name "web*app" | head -1)
-          [ -z "$PROJ_DIR" ] && PROJ_DIR=$(ls -d */ | head -1 | tr -d '/')
-          [ -z "$PROJ_DIR" ] && { echo "ERROR: Cannot find project dir"; ls -la; exit 1; }
-          cd "$PROJ_DIR"
-
-          if [ -z "$INPUT_ICON_URL" ]; then
-            echo "No icon URL provided. Using default Flutter icon."
-            exit 0
-          fi
-
-          echo "Downloading icon from: $INPUT_ICON_URL"
-          HTTP_CODE=$(curl -sL -w "%{http_code}" -o /tmp/app_icon.png --retry 2 --retry-delay 3 "$INPUT_ICON_URL")
-          echo "HTTP Status: $HTTP_CODE"
-
-          if [ "$HTTP_CODE" -ne 200 ] || [ ! -s /tmp/app_icon.png ]; then
-            echo "WARN: Icon download failed. Using default icon."
-            exit 0
-          fi
-
-          FILE_TYPE=$(file /tmp/app_icon.png 2>/dev/null || echo "unknown")
-          echo "File type: $FILE_TYPE"
-
-          if ! echo "$FILE_TYPE" | grep -qi "png\|jpeg\|image\|bitmap"; then
-            echo "WARN: Downloaded file is not an image. Using default icon."
-            exit 0
-          fi
-
-          # Copy icon to all mipmap directories
-          for dir in android/app/src/main/res/mipmap-*; do
-            if [ -d "$dir" ]; then
-              cp /tmp/app_icon.png "$dir/ic_launcher.png" 2>/dev/null || true
+          # Download icon
+          if [ -n "$INPUT_ICON_URL" ]; then
+            HTTP_CODE=$(curl -sL -w "%{http_code}" -o /tmp/app_icon.png --retry 2 --retry-delay 2 "$INPUT_ICON_URL")
+            if [ "$HTTP_CODE" -eq 200 ] && [ -s /tmp/app_icon.png ]; then
+              FILE_TYPE=$(file /tmp/app_icon.png 2>/dev/null || echo "unknown")
+              if echo "$FILE_TYPE" | grep -qi "png\|jpeg\|image\|bitmap"; then
+                for dir in android/app/src/main/res/mipmap-*; do
+                  if [ -d "$dir" ]; then cp /tmp/app_icon.png "$dir/ic_launcher.png" 2>/dev/null || true; fi
+                done
+                echo "Icon applied!"
+              fi
             fi
-          done
+          fi
 
-          echo "Icon applied successfully."
-
-      - name: Get Dependencies & Build APK
-        run: |
-          # Find the project directory
-          PROJ_DIR=$(find . -maxdepth 1 -type d ! -name '.' ! -name '..' | head -1)
-          [ -z "$PROJ_DIR" ] && { echo "ERROR: Cannot find project dir"; ls -la; exit 1; }
-          cd "$PROJ_DIR"
-
-          echo "=== Getting Dependencies ==="
-          flutter pub get
-
-          echo ""
-          echo "=== Verifying Project ==="
-          echo "pubspec.yaml:"
-          cat pubspec.yaml
-          echo ""
-          echo "main.dart (first 10 lines):"
-          head -10 lib/main.dart
-          echo ""
-
-          echo "=== Building WebView APK ==="
+          # Build
           flutter build apk --release --no-tree-shake-icons 2>&1 | tee build_output.txt
 
-          APK_PATH=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1)
+          APK_PATH=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1 || find build/app/outputs/apk -name "*.apk" 2>/dev/null | head -1)
           if [ -z "$APK_PATH" ]; then
-            APK_PATH=$(find build/app/outputs/apk -name "*.apk" 2>/dev/null | head -1)
-          fi
-
-          if [ -z "$APK_PATH" ]; then
-            echo ""
-            echo "=== BUILD FAILED! ==="
-            if [ -f build_output.txt ] && [ -s build_output.txt ]; then
-              echo "Last 30 lines:"
-              tail -30 build_output.txt
-              echo ""
-              echo "Error lines:"
-              grep -i "error\|failed\|exception" build_output.txt 2>/dev/null | tail -15 || true
-            fi
+            echo "=== BUILD FAILED ==="
+            tail -30 build_output.txt
             exit 1
           fi
+          echo "APK: $APK_PATH ($(du -sh "$APK_PATH" | cut -f1))"
 
-          echo "APK built: $APK_PATH ($(du -sh "$APK_PATH" | cut -f1))"
-
-      - name: Upload APK Artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: web2apk-output
@@ -297,47 +208,30 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-      - name: Send APK to Telegram
+      - name: Send to Telegram
         if: inputs.chat_id != '' && inputs.bot_token != ''
         run: |
           SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
-          APK=$(find . -path "*/flutter-apk/*.apk" 2>/dev/null | head -1)
-          if [ -z "$APK" ]; then
-            APK=$(find . -path "*/apk/*.apk" -name "*.apk" 2>/dev/null | head -1)
-          fi
+          APK=$(find . -path "*/flutter-apk/*.apk" 2>/dev/null | head -1 || find . -path "*/apk/*.apk" -name "*.apk" 2>/dev/null | head -1)
           if [ -n "$APK" ]; then
             SIZE=$(du -sh "$APK" | cut -f1)
-            CAPTION=$(printf 'Web2APK Selesai!\n\nApp: %s\nURL: %s\nSize: %s\n\nby Deruzuan Dev' "$SAFE_APP_NAME" "$INPUT_WEB_URL" "$SIZE")
+            CAPTION=$(printf '✅ Web2APK Udah Jadi!\n%s | %s | %s' "$SAFE_APP_NAME" "$INPUT_WEB_URL" "$SIZE")
             curl -s -X POST "https://api.telegram.org/bot${INPUT_BOT_TOKEN}/sendDocument" \
-              -F "chat_id=${INPUT_CHAT_ID}" \
-              -F "document=@$APK" \
-              -F "parse_mode=HTML" \
-              --form-string "caption=$CAPTION"
-            echo "APK sent to Telegram!"
-          else
-            echo "ERROR: APK file not found for Telegram delivery"
+              -F "chat_id=${INPUT_CHAT_ID}" -F "document=@$APK" --form-string "caption=$CAPTION"
           fi
 
       - name: Notify Failure
         if: failure()
         run: |
-          ERROR_SUMMARY="Web2APK Build gagal"
+          ERROR_SUMMARY="Web2APK gagal"
           if [ -f build_output.txt ]; then
             ERROR_SUMMARY=$(grep -i "error\|failed\|exception" build_output.txt 2>/dev/null | head -5 | tr '\n' ' ')
-            [ -z "$ERROR_SUMMARY" ] && ERROR_SUMMARY="Web2APK Build gagal (no specific error in log)"
-          else
-            ERROR_SUMMARY="Web2APK Build gagal di tahap awal (project creation/flutter setup). Cek workflow log."
           fi
+          [ -z "$ERROR_SUMMARY" ] && ERROR_SUMMARY="Web2APK gagal di awal."
           ERROR_SUMMARY=$(echo "$ERROR_SUMMARY" | cut -c1-500)
-
           if [ -n "$INPUT_CHAT_ID" ] && [ -n "$INPUT_BOT_TOKEN" ]; then
             SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
-            MSG=$(printf 'Web2APK Build Gagal!\n\nApp: %s\nURL: %s\nError: %s' "$SAFE_APP_NAME" "$INPUT_WEB_URL" "$ERROR_SUMMARY")
+            MSG=$(printf '❌ Web2APK Gagal\n%s | %s\n%s' "$SAFE_APP_NAME" "$INPUT_WEB_URL" "$ERROR_SUMMARY")
             curl -s -X POST "https://api.telegram.org/bot${INPUT_BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${INPUT_CHAT_ID}" \
-              --data-urlencode "parse_mode=HTML" \
-              --data-urlencode "text=$MSG"
+              --data-urlencode "chat_id=${INPUT_CHAT_ID}" --data-urlencode "text=$MSG"
           fi
-
-          echo "BUILD FAILED"
-          echo "Error summary: $ERROR_SUMMARY"
