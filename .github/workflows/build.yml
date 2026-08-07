@@ -1,13 +1,13 @@
-name: Deruzuan Dev Build APK
+name: Build APK
 
 on:
   workflow_dispatch:
     inputs:
       zip_url:
-        description: 'URL ZIP project Flutter (dari GitHub Release)'
+        description: 'URL ZIP project Flutter'
         required: true
       tag:
-        description: 'Build tag / identifier'
+        description: 'Build tag'
         required: true
       build_type:
         description: 'Build Type'
@@ -27,11 +27,11 @@ on:
           - aab
           - both
       app_name:
-        description: 'App Name (optional)'
+        description: 'App Name'
         required: false
         default: 'MyApp'
       icon_url:
-        description: 'Icon URL (optional)'
+        description: 'Icon URL'
         required: false
         default: ''
       chat_id:
@@ -46,14 +46,13 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     permissions:
       contents: write
       actions: write
     env:
       LC_ALL: C.UTF-8
       LANG: C.UTF-8
-      # ── Pass ALL free-text inputs through env to prevent script injection ──
       INPUT_APP_NAME: ${{ inputs.app_name }}
       INPUT_ZIP_URL: ${{ inputs.zip_url }}
       INPUT_CHAT_ID: ${{ inputs.chat_id }}
@@ -64,104 +63,55 @@ jobs:
       INPUT_BUILD_FORMAT: ${{ inputs.build_format }}
 
     steps:
-      - name: Download Project ZIP
-        run: |
-          echo "=== Download Project ZIP ==="
-          echo "Tag: $INPUT_TAG"
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
 
-          # Step 1: Download with auth + retry
-          echo "[1/4] Downloading..."
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Cache Gradle + Pub
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            android/.gradle
+            ~/.pub-cache
+            .dart_tool
+          key: gpub-${{ hashFiles('pubspec.yaml', 'pubspec.lock', 'android/**/build.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gpub-
+
+      - name: Download + Extract + Deps + Patch
+        run: |
+          # Download
           HTTP_CODE=$(curl -sL -w "%{http_code}" -o project.zip \
-            --retry 3 --retry-delay 5 --retry-connrefused \
+            --retry 3 --retry-delay 2 --retry-connrefused \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             "$INPUT_ZIP_URL")
-
-          echo "HTTP Status: $HTTP_CODE"
-
           if [ "$HTTP_CODE" -ne 200 ]; then
             echo "ERROR: Download failed! HTTP $HTTP_CODE"
-            echo "Possible causes: URL expired, release not published, or auth failed."
-            if [ -f project.zip ]; then
-              FILE_TYPE=$(file project.zip 2>/dev/null || echo "unknown")
-              echo "File type: $FILE_TYPE"
-              if echo "$FILE_TYPE" | grep -qi "html\|text"; then
-                echo "Downloaded file is NOT a ZIP - likely an HTML page."
-                head -5 project.zip 2>/dev/null || true
-              fi
-            fi
             exit 1
           fi
-
-          # Step 2: Verify file exists and is not empty
-          echo "[2/4] Verifying file..."
-          if [ ! -f project.zip ] || [ ! -s project.zip ]; then
-            echo "ERROR: ZIP file is empty or missing!"
-            exit 1
-          fi
-
-          FILE_SIZE=$(stat -c%s project.zip 2>/dev/null || echo "0")
-          echo "File size: $FILE_SIZE bytes"
-
-          # Step 3: Verify ZIP magic bytes (PK header = 50 4B)
-          echo "[3/4] Checking ZIP magic bytes..."
           MAGIC=$(od -A n -t x1 -N 4 project.zip 2>/dev/null | tr -d ' ')
-          echo "Magic bytes: $MAGIC"
           if ! echo "$MAGIC" | grep -qi "^504b"; then
-            echo "ERROR: Not a valid ZIP file! (Missing PK magic header)"
-            echo "First 16 bytes (hex):"
-            od -A n -t x1 -N 16 project.zip 2>/dev/null || true
-            echo "First 5 lines (text):"
-            head -5 project.zip 2>/dev/null || true
+            echo "ERROR: Not a valid ZIP file!"
             exit 1
           fi
-
-          # Step 4: Verify with file command
-          echo "[4/4] File type check..."
-          FILE_TYPE=$(file project.zip 2>/dev/null || echo "unknown")
-          echo "File type: $FILE_TYPE"
-          if ! echo "$FILE_TYPE" | grep -qi "zip\|archive"; then
-            echo "WARN: file command doesn't recognize as ZIP, but magic bytes OK. Continuing..."
-          fi
-
-          echo "SUCCESS: ZIP downloaded ($(du -sh project.zip | cut -f1))"
-
-      - name: Extract Project
-        run: |
-          echo "=== Extract Project ==="
-
-          # Verify ZIP integrity before extracting
-          echo "Testing ZIP integrity..."
-          if ! unzip -t project.zip > /dev/null 2>&1; then
-            echo "WARN: ZIP integrity test failed. Attempting repair..."
-            zip -F project.zip --out project_fixed.zip 2>/dev/null || true
-            if [ -f project_fixed.zip ] && [ -s project_fixed.zip ]; then
-              mv project_fixed.zip project.zip
-              echo "ZIP repaired successfully."
-            else
-              rm -f project_fixed.zip
-              echo "ERROR: ZIP is corrupt and cannot be repaired."
-              echo "This usually means the download was incomplete or the file was damaged during upload."
-              exit 1
-            fi
-          fi
+          echo "ZIP: $(du -sh project.zip | cut -f1)"
 
           # Extract
           mkdir -p project
           if ! unzip -q project.zip -d project; then
-            echo "ERROR: Failed to extract ZIP!"
-            echo "Trying with unzip -o (overwrite)..."
-            if ! unzip -o project.zip -d project; then
-              echo "ERROR: Extraction still failed. ZIP is likely corrupt."
-              exit 1
-            fi
+            echo "ERROR: Extraction failed!"
+            exit 1
           fi
-
-          # Show what's inside
-          echo "ZIP contents:"
-          ls -la project/ | head -20
-
-          # Find Flutter project root and copy ALL files to workspace root
-          # (cd does NOT persist across GitHub Actions steps!)
           PROJECT_DIR=""
           if [ -f "project/pubspec.yaml" ]; then
             PROJECT_DIR="project"
@@ -171,360 +121,145 @@ jobs:
               PROJECT_DIR=$(dirname "$INNER")
             fi
           fi
-
           if [ -z "$PROJECT_DIR" ]; then
-            echo "ERROR: No pubspec.yaml found in ZIP!"
-            echo "Make sure the ZIP contains a valid Flutter project."
-            echo "ZIP contents:"
-            find project -maxdepth 3 -type f | head -30
+            echo "ERROR: No pubspec.yaml found!"
             exit 1
           fi
-
-          echo "Flutter project found at: $PROJECT_DIR"
-          echo "Copying project files to workspace root..."
-
-          # Copy all files (including hidden like .dart_tool, .packages)
+          echo "Project: $PROJECT_DIR"
           rsync -a --remove-source-files "$PROJECT_DIR/" . 2>/dev/null || {
-            # Fallback if rsync not available
             cp -r "$PROJECT_DIR"/* . 2>/dev/null || true
             cp -r "$PROJECT_DIR"/.* . 2>/dev/null || true
           }
-
-          # Verify pubspec.yaml is now in workspace root
           if [ ! -f "pubspec.yaml" ]; then
-            echo "ERROR: pubspec.yaml not found in workspace after copy!"
-            echo "Workspace contents:"
-            ls -la | head -20
+            echo "ERROR: pubspec.yaml missing!"
             exit 1
           fi
+          rm -rf project project.zip
 
-          echo "Project extracted successfully."
-          echo "Workspace contents:"
-          ls -la | head -20
+          # Pub get
+          flutter pub get || { echo "ERROR: pub get failed!"; exit 1; }
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: 'stable'
-          cache: true
-
-      - name: Cache Gradle
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-            android/.gradle
-          key: gradle-${{ hashFiles('android/**/build.gradle*') }}-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties') }}
-          restore-keys: |
-            gradle-
-
-      - name: Cache Flutter Pub
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.pub-cache
-            .dart_tool
-          key: pub-${{ hashFiles('pubspec.yaml') }}-${{ hashFiles('pubspec.lock') }}
-          restore-keys: |
-            pub-
-
-      - name: Get Dependencies
-        run: |
-          if [ -f "pubspec.yaml" ]; then
-            flutter pub get || echo "WARN: pub get failed, trying to continue..."
-          else
-            echo "ERROR: No pubspec.yaml! Not a valid Flutter project."
-            exit 1
-          fi
-
-      - name: Auto-fix Incompatible Packages
-        run: |
-          echo "=== Auto-fix Incompatible Packages ==="
+          # Auto-fix incompatible packages
           FLUTTER_VER=$(flutter --version 2>/dev/null | head -1 | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "0.0.0")
           FLUTTER_MAJOR=$(echo "$FLUTTER_VER" | cut -d. -f1)
           FLUTTER_MINOR=$(echo "$FLUTTER_VER" | cut -d. -f2)
-          echo "Detected Flutter: $FLUTTER_VER"
-
           CHANGED=false
-
-          # Fix font_awesome_flutter <11.0.0 (IconData final class in Flutter 3.27+)
-          # Changelog: 11.0.0 - FaIconData no longer implements IconData (fixes flutter/flutter#181342)
           if [ "$FLUTTER_MAJOR" -ge 3 ] && [ "$FLUTTER_MINOR" -ge 27 ]; then
-            echo "Flutter 3.27+ detected. Checking font_awesome_flutter..."
-            if grep -q 'font_awesome_flutter' pubspec.yaml; then
-              # Match any 10.x.x version (all 10.x are incompatible with Flutter 3.27+)
-              if grep -qP 'font_awesome_flutter.*\^?10\.' pubspec.yaml 2>/dev/null; then
-                echo "Upgrading font_awesome_flutter to ^11.0.0 (fixes IconData final class)..."
-                sed -i 's/font_awesome_flutter:.*$/font_awesome_flutter: \^11.0.0/' pubspec.yaml
-                CHANGED=true
-              fi
+            if grep -qP 'font_awesome_flutter.*\^?10\.' pubspec.yaml 2>/dev/null; then
+              sed -i 's/font_awesome_flutter:.*$/font_awesome_flutter: \^11.0.0/' pubspec.yaml
+              CHANGED=true
             fi
-            # Also fix flutter_launcher_icons <0.14.0 which breaks on 3.27+
-            if grep -q 'flutter_launcher_icons' pubspec.yaml; then
-              if grep -qP 'flutter_launcher_icons.*0\.(0|1|2|3|4|5|6|7|8|9|10|11|12|13)\.' pubspec.yaml 2>/dev/null; then
-                echo "Upgrading flutter_launcher_icons to ^0.14.0..."
-                sed -i 's/flutter_launcher_icons:.*$/flutter_launcher_icons: \^0.14.0/' pubspec.yaml
-                CHANGED=true
-              fi
+            if grep -qP 'flutter_launcher_icons.*0\.(0|1|2|3|4|5|6|7|8|9|10|11|12|13)\.' pubspec.yaml 2>/dev/null; then
+              sed -i 's/flutter_launcher_icons:.*$/flutter_launcher_icons: \^0.14.0/' pubspec.yaml
+              CHANGED=true
             fi
           fi
-
           if [ "$CHANGED" = true ]; then
-            echo "Re-running flutter pub get after fixes..."
-            flutter pub get || echo "WARN: pub get after auto-fix failed"
-          else
-            echo "No incompatible packages found."
+            flutter pub get || true
           fi
 
-      - name: Patch Source for FA 11.0.0
-        run: |
-          echo "=== Patching Dart source for font_awesome_flutter 11.0.0 compatibility ==="
-
-          if [ ! -d "lib" ]; then
-            echo "No lib/ directory. Skipping patch."
-            exit 0
-          fi
-
-          # Check if font_awesome_flutter is used at all
+          # Patch FA 11.0.0 source (unconditional)
+          if [ ! -d "lib" ]; then exit 0; fi
           FA_USED=false
-          if grep -q 'font_awesome_flutter' pubspec.yaml 2>/dev/null; then
-            FA_USED=true
-            FA_VER=$(grep -oP 'font_awesome_flutter:.*?\K[\^\d.]+|font_awesome_flutter:.*' pubspec.yaml | head -1)
-            echo "Detected font_awesome_flutter: $FA_VER"
-          fi
-
-          # Also check if FontAwesomeIcons is used in source code
+          if grep -q 'font_awesome_flutter' pubspec.yaml 2>/dev/null; then FA_USED=true; fi
           FA_IN_SRC=false
-          if grep -rq 'FontAwesomeIcons' lib/ 2>/dev/null; then
-            FA_IN_SRC=true
-            echo "FontAwesomeIcons found in source code"
-          fi
+          if grep -rq 'FontAwesomeIcons' lib/ 2>/dev/null; then FA_IN_SRC=true; fi
+          if [ "$FA_USED" != "true" ] && [ "$FA_IN_SRC" != "true" ]; then exit 0; fi
 
-          if [ "$FA_USED" != "true" ] && [ "$FA_IN_SRC" != "true" ]; then
-            echo "font_awesome_flutter not detected. Skipping source patch."
-            exit 0
-          fi
-
-          echo "Running Python source patcher..."
-          PATCHED_COUNT=0
           python3 - << 'PYSCRIPT'
           import os, re, sys
-
-          # Placeholder that won't match FontAwesomeIcons.xxx pattern
           PH = 'FAARG_DOT_'
-
           def patch_file(filepath):
               with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
                   content = f.read()
               original = content
               changes = []
-
-              # ── Pass 1: Icon(FontAwesomeIcons.xxx → FaIcon(FontAwesomeIcons.xxx
               new = re.sub(r'\bIcon\(FontAwesomeIcons\.', 'FaIcon(FontAwesomeIcons.', content)
-              if new != content:
-                  changes.append('Pass1: Icon→FaIcon')
-                  content = new
-
-              # ── Pass 2: find.byIcon(FontAwesomeIcons.xxx) → .xxx.data
-              new = re.sub(
-                  r'find\.byIcon\(FontAwesomeIcons\.(\w+)\)',
-                  r'find.byIcon(FontAwesomeIcons.\1.data)', content)
-              if new != content:
-                  changes.append('Pass2: find.byIcon→.data')
-                  content = new
-
-              # ── Pass 3: Add .data to FA refs NOT in FaIcon() first arg
-              # Use placeholder to protect FaIcon first args from .data addition
-              before_pass3 = content
-              # Step 3a: Replace FaIcon(FontAwesomeIcons.xxx with placeholder
-              content = re.sub(
-                  r'(FaIcon\(\s*)FontAwesomeIcons\.(\w+)',
-                  rf'\1{PH}\2', content)
-              # Step 3b: Replace already .data refs with placeholder
-              content = re.sub(
-                  r'FontAwesomeIcons\.(\w+)\.data',
-                  rf'{PH}\1.data', content)
-              # Step 3c: Add .data to remaining FA refs (unprotected ones)
-              content = re.sub(
-                  r'FontAwesomeIcons\.(\w+)',
-                  r'FontAwesomeIcons.\1.data', content)
-              # Step 3d: Restore placeholders back to FontAwesomeIcons.xxx
+              if new != content: changes.append('P1'); content = new
+              new = re.sub(r'find\.byIcon\(FontAwesomeIcons\.(\w+)\)', r'find.byIcon(FontAwesomeIcons.\1.data)', content)
+              if new != content: changes.append('P2'); content = new
+              before = content
+              content = re.sub(r'(FaIcon\(\s*)FontAwesomeIcons\.(\w+)', rf'\1{PH}\2', content)
+              content = re.sub(r'FontAwesomeIcons\.(\w+)\.data', rf'{PH}\1.data', content)
+              content = re.sub(r'FontAwesomeIcons\.(\w+)', r'FontAwesomeIcons.\1.data', content)
               content = content.replace(PH, 'FontAwesomeIcons.')
-              if content != before_pass3:
-                  changes.append('Pass3: added .data to FA refs')
-
-              # ── Pass 4: Remove 'const' that breaks with .data (multi-line aware)
-              # .data is a getter → non-const. Find const keywords near FA.data refs and remove.
+              if content != before: changes.append('P3')
               if 'FontAwesomeIcons.' in content:
                   lines = content.split('\n')
-                  # Mark lines that have FontAwesomeIcons.xxx.data (non-const)
                   fa_data_lines = set()
                   for i, line in enumerate(lines):
-                      if re.search(r'FontAwesomeIcons\.\w+\.data', line):
-                          fa_data_lines.add(i)
+                      if re.search(r'FontAwesomeIcons\.\w+\.data', line): fa_data_lines.add(i)
                   if fa_data_lines:
-                      # For each FA.data line, search backwards up to 10 lines for 'const' keyword
                       const_removals = set()
                       for fa_line in fa_data_lines:
                           for back in range(min(fa_line + 1, 10)):
-                              check_line = fa_line - back
-                              if check_line >= 0 and check_line not in const_removals:
-                                  if re.search(r'\bconst\b', lines[check_line]):
-                                      const_removals.add(check_line)
-                                      break
-                      # Remove const from identified lines
-                      for line_idx in sorted(const_removals, reverse=True):
-                          old_line = lines[line_idx]
-                          lines[line_idx] = re.sub(r'\bconst\s+', '', lines[line_idx], count=1)
-                          if lines[line_idx] != old_line:
-                              changes.append(f'Pass4: removed const at line {line_idx+1}')
+                              check = fa_line - back
+                              if check >= 0 and check not in const_removals:
+                                  if re.search(r'\bconst\b', lines[check]):
+                                      const_removals.add(check); break
+                      for idx in sorted(const_removals, reverse=True):
+                          lines[idx] = re.sub(r'\bconst\s+', '', lines[idx], count=1)
+                          changes.append(f'P4:{idx+1}')
                       content = '\n'.join(lines)
-
-              # ── Pass 5: Fix FaIcon(x, ...) where x is NOT a FA ref
-              # These cause "IconData can't be assigned to FaIconData?" errors
-              # Revert FaIcon back to Icon when first arg is not FontAwesomeIcons.xxx
-              new = re.sub(
-                  r'\bFaIcon\((?!FontAwesomeIcons\.)',
-                  'Icon(', content)
-              if new != content:
-                  changes.append('Pass5: FaIcon→Icon for non-FA args')
-                  content = new
-
+              new = re.sub(r'\bFaIcon\((?!FontAwesomeIcons\.)', 'Icon(', content)
+              if new != content: changes.append('P5'); content = new
               if content != original:
-                  with open(filepath, 'w', encoding='utf-8') as f:
-                      f.write(content)
-                  return True, changes
-              return False, []
-
+                  with open(filepath, 'w', encoding='utf-8') as f: f.write(content)
+                  return True
+              return False
           patched = 0
           for root, dirs, files in os.walk('lib'):
               for fname in files:
                   if fname.endswith('.dart'):
-                      fp = os.path.join(root, fname)
                       try:
-                          ok, changes = patch_file(fp)
-                          if ok:
-                              print(f'  PATCHED: {fp}')
-                              for c in changes:
-                                  print(f'    - {c}')
-                              patched += 1
-                          else:
-                              # Check if file has FA refs at all
-                              with open(fp, 'r', encoding='utf-8', errors='replace') as f:
-                                  if 'FontAwesomeIcons' in f.read():
-                                      print(f'  UNCHANGED (has FA refs but no pattern matched): {fp}')
-                      except Exception as e:
-                          print(f'  ERROR: {fp}: {e}')
-
-          print(f'')
-          print(f'=== PATCH SUMMARY ===')
-          print(f'Total files patched: {patched}')
-          if patched > 0:
-              print(f'Source code modified for FA 11.0.0 compatibility.')
-          else:
-              print(f'No files needed patching.')
-          # Write count to file for shell to read
-          with open('/tmp/fa_patched_count.txt', 'w') as f:
-              f.write(str(patched))
+                          if patch_file(os.path.join(root, fname)): patched += 1
+                      except: pass
+          print(f'Patched: {patched}')
+          with open('/tmp/fa_cnt.txt', 'w') as f: f.write(str(patched))
           PYSCRIPT
+          PC=$(cat /tmp/fa_cnt.txt 2>/dev/null || echo "0")
+          if [ "$PC" -gt 0 ] 2>/dev/null; then flutter pub get || true; fi
 
-          echo ""
-          PATCHED_COUNT=$(cat /tmp/fa_patched_count.txt 2>/dev/null || echo "0")
-          echo "Files patched: $PATCHED_COUNT"
-
-          if [ "$PATCHED_COUNT" -gt 0 ] 2>/dev/null; then
-            echo "Re-running flutter pub get after source patches..."
-            flutter pub get || true
-          fi
-
-      - name: Patch Android Config
-        run: |
-          # Sanitize app_name: strip anything that isn't alphanumeric, space, dash, underscore, dot
-          SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
-          MANIFEST="android/app/src/main/AndroidManifest.xml"
-          if [ -f "$MANIFEST" ]; then
-            if [ -n "$SAFE_APP_NAME" ] && [ "$SAFE_APP_NAME" != "MyApp" ]; then
-              sed -i "s|android:label=\"[^\"]*\"|android:label=\"$SAFE_APP_NAME\"|g" "$MANIFEST"
-              echo "App name patched: $SAFE_APP_NAME"
-            fi
-          fi
-
-      - name: Decode Keystore (if configured)
-        if: env.KEYSTORE_BASE64 != ''
-        run: |
-          echo "$KEYSTORE_BASE64" | base64 --decode > android/app/keystore.jks
-          echo "Keystore decoded"
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-
-      - name: Build APK
+      - name: Patch Android + Build APK
         if: inputs.build_format == 'apk' || inputs.build_format == 'both'
         run: |
-          echo "=== Build APK ==="
-          echo "Flutter version: $(flutter --version 2>/dev/null | head -1)"
-          echo "Project dir: $(pwd)"
-          echo "pubspec.yaml exists: $(test -f pubspec.yaml && echo YES || echo NO)"
-          echo ""
-
+          SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ] && [ -n "$SAFE_APP_NAME" ] && [ "$SAFE_APP_NAME" != "MyApp" ]; then
+            sed -i "s|android:label=\"[^\"]*\"|android:label=\"$SAFE_APP_NAME\"|g" "$MANIFEST"
+          fi
           if [ "$INPUT_BUILD_TYPE" = "release" ]; then
-            echo "Building RELEASE APK..."
             flutter build apk --release --no-tree-shake-icons 2>&1 | tee build_output.txt
           else
-            echo "Building DEBUG APK..."
             flutter build apk --debug --no-tree-shake-icons 2>&1 | tee build_output.txt
           fi
-
-          APK_PATH=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1)
+          APK_PATH=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1 || find build/app/outputs/apk -name "*.apk" 2>/dev/null | head -1)
           if [ -z "$APK_PATH" ]; then
-            APK_PATH=$(find build/app/outputs/apk -name "*.apk" 2>/dev/null | head -1)
-          fi
-
-          if [ -z "$APK_PATH" ]; then
-            echo ""
-            echo "=== BUILD FAILED! ==="
-            echo ""
-            if [ -f build_output.txt ] && [ -s build_output.txt ]; then
-              echo "Last 30 lines of build output:"
-              tail -30 build_output.txt
-              echo ""
-              echo "Error lines:"
-              grep -i "error\|failed\|exception" build_output.txt 2>/dev/null | tail -15 || echo "(no specific errors found)"
-            else
-              echo "No build output captured! flutter build may have failed to start."
-            fi
+            echo "=== BUILD FAILED ==="
+            tail -30 build_output.txt
             exit 1
           fi
+          echo "APK: $APK_PATH ($(du -sh "$APK_PATH" | cut -f1))"
 
-          echo "APK built: $APK_PATH ($(du -sh "$APK_PATH" | cut -f1))"
-
-      - name: Build AAB (App Bundle)
+      - name: Patch Android + Build AAB
         if: inputs.build_format == 'aab' || inputs.build_format == 'both'
         run: |
+          SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ] && [ -n "$SAFE_APP_NAME" ] && [ "$SAFE_APP_NAME" != "MyApp" ]; then
+            sed -i "s|android:label=\"[^\"]*\"|android:label=\"$SAFE_APP_NAME\"|g" "$MANIFEST"
+          fi
           if [ "$INPUT_BUILD_TYPE" = "release" ]; then
-            echo "Building RELEASE AAB..."
             flutter build appbundle --release --no-tree-shake-icons 2>&1 | tee build_output_aab.txt
           else
-            echo "Building DEBUG AAB..."
             flutter build appbundle --debug --no-tree-shake-icons 2>&1 | tee build_output_aab.txt
           fi
-
           AAB_PATH=$(find build/app/outputs/bundle -name "*.aab" 2>/dev/null | head -1)
           if [ -z "$AAB_PATH" ]; then
-            echo "AAB not found!"
-            grep -i "error\|failed\|exception" build_output_aab.txt 2>/dev/null | tail -10 || echo "(no specific errors found)"
-            exit 1
+            echo "AAB FAILED!"; exit 1
           fi
 
-          echo "AAB built: $AAB_PATH ($(du -sh "$AAB_PATH" | cut -f1))"
-
-      - name: Upload APK Artifact
+      - name: Upload APK
         if: inputs.build_format == 'apk' || inputs.build_format == 'both'
         uses: actions/upload-artifact@v4
         with:
@@ -532,7 +267,7 @@ jobs:
           path: build/app/outputs/flutter-apk/*.apk
           retention-days: 7
 
-      - name: Upload AAB Artifact
+      - name: Upload AAB
         if: inputs.build_format == 'aab' || inputs.build_format == 'both'
         uses: actions/upload-artifact@v4
         with:
@@ -540,75 +275,41 @@ jobs:
           path: build/app/outputs/bundle/**/*.aab
           retention-days: 7
 
-      - name: Send Output to Telegram
+      - name: Send to Telegram
         if: inputs.chat_id != '' && inputs.bot_token != ''
         run: |
-          BUILD_TYPE="$INPUT_BUILD_TYPE"
-          BUILD_FORMAT="$INPUT_BUILD_FORMAT"
-          # Sanitize app_name for caption
           SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
-
-          # Send APK
-          if [ "$BUILD_FORMAT" = "apk" ] || [ "$BUILD_FORMAT" = "both" ]; then
+          if [ "$INPUT_BUILD_FORMAT" = "apk" ] || [ "$INPUT_BUILD_FORMAT" = "both" ]; then
             APK=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1)
             if [ -n "$APK" ]; then
               SIZE=$(du -sh "$APK" | cut -f1)
-              CAPTION=$(printf 'APK Build Selesai!\n\nApp: %s\nTipe: %s\nSize: %s\n\nby Deruzuan Dev' "$SAFE_APP_NAME" "$BUILD_TYPE" "$SIZE")
+              CAPTION=$(printf '✅ APK Udah Jadi!\n%s | %s | %s' "$SAFE_APP_NAME" "$INPUT_BUILD_TYPE" "$SIZE")
               curl -s -X POST "https://api.telegram.org/bot${INPUT_BOT_TOKEN}/sendDocument" \
-                -F "chat_id=${INPUT_CHAT_ID}" \
-                -F "document=@$APK" \
-                -F "parse_mode=HTML" \
-                --form-string "caption=$CAPTION"
+                -F "chat_id=${INPUT_CHAT_ID}" -F "document=@$APK" --form-string "caption=$CAPTION"
             fi
           fi
-
-          # Send AAB
-          if [ "$BUILD_FORMAT" = "aab" ] || [ "$BUILD_FORMAT" = "both" ]; then
+          if [ "$INPUT_BUILD_FORMAT" = "aab" ] || [ "$INPUT_BUILD_FORMAT" = "both" ]; then
             AAB=$(find build/app/outputs/bundle -name "*.aab" 2>/dev/null | head -1)
             if [ -n "$AAB" ]; then
               SIZE=$(du -sh "$AAB" | cut -f1)
-              CAPTION=$(printf 'AAB Build Selesai!\n\nApp: %s\nTipe: %s\nSize: %s\n\nby Deruzuan Dev' "$SAFE_APP_NAME" "$BUILD_TYPE" "$SIZE")
+              CAPTION=$(printf '✅ AAB Udah Jadi!\n%s | %s | %s' "$SAFE_APP_NAME" "$INPUT_BUILD_TYPE" "$SIZE")
               curl -s -X POST "https://api.telegram.org/bot${INPUT_BOT_TOKEN}/sendDocument" \
-                -F "chat_id=${INPUT_CHAT_ID}" \
-                -F "document=@$AAB" \
-                -F "parse_mode=HTML" \
-                --form-string "caption=$CAPTION"
+                -F "chat_id=${INPUT_CHAT_ID}" -F "document=@$AAB" --form-string "caption=$CAPTION"
             fi
           fi
 
       - name: Notify Failure
         if: failure()
         run: |
-          # Collect error summary from available log files
           ERROR_SUMMARY="Build gagal"
           if [ -f build_output.txt ]; then
             ERROR_SUMMARY=$(grep -i "error\|failed\|exception" build_output.txt 2>/dev/null | head -5 | tr '\n' ' ')
-            [ -z "$ERROR_SUMMARY" ] && ERROR_SUMMARY="Build gagal (no specific error in APK log)"
           fi
-          if [ -z "$ERROR_SUMMARY" ] || [ "$ERROR_SUMMARY" = "Build gagal" ]; then
-            if [ -f build_output_aab.txt ]; then
-              ERROR_SUMMARY=$(grep -i "error\|failed\|exception" build_output_aab.txt 2>/dev/null | head -5 | tr '\n' ' ')
-              [ -z "$ERROR_SUMMARY" ] && ERROR_SUMMARY="Build gagal (no specific error in AAB log)"
-            fi
-          fi
-
-          # Also check if it's an early failure (download/extract)
-          if [ ! -f build_output.txt ] && [ ! -f build_output_aab.txt ]; then
-            ERROR_SUMMARY="Build gagal di tahap awal (download/extract/project setup). Cek workflow log untuk detail."
-          fi
-
-          # Truncate error summary to avoid Telegram API limits
+          [ -z "$ERROR_SUMMARY" ] && ERROR_SUMMARY="Build gagal di awal."
           ERROR_SUMMARY=$(echo "$ERROR_SUMMARY" | cut -c1-500)
-
           if [ -n "$INPUT_CHAT_ID" ] && [ -n "$INPUT_BOT_TOKEN" ]; then
             SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
-            MSG=$(printf 'Build Gagal!\n\nApp: %s\nTipe: %s\nError: %s' "$SAFE_APP_NAME" "$INPUT_BUILD_TYPE" "$ERROR_SUMMARY")
+            MSG=$(printf '❌ Build Gagal\n%s | %s\n%s' "$SAFE_APP_NAME" "$INPUT_BUILD_TYPE" "$ERROR_SUMMARY")
             curl -s -X POST "https://api.telegram.org/bot${INPUT_BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${INPUT_CHAT_ID}" \
-              --data-urlencode "parse_mode=HTML" \
-              --data-urlencode "text=$MSG"
+              --data-urlencode "chat_id=${INPUT_CHAT_ID}" --data-urlencode "text=$MSG"
           fi
-
-          # Always output to workflow log
-          echo "BUILD FAILED"
-          echo "Error summary: $ERROR_SUMMARY"
