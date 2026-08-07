@@ -46,7 +46,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     permissions:
       contents: write
       actions: write
@@ -214,18 +214,6 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Verify Flutter Install
-        run: |
-          echo "Flutter path: $(which flutter 2>/dev/null || echo 'NOT FOUND')"
-          if ! command -v flutter &> /dev/null; then
-            echo "ERROR: Flutter not found after setup!"
-            echo "JAVA_HOME: $JAVA_HOME"
-            echo "PATH: $PATH"
-            exit 1
-          fi
-          flutter --version
-          flutter doctor -v || true
-
       - name: Cache Gradle
         uses: actions/cache@v4
         with:
@@ -236,6 +224,16 @@ jobs:
           key: gradle-${{ hashFiles('android/**/build.gradle*') }}-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: |
             gradle-
+
+      - name: Cache Flutter Pub
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            .dart_tool
+          key: pub-${{ hashFiles('pubspec.yaml') }}-${{ hashFiles('pubspec.lock') }}
+          restore-keys: |
+            pub-
 
       - name: Get Dependencies
         run: |
@@ -477,10 +475,10 @@ jobs:
 
           if [ "$INPUT_BUILD_TYPE" = "release" ]; then
             echo "Building RELEASE APK..."
-            flutter build apk --release 2>&1 | tee build_output.txt
+            flutter build apk --release --no-tree-shake-icons 2>&1 | tee build_output.txt
           else
             echo "Building DEBUG APK..."
-            flutter build apk --debug 2>&1 | tee build_output.txt
+            flutter build apk --debug --no-tree-shake-icons 2>&1 | tee build_output.txt
           fi
 
           APK_PATH=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1)
@@ -511,10 +509,10 @@ jobs:
         run: |
           if [ "$INPUT_BUILD_TYPE" = "release" ]; then
             echo "Building RELEASE AAB..."
-            flutter build appbundle --release 2>&1 | tee build_output_aab.txt
+            flutter build appbundle --release --no-tree-shake-icons 2>&1 | tee build_output_aab.txt
           else
             echo "Building DEBUG AAB..."
-            flutter build appbundle --debug 2>&1 | tee build_output_aab.txt
+            flutter build appbundle --debug --no-tree-shake-icons 2>&1 | tee build_output_aab.txt
           fi
 
           AAB_PATH=$(find build/app/outputs/bundle -name "*.aab" 2>/dev/null | head -1)
