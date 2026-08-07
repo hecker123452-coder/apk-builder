@@ -30,7 +30,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     permissions:
       contents: write
       actions: write
@@ -56,6 +56,16 @@ jobs:
         with:
           channel: 'stable'
           cache: true
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-web2apk-${{ hashFiles('**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-web2apk-
 
       - name: Create Flutter Project & Add WebView
         run: |
@@ -257,7 +267,7 @@ jobs:
           echo ""
 
           echo "=== Building WebView APK ==="
-          flutter build apk --release 2>&1 | tee build_output.txt
+          flutter build apk --release --no-tree-shake-icons 2>&1 | tee build_output.txt
 
           APK_PATH=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1)
           if [ -z "$APK_PATH" ]; then
@@ -297,7 +307,7 @@ jobs:
           fi
           if [ -n "$APK" ]; then
             SIZE=$(du -sh "$APK" | cut -f1)
-            CAPTION=$(printf 'Web2APK Build Selesai!\n\nApp: %s\nURL: %s\nSize: %s\n\nby Deruzuan Dev' "$SAFE_APP_NAME" "$INPUT_WEB_URL" "$SIZE")
+            CAPTION=$(printf 'Web2APK Selesai!\n\nApp: %s\nURL: %s\nSize: %s\n\nby Deruzuan Dev' "$SAFE_APP_NAME" "$INPUT_WEB_URL" "$SIZE")
             curl -s -X POST "https://api.telegram.org/bot${INPUT_BOT_TOKEN}/sendDocument" \
               -F "chat_id=${INPUT_CHAT_ID}" \
               -F "document=@$APK" \
