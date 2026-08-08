@@ -69,6 +69,9 @@ jobs:
           restore-keys: |
             w2a-
 
+      - name: Install ImageMagick
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick
+
       - name: Create Project + WebView + Icon + Build
         run: |
           SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
@@ -175,18 +178,72 @@ jobs:
             fi
           fi
 
-          # Download icon
+          # ── Icon processing with ImageMagick + PNG validation ──
+          ICON_APPLIED=false
           if [ -n "$INPUT_ICON_URL" ]; then
-            HTTP_CODE=$(curl -sL -w "%{http_code}" -o /tmp/app_icon.png --retry 2 --retry-delay 2 "$INPUT_ICON_URL")
-            if [ "$HTTP_CODE" -eq 200 ] && [ -s /tmp/app_icon.png ]; then
-              FILE_TYPE=$(file /tmp/app_icon.png 2>/dev/null || echo "unknown")
-              if echo "$FILE_TYPE" | grep -qi "png\|jpeg\|image\|bitmap"; then
-                for dir in android/app/src/main/res/mipmap-*; do
-                  if [ -d "$dir" ]; then cp /tmp/app_icon.png "$dir/ic_launcher.png" 2>/dev/null || true; fi
-                done
-                echo "Icon applied!"
+            echo "Nge-download icon dari: $INPUT_ICON_URL"
+            HTTP_CODE=$(curl -sL -w "%{http_code}" -o /tmp/app_icon_raw --retry 3 --retry-delay 2 --max-time 15 "$INPUT_ICON_URL")
+            if [ "$HTTP_CODE" -eq 200 ] && [ -s /tmp/app_icon_raw ]; then
+              # Check file is actually an image via magic bytes
+              FILE_MAGIC=$(xxd -l 8 -p /tmp/app_icon_raw 2>/dev/null || echo "")
+              FILE_TYPE=$(file -b /tmp/app_icon_raw 2>/dev/null || echo "unknown")
+              echo "Magic: $FILE_MAGIC | Type: $FILE_TYPE"
+
+              IS_IMAGE=false
+              # PNG: 89504e47
+              if echo "$FILE_MAGIC" | grep -qi "^89504e47"; then IS_IMAGE=true; fi
+              # JPEG: ffd8ff
+              if echo "$FILE_MAGIC" | grep -qi "^ffd8ff"; then IS_IMAGE=true; fi
+              # GIF: 47494638
+              if echo "$FILE_MAGIC" | grep -qi "^47494638"; then IS_IMAGE=true; fi
+              # WebP: 52494646...57454250
+              if echo "$FILE_MAGIC" | grep -qi "^52494646"; then IS_IMAGE=true; fi
+              # BMP: 424d
+              if echo "$FILE_MAGIC" | grep -qi "^424d"; then IS_IMAGE=true; fi
+              # SVG (text-based, check file type)
+              if echo "$FILE_TYPE" | grep -qi "svg"; then IS_IMAGE=true; fi
+
+              if [ "$IS_IMAGE" = true ]; then
+                echo "File valid sebagai image, konversi ke PNG..."
+                # Convert to proper PNG with ImageMagick
+                # -strip removes metadata, -resize fits, -define png:compression-level=9 optimizes
+                if convert /tmp/app_icon_raw -strip -resize 512x512 -gravity center -extent 512x512 -define png:compression-level=9 -define png:compression-filter=5 /tmp/app_icon_valid.png 2>/dev/null; then
+                  # Double-check: verify the converted PNG magic bytes
+                  PNG_MAGIC=$(xxd -l 4 -p /tmp/app_icon_valid.png 2>/dev/null || echo "")
+                  if [ "$PNG_MAGIC" = "89504e47" ]; then
+                    echo "PNG valid! Applying ke mipmap directories..."
+                    # Android mipmap sizes: mdpi=48, hdpi=72, xhdpi=96, xxhdpi=144, xxxhdpi=192
+                    for dir in android/app/src/main/res/mipmap-*; do
+                      if [ -d "$dir" ]; then
+                        dirname=$(basename "$dir")
+                        case "$dirname" in
+                          mipmap-mdpi)    SIZE=48  ;;
+                          mipmap-hdpi)    SIZE=72  ;;
+                          mipmap-xhdpi)   SIZE=96  ;;
+                          mipmap-xxhdpi)  SIZE=144 ;;
+                          mipmap-xxxhdpi) SIZE=192 ;;
+                          *)              SIZE=96  ;;
+                        esac
+                        convert /tmp/app_icon_valid.png -resize ${SIZE}x${SIZE} -define png:compression-level=9 "$dir/ic_launcher.png" 2>/dev/null && \
+                        echo "  $dirname -> ${SIZE}x${SIZE} OK" || echo "  $dirname -> GAGAL, pake default"
+                      fi
+                    done
+                    ICON_APPLIED=true
+                    echo "Icon berhasil di-apply!"
+                  else
+                    echo "Konversi PNG gagal (magic byte gak valid), pake icon default Flutter"
+                  fi
+                else
+                  echo "ImageMagick convert gagal, pake icon default Flutter"
+                fi
+              else
+                echo "File bukan image valid (magic: $FILE_MAGIC), pake icon default Flutter"
               fi
+            else
+              echo "Download gagal (HTTP $HTTP_CODE atau file kosong), pake icon default Flutter"
             fi
+          else
+            echo "Gak ada icon URL, pake icon default Flutter"
           fi
 
           # Build
