@@ -72,6 +72,10 @@ jobs:
       - name: Install Flutter
         uses: subosito/flutter-action@v2
         with:
+          # ── ⚠️ v4.8: WAJIB PIN VERSI! Flutter stable baru (AGP 9) nolak
+          # plugin lama yang masih pake proguard-android.txt → build gagal massal.
+          # 3.47.2 = versi deterministik, template & auto-fix sudah tervalidasi.
+          flutter-version: '3.47.2'
           channel: 'stable'
           cache: true
 
@@ -228,6 +232,11 @@ jobs:
           if [ -f "$MANIFEST" ] && [ -n "$SAFE_APP_NAME" ] && [ "$SAFE_APP_NAME" != "MyApp" ]; then
             sed -i "s|android:label=\"[^\"]*\"|android:label=\"$SAFE_APP_NAME\"|g" "$MANIFEST"
           fi
+          # ── ⚙️ v4.8 AGP9 safety net: patch plugin pub-cache lama yang masih
+          # pake proguard-android.txt (di-blok AGP 9+). Non-fatal. (APK step)
+          find "$HOME/.pub-cache/hosted" -name "build.gradle" -path "*android*" \
+            -exec sed -i "s/getDefaultProguardFile('proguard-android.txt')/getDefaultProguardFile('proguard-android-optimize.txt')/g" {} + 2>/dev/null || true
+          echo "AGP9 proguard safety patch (APK): OK"
           if [ "$INPUT_BUILD_TYPE" = "release" ]; then
             flutter build apk --release --no-tree-shake-icons 2>&1 | tee build_output.txt
           else
@@ -249,6 +258,10 @@ jobs:
           if [ -f "$MANIFEST" ] && [ -n "$SAFE_APP_NAME" ] && [ "$SAFE_APP_NAME" != "MyApp" ]; then
             sed -i "s|android:label=\"[^\"]*\"|android:label=\"$SAFE_APP_NAME\"|g" "$MANIFEST"
           fi
+          # ── ⚙️ v4.8 AGP9 safety net (AAB step) — sama kayak step APK.
+          find "$HOME/.pub-cache/hosted" -name "build.gradle" -path "*android*" \
+            -exec sed -i "s/getDefaultProguardFile('proguard-android.txt')/getDefaultProguardFile('proguard-android-optimize.txt')/g" {} + 2>/dev/null || true
+          echo "AGP9 proguard safety patch (AAB): OK"
           if [ "$INPUT_BUILD_TYPE" = "release" ]; then
             flutter build appbundle --release --no-tree-shake-icons 2>&1 | tee build_output_aab.txt
           else
