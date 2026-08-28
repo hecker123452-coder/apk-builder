@@ -1,22 +1,28 @@
 name: Web2APK
 
 # ============================================================================
-# DZR CloudBuilder — Web2APK Workflow v5.0 (SITUS OFFLINE ZIP + TABS + OTA)
+# DZR CloudBuilder — Web2APK Workflow v5.1 (OTA DICABUT → PENGUMUMAN GLOBAL)
 # ============================================================================
+# FIX LOG v5.1 (request owner: "malas 2 nya lu gantiin aja" — OTA ditukar):
+#   1. OTA IN-APP UPDATE DICABUT  : input update_url & version_code dihapus,
+#      Dart _checkUpdate + banner update + manifest per-app (updates/<pkg>.json)
+#      + release ota-<pkg> gak dipake lagi. Penggantinya di sisi BOT: tiap
+#      build sukses, APK di-upload ke release `apk-<pkg>` (rolling) → bot
+#      kirim 🔗 link download permanen + QR code (scan = download).
+#   2. PENGUMUMAN GLOBAL (BARU)   : app ngefetch `announcements/global.json`
+#      dari repo raw pas start + tiap 8 jam. Owner kirim `/pengumuman <teks>`
+#      di bot → SEMUA app nampilin banner oranye (bisa dikasih link, bisa
+#      ditutup, matiin pake `/pengumumanoff`). Tanpa FCM, tanpa Firebase.
+#   Fitur v5.0 tetep: situs offline ZIP, multi-tab + bottom nav, splash
+#   custom, tema gelap, APK hemat arm64. Fitur v4.5–v4.8 tetep:
+#   flutter_inappwebview 6.1.5, pin Flutter 3.47.2 + AGP9 proguard safety net.
+#
 # FIX LOG v5.0:
 #   1. SITUS OFFLINE (ZIP) : input html_zip_url (direct download URL release
 #      ZIP situs statis: index.html+css+js+gambar, max ~25MB) → di-download &
 #      di-unzip ke assets/webapp → APK jalan OFFLINE penuh via localhost server.
 #   2. MULTI-TAB           : input tabs_json (JSON array [{label,url}], max 3)
 #      → app dapat bottom navigation bar, swap URL antar tab.
-#   3. OTA UPDATE          : input update_url (raw URL manifest JSON) +
-#      version_code (stempel waktu build). App cek manifest pas start + tiap
-#      8 jam → kalo ada versi lebih baru, muncul banner "Update tersedia" →
-#      tap = buka browser download APK baru. Manifest di-push bot ke
-#      updates/<pkg>.json + APK di-upload ke release ota-<pkg>.
-#   Semua fitur v4.5–v4.8 tetep: flutter_inappwebview 6.1.5 (anti layar putih,
-#   backend support, pull-to-refresh, splash custom, tema gelap), pin Flutter
-#   3.47.2 + AGP9 proguard safety net.
 #
 # FIX LOG v4.6:
 #   1. OPSI BUILD DI BOT  : sebelum build, user bisa atur:
@@ -97,14 +103,6 @@ on:
         description: 'v5.0 JSON array [{label,url}] max 3 — bottom navigation'
         required: false
         default: ''
-      update_url:
-        description: 'v5.0 Raw URL manifest OTA (updates/<pkg>.json), kosong = off'
-        required: false
-        default: ''
-      version_code:
-        description: 'v5.0 Kode versi build (unix ms) buat perbandingan OTA'
-        required: false
-        default: '0'
 
 jobs:
   build:
@@ -126,8 +124,8 @@ jobs:
       INPUT_SMALL_APK: ${{ inputs.small_apk }}
       INPUT_HTML_ZIP_URL: ${{ inputs.html_zip_url }}
       INPUT_TABS_JSON: ${{ inputs.tabs_json }}
-      INPUT_UPDATE_URL: ${{ inputs.update_url }}
-      INPUT_VERSION_CODE: ${{ inputs.version_code }}
+      # ── v5.1: slug "owner/repo" buat URL pengumuman global (tanpa input bot) ──
+      GITHUB_SLUG: ${{ github.repository }}
 
     steps:
       - name: Setup JDK
@@ -408,12 +406,10 @@ jobs:
           const bool kDarkTheme = __DARK_THEME__;
           const Color kBgColor = kDarkTheme ? Color(0xFF121212) : Colors.white;
 
-          // ── v5.0: OTA update & multi-tab (diisi token replacement saat build) ──
-          // kUpdateUrl : raw URL manifest updates/<pkg>.json ('' = OTA off)
-          // kVersionCode : stempel waktu build ini — app update kalo manifest > ini
+          // ── v5.1: pengumuman & multi-tab (diisi token replacement saat build) ──
+          // kAnnounceUrl : raw URL announcements/global.json ('' = fitur off)
           // kTabsJson : JSON [{label,url}] (max 3) — '[]' = 1 tab (tanpa nav bawah)
-          const int kVersionCode = __VERSION_CODE__;
-          const String kUpdateUrl = '__UPDATE_URL__';
+          const String kAnnounceUrl = '__ANNOUNCE_URL__';
           const String kTabsJson = '__TABS_JSON__';
 
           class WebViewApp extends StatelessWidget {
@@ -471,13 +467,14 @@ jobs:
             int _reloadKey = 0;
             Timer? _slowTimer;
 
-            // ── 📑 v5.0: multi-tab & 🔄 OTA update state ──
+            // ── 📑 v5.0: multi-tab & 📢 v5.1: pengumuman state ──
             List<Map<String, String>> _tabs = const [];
             int _tabIndex = 0;
             String _currentTarget = _target;
-            Timer? _updateTimer;
-            bool _updateAvailable = false;
-            String _updateApkUrl = '';
+            Timer? _announceTimer;
+            bool _announceVisible = false;
+            String _announceMsg = '';
+            String _announceLink = '';
 
             // ── Settings max-compatibility (intinya: perlakuin webview kayak Chrome) ──
             final InAppWebViewSettings _settings = InAppWebViewSettings(
@@ -529,9 +526,9 @@ jobs:
               } catch (_) {
                 _tabs = const [];
               }
-              // ── 🔄 v5.0: cek update OTA pas start + tiap 8 jam selagi app buka ──
-              _checkUpdate();
-              _updateTimer = Timer.periodic(const Duration(hours: 8), (_) => _checkUpdate());
+              // ── 📢 v5.1: tarik pengumuman pas start + tiap 8 jam selagi app buka ──
+              _fetchAnnouncement();
+              _announceTimer = Timer.periodic(const Duration(hours: 8), (_) => _fetchAnnouncement());
               // Splash hilang maksimal 6 detik, biar halaman lambat gak keliatan "mati"
               Future.delayed(const Duration(seconds: 6), () {
                 if (mounted && _showSplash) {
@@ -543,7 +540,7 @@ jobs:
             @override
             void dispose() {
               _slowTimer?.cancel();
-              _updateTimer?.cancel();
+              _announceTimer?.cancel();
               super.dispose();
             }
 
@@ -591,30 +588,31 @@ jobs:
               }
             }
 
-            // ── 🔄 v5.0: cek manifest OTA (raw.githubusercontent). Senyap kalo gagal. ──
-            // Manifest: {"versionCode": <unix-ms>, "apkUrl": "https://...apk"}
-            // Kalo versionCode manifest > versi build ini → tampilin banner update.
-            Future<void> _checkUpdate() async {
-              if (kUpdateUrl.isEmpty || kVersionCode <= 0) return;
+            // ── 📢 v5.1: tarik pengumuman global (raw.githubusercontent).
+            // Format file: {"id": <unix-ms>, "message": "teks", "url": "https://..."}
+            // message kosong / gagal / offline = senyap, jangan ganggu user.
+            Future<void> _fetchAnnouncement() async {
+              if (kAnnounceUrl.isEmpty) return;
               HttpClient? hc;
               try {
                 hc = HttpClient();
                 hc.connectionTimeout = const Duration(seconds: 10);
-                final req = await hc.getUrl(Uri.parse(kUpdateUrl));
+                final req = await hc.getUrl(Uri.parse(kAnnounceUrl));
                 final resp = await req.close();
                 if (resp.statusCode != 200) return;
                 final body = await resp.transform(utf8.decoder).join();
                 final data = jsonDecode(body);
-                final remote = data['versionCode'];
-                final apkUrl = data['apkUrl'];
-                if (remote is num && remote > kVersionCode && apkUrl is String && apkUrl.isNotEmpty && mounted) {
+                final msg = data['message'];
+                if (msg is String && msg.trim().isNotEmpty && mounted) {
+                  final link = data['url'];
                   setState(() {
-                    _updateAvailable = true;
-                    _updateApkUrl = apkUrl;
+                    _announceVisible = true;
+                    _announceMsg = msg.trim();
+                    _announceLink = (link is String) ? link : '';
                   });
                 }
               } catch (_) {
-                // Offline / manifest belum ada / JSON rusak — diemin aja, jangan ganggu user.
+                // Offline / file belum ada / JSON rusak — diemin aja.
               } finally {
                 hc?.close();
               }
@@ -801,30 +799,34 @@ jobs:
                             ),
                           ),
 
-                        // ── 🔄 v5.0: banner update tersedia (OTA) — tap = buka APK baru ──
-                        if (_updateAvailable)
+                        // ── 📢 v5.1: banner pengumuman owner — tap = buka link (kalo ada) ──
+                        if (_announceVisible)
                           Positioned(
                             top: 0,
                             left: 0,
                             right: 0,
                             child: Material(
-                              color: Colors.blue,
+                              color: Colors.deepOrange,
                               child: InkWell(
-                                onTap: () => _openExternal(WebUri(_updateApkUrl)),
+                                onTap: _announceLink.isEmpty
+                                    ? null
+                                    : () => _openExternal(WebUri(_announceLink)),
                                 child: Padding(
                                   padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                                   child: Row(
                                     children: [
-                                      const Icon(Icons.system_update_alt, color: Colors.white, size: 20),
+                                      const Icon(Icons.campaign, color: Colors.white, size: 20),
                                       const SizedBox(width: 8),
-                                      const Expanded(
+                                      Expanded(
                                         child: Text(
-                                          'Update baru tersedia — tap buat update',
-                                          style: TextStyle(color: Colors.white, fontSize: 13),
+                                          _announceMsg,
+                                          maxLines: 3,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(color: Colors.white, fontSize: 13),
                                         ),
                                       ),
                                       GestureDetector(
-                                        onTap: () => setState(() => _updateAvailable = false),
+                                        onTap: () => setState(() => _announceVisible = false),
                                         child: const Icon(Icons.close, color: Colors.white70, size: 18),
                                       ),
                                     ],
@@ -922,10 +924,10 @@ jobs:
           mode = os.environ.get('W2A_MODE', 'url')
           splash = (os.environ.get('INPUT_SPLASH', 'true') or 'true').strip().lower()
           dark = (os.environ.get('INPUT_DARK_MODE', 'false') or 'false').strip().lower()
-          # ── v5.0: tabs + OTA ──
+          # ── v5.0: tabs ──
           tabs_raw = os.environ.get('INPUT_TABS_JSON', '') or ''
-          update_url = os.environ.get('INPUT_UPDATE_URL', '') or ''
-          version_code = os.environ.get('INPUT_VERSION_CODE', '0') or '0'
+          # ── v5.1: URL pengumuman global dari slug repo (tanpa input bot) ──
+          slug = os.environ.get('GITHUB_SLUG', '') or ''
 
           # Normalisasi bool (true/1/yes/on = true, sisanya false)
           splash = 'true' if splash in ('1', 'true', 'yes', 'on') else 'false'
@@ -963,11 +965,13 @@ jobs:
                       tabs_safe = json.dumps(clean, ensure_ascii=False).replace('\\', '\\\\').replace("'", "\\'")
               except Exception:
                   tabs_safe = '[]'
-          update_url_safe = update_url.strip().replace('\\', '\\\\').replace("'", "\\'")
-          try:
-              version_code_safe = str(int(version_code))
-          except Exception:
-              version_code_safe = '0'
+          announce_url_safe = ''
+          if slug.strip():
+              # raw.githubusercontent cache ±5 menit — banner muncul maks 5 mnt
+              # setelah owner /pengumuman. Escape buat Dart single-quoted literal.
+              announce_url_safe = ('https://raw.githubusercontent.com/' + slug.strip()
+                                   + '/main/announcements/global.json')
+              announce_url_safe = announce_url_safe.replace('\\', '\\\\').replace("'", "\\'")
 
           with open('lib/main.dart', 'r', encoding='utf-8') as f:
               src = f.read()
@@ -985,16 +989,14 @@ jobs:
                   return dark
               if tok == '__TABS_JSON__':
                   return tabs_safe
-              if tok == '__UPDATE_URL__':
-                  return update_url_safe
-              if tok == '__VERSION_CODE__':
-                  return version_code_safe
+              if tok == '__ANNOUNCE_URL__':
+                  return announce_url_safe
               return tok
 
-          src = re.sub(r'__(?:APP_NAME|WEB_URL|SHOW_SPLASH|DARK_THEME|TABS_JSON|UPDATE_URL|VERSION_CODE)__', repl, src)
+          src = re.sub(r'__(?:APP_NAME|WEB_URL|SHOW_SPLASH|DARK_THEME|TABS_JSON|ANNOUNCE_URL)__', repl, src)
 
           # Safety net: gak boleh ada token tersisa di main.dart
-          leftover = re.findall(r'__(?:APP_NAME|WEB_URL|SHOW_SPLASH|DARK_THEME|TABS_JSON|UPDATE_URL|VERSION_CODE)__', src)
+          leftover = re.findall(r'__(?:APP_NAME|WEB_URL|SHOW_SPLASH|DARK_THEME|TABS_JSON|ANNOUNCE_URL)__', src)
           if leftover:
               raise SystemExit('ERROR: token tersisa di main.dart: %s' % leftover)
 
@@ -1034,7 +1036,7 @@ jobs:
               print('Assets registered:', need)
 
           print('Token applied. Mode:', mode, '| splash:', splash, '| dark:', dark)
-          print('v5.0:', 'tabs=' + tabs_safe if tabs_safe != '[]' else 'tabs=off', '| ota=' + ('on' if update_url_safe else 'off'), '| versionCode=' + version_code_safe)
+          print('v5.1:', 'tabs=' + tabs_safe if tabs_safe != '[]' else 'tabs=off', '| announce=' + ('on' if announce_url_safe else 'off'))
           if mode == 'url':
               print('URL set to:', web_url)
 
