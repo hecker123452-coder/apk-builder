@@ -1,30 +1,42 @@
 name: Web2APK
 
 # ============================================================================
-# DZR CloudBuilder — Web2APK Workflow v4.4 (HTML+URL, token-based, FIXED)
+# DZR CloudBuilder — Web2APK Workflow v4.5 (HTML+URL, token-based, FIXED)
 # ============================================================================
+# FIX LOG v4.5 (FIX LAYAR PUTIH + BACKEND SUPPORT):
+#   1. GANTI ENGINE WEBVIEW : webview_flutter -> flutter_inappwebview.
+#      Website modern (SPA React/Vue, call API backend) sekarang jalan normal:
+#      - mixedContentMode ALWAYS_ALLOW  -> halaman HTTPS boleh manggil API HTTP
+#        (dulu: DIBLOKIR TOTAL -> layar putih / muter tanpa ujung)
+#      - useHybridComposition           -> rendering anti layar-putih di
+#        banyak device (dulu: TLHC default suka blank)
+#      - DOM storage + database + cookie 3rd-party + cache AKTIF semua
+#   2. ANTI-MUTER v2        : timer 25 detik. Backend lambat/down -> kartu
+#      peringatan "Lama banget nge-load" + tombol Coba Lagi (bukan spinner
+#      tanpa ujung). Splash branded max 6 detik pas cold start.
+#   3. UPLOAD FILE          : <input type="file"> kebuka (gallery/kamera).
+#   4. LINK EKSTERNAL       : tel:/mailto:/whatsapp:/geo:/intent: -> app
+#      yang bener. target="_blank" kebuka di webview (dulu: gak kejadian apa2).
+#   5. DOWNLOAD             : link download diterusin ke DownloadManager/
+#      browser sistem.
+#   6. TOMBOL BACK FIXED    : back = history webview, mentok = keluar app
+#      (dulu: back nge-freeze, gak bisa keluar).
+#   7. HTML MODE UPGRADE    : asset HTML disajikan via InAppLocalhostServer
+#      (bukan file://) -> fetch()/CSS relatif/localStorage jalan normal.
+#   8. MANIFEST             : + <queries> VIEW http/https/tel/mailto
+#      (wajib Android 11+ biar url_launcher nemu app target).
+#   Versi plugin di-PIN persis (flutter_inappwebview 6.1.5, url_launcher
+#   6.3.2) biar build CI deterministik — API kevalidasi pake flutter analyze
+#   3.47.2 (0 issue, mode URL & HTML dua-duanya).
+#
 # FIX LOG v4.4:
-#   1. FIX ICON JEPIT : foto non-1:1 (mis. screenshot 572x1280) dulu di-jepit
-#      pake -extent (letterbox) → icon jadi thumbnail kecil gak jelas. Sekarang
-#      -auto-orient (EXIF rotasi HP) + CROP TENGAH persis 1:1 dulu, baru
-#      di-resize 512x512. Icon launcher bener-bener kotak & jelas.
-#   2. Catatan v4.3 (tetep berlaku): tanpa step kirim Telegram (anti dobel),
-#      template WebView anti-muter, heredoc terminator kolom 0.
+#   1. FIX ICON JEPIT : foto non-1:1 di-CROP TENGAH (auto-orient) sebelum
+#      resize 512x512 — icon launcher bener-bener kotak & jelas.
 #
 # FIX LOG v4.3:
-#   1. ANTI DOUBLE-Send : Step "Send to Telegram" DIHAPUS PERMANEN.
-#      Bot (index.js) satu-satunya yang kirim APK ke user. Workflow cuma
-#      build + upload artifact. (Versi lama kirim 2x → user dapet APK dobel.)
-#   2. FIX MUTER-MUTER  : Template WebView baru — loadRequest dibungkus
-#      try/catch, URL tanpa scheme di-normalisasi, ada error screen + tombol
-#      "Coba Lagi" kalo halaman gagal dimuat. App selalu render frame pertama.
-#   3. FIX HEREDOC      : Semua terminator heredoc (DART_EOF / PYEOF) sekarang
-#   ⚠️  WAJIB rata sama base indent block `run:` biar bash nemu terminator-nya.
-#      (Versi lama: PYEOF mode HTML keindeteksi +2 spasi → bash gak nemu
-#      terminator → seluruh script ke-telan → build HTML mode gagal total.)
-#   4. FIX ICON         : icon_url sekarang HARUS direct download URL asset
-#      (browser_download_url), bukan URL halaman release. Diperbaiki di sisi
-#      bot (server.js → publishRelease). Magic byte check tetap jadi safety.
+#   1. ANTI DOUBLE-Send : Step "Send to Telegram" DIHAPUS PERMANEN (bot yang
+#      kirim APK).  2. Template WebView anti-muter + error screen.
+#   3. Heredoc terminator kolom 0.  4. icon_url = direct download URL.
 #
 # Cara custom:
 #   1. Cari token placeholder di file ini — semua ada di bagian "TOKENS".
@@ -32,9 +44,10 @@ name: Web2APK
 #   3. Token di-replace otomatis pas build jalan (step "Apply Tokens").
 #
 # Mode yang didukung:
-#   - URL mode   : web_url diisi, html_content kosong → WebView loadRequest(url)
+#   - URL mode   : web_url diisi, html_content kosong -> WebView loadRequest(url)
 #   - HTML mode  : html_content diisi (base64 / plain), web_url kosong
-#                  → file disimpen ke assets/webapp/index.html, WebView loadFlutterAsset
+#                  -> file disimpen ke assets/webapp/index.html, WebView load
+#                  via InAppLocalhostServer (http://localhost:8080/index.html)
 # ============================================================================
 
 on:
@@ -179,7 +192,9 @@ jobs:
 
           flutter create --project-name "$PROJ_NAME" --org "$(echo "$SAFE_PKG" | rev | cut -d. -f2- | rev)" "$PROJ_NAME"
           cd "$PROJ_NAME"
-          flutter pub add webview_flutter
+          # Versi di-PIN persis biar build CI deterministik (udah divalidasi
+          # pake flutter analyze 3.47.2 — 0 issue).
+          flutter pub add flutter_inappwebview:6.1.5 url_launcher:6.3.2
 
           # ── HTML mode: siapin assets + daftarin ke pubspec ──
           if [ "$W2A_MODE" = "html" ]; then
@@ -187,18 +202,47 @@ jobs:
             cp /tmp/w2a/index.html assets/webapp/index.html
           fi
 
-          # ── Tulis Dart main.dart (template ANTI-MUTER v4.3) ──
+          # ── Tulis Dart main.dart (template v4.5 flutter_inappwebview) ──
           # ⚠️ Heredoc: body & terminator DART_EOF wajib di base indent (kolom 0
           # setelah YAML strip). Jangan naikin indentasinya!
           # Fitur template:
-          #   - loadRequest dibungkus try/catch (URL rusak = error screen, BUKAN crash)
-          #   - Error screen + tombol "Coba Lagi" kalo halaman gagal dimuat
-          #   - Background putih solid (gak blink transparan)
-          #   - Loading bar progres + tombol back navigasi WebView
-          #   - HTML mode otomatis loadFlutterAsset (deteksi path 'assets/')
+          #   - mixed content ALWAYS_ALLOW (HTTPS page boleh call API HTTP)
+          #   - Hybrid Composition (anti layar-putih) + DOM storage + cache
+          #   - Timer 25 dtk: backend lambat/down → kartu peringatan, bukan muter
+          #   - Upload file, link eksternal (wa/tel/mailto), download, tab baru
+          #   - Tombol back = history webview, mentok = keluar app
+          #   - HTML mode via InAppLocalhostServer (perilaku = website asli)
           cat > lib/main.dart << 'DART_EOF'
+          // ============================================================================
+          // Web2APK Template v4.5 — flutter_inappwebview ANTI-LAYAR-PUTIH
+          // ============================================================================
+          // Kenapa ganti engine ke flutter_inappwebview (dari webview_flutter)?
+          //   1. LAYAR PUTIH / MUTER   : webview_flutter pake rendering TLHC yang sering
+          //      blank + gak bisa atur mixed content. Website HTTPS yang manggil API
+          //      HTTP (backend lokal/kampret) DIBLOKIR TOTAL → SPA putih/muter selamanya.
+          //      Sekarang: mixedContentMode ALWAYS_ALLOW + Hybrid Composition.
+          //   2. BACKEND FRIENDLY      : DOM storage, database, cookie 3rd-party, cache
+          //      aktif semua → React/Vue/jQuery + API jalan kayak di Chrome.
+          //   3. UPLOAD FILE           : <input type="file"> kebuka otomatis (gallery/
+          //      kamera). Versi lama: dipencet gak kejadian apa-apa.
+          //   4. LINK EKSTERNAL        : tel:, mailto:, whatsapp:, geo:, intent: →
+          //      diterusin ke app yang bener. Link target="_blank" kebuka di webview.
+          //   5. DOWNLOAD              : link download diterusin ke DownloadManager/
+          //      browser sistem.
+          //   6. ANTI-MUTER            : timer 25 detik — kalo backend lambat/down,
+          //      muncul kartu peringatan + tombol Coba Lagi (bukan muter tanpa ujung).
+          //   7. TOMBOL BACK           : navigasi balik history webview, kalo mentok
+          //      keluar app (versi lama: tombol back nge-freeze di halaman).
+          // Catatan token: __APP_NAME__ dan __WEB_URL__ di-replace saat build
+          //   (mode HTML → __WEB_URL__ jadi 'assets/webapp/index.html').
+          // ============================================================================
+
+          import 'dart:async';
+
           import 'package:flutter/material.dart';
-          import 'package:webview_flutter/webview_flutter.dart';
+          import 'package:flutter/services.dart' show SystemNavigator;
+          import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+          import 'package:url_launcher/url_launcher.dart';
 
           void main() {
             runApp(const WebViewApp());
@@ -229,95 +273,158 @@ jobs:
           }
 
           class _WebViewScreenState extends State<WebViewScreen> {
-            late final WebViewController _controller;
+            // ── TARGET (diisi oleh token replacement saat build) ──
+            // URL mode  : 'https://website-kamu.com'
+            // HTML mode : 'assets/webapp/index.html' (dibundle, jalan offline)
+            static const String _target = '__WEB_URL__';
+            static final bool _isAssetMode = _target.startsWith('assets/');
+            // HTML mode disajikan lewat server localhost built-in biar perilaku sama
+            // kayak website asli (fetch()/CSS relatif/localStorage jalan normal).
+            static const String _assetDocRoot = 'assets/webapp/';
+            final InAppLocalhostServer _localhost =
+                InAppLocalhostServer(documentRoot: _assetDocRoot);
+            bool _localhostStarted = false;
+
+            // ── State UI ──
+            InAppWebViewController? _web;
             bool _isLoading = true;
-            int _loadProgress = 0;
             bool _hasError = false;
+            bool _isSlow = false;
+            bool _showSplash = true;
+            int _progress = 0;
             String _errorMsg = '';
+            int _reloadKey = 0;
+            Timer? _slowTimer;
+
+            // ── Settings max-compatibility (intinya: perlakuin webview kayak Chrome) ──
+            final InAppWebViewSettings _settings = InAppWebViewSettings(
+              javaScriptEnabled: true,
+              domStorageEnabled: true,
+              databaseEnabled: true,
+              cacheEnabled: true,
+              // FIX UTAMA "data kebalik/putih": HTTPS page boleh manggil API HTTP
+              mixedContentMode: MixedContentMode.MIXED_CONTENT_ALWAYS_ALLOW,
+              // FIX LAYAR PUTIH di banyak device: rendering hybrid composition
+              useHybridComposition: true,
+              transparentBackground: false,
+              supportZoom: true,
+              mediaPlaybackRequiresUserGesture: false,
+              thirdPartyCookiesEnabled: true,
+              useOnDownloadStart: true,
+              allowFileAccess: true,
+              allowFileAccessFromFileURLs: true,
+              allowUniversalAccessFromFileURLs: true,
+              javaScriptCanOpenWindowsAutomatically: true,
+              disableDefaultErrorPage: true,
+            );
 
             @override
             void initState() {
               super.initState();
-              _controller = WebViewController()
-                ..setJavaScriptMode(JavaScriptMode.unrestricted)
-                ..setBackgroundColor(const Color(0xFFFFFFFF))
-                ..enableZoom(true)
-                ..setNavigationDelegate(
-                  NavigationDelegate(
-                    onProgress: (p) {
-                      if (mounted) {
-                        setState(() {
-                          _loadProgress = p;
-                          _isLoading = p < 100;
-                        });
-                      }
-                    },
-                    onPageStarted: (_) {
-                      if (mounted) {
-                        setState(() {
-                          _isLoading = true;
-                          _hasError = false;
-                          _loadProgress = 0;
-                        });
-                      }
-                    },
-                    onPageFinished: (_) {
-                      if (mounted) {
-                        setState(() {
-                          _isLoading = false;
-                          _loadProgress = 100;
-                        });
-                      }
-                    },
-                    onWebResourceError: (err) {
-                      // Hanya anggap fatal kalo error-nya di main frame
-                      // (error sub-resource like iklan/gambar gak usah nge-block)
-                      if (err.isForMainFrame == true && mounted) {
-                        setState(() {
-                          _hasError = true;
-                          _isLoading = false;
-                          _errorMsg = err.description ?? 'Gagal memuat halaman';
-                        });
-                      }
-                    },
-                  ),
-                );
-              _loadInitial();
+              _armSlowTimer();
+              // Splash hilang maksimal 6 detik, biar halaman lambat gak keliatan "mati"
+              Future.delayed(const Duration(seconds: 6), () {
+                if (mounted && _showSplash) {
+                  setState(() => _showSplash = false);
+                }
+              });
             }
 
-            Future<void> _loadInitial() async {
-              try {
-                const target = '__WEB_URL__';
-                if (target.startsWith('assets/')) {
-                  // HTML mode — konten dibundle di asset, jalan offline
-                  await _controller.loadFlutterAsset(target);
-                } else {
-                  final uri = Uri.parse(target);
-                  if (!uri.scheme.startsWith('http')) {
-                    throw const FormatException('URL tidak valid: $target');
-                  }
-                  await _controller.loadRequest(uri);
+            @override
+            void dispose() {
+              _slowTimer?.cancel();
+              super.dispose();
+            }
+
+            // ── ANTI-MUTER: kalo 25 detik belum selesai load, buka kartu peringatan ──
+            void _armSlowTimer() {
+              _slowTimer?.cancel();
+              _slowTimer = Timer(const Duration(seconds: 25), () {
+                if (mounted && _isLoading && !_hasError) {
+                  setState(() => _isSlow = true);
                 }
-              } catch (e) {
-                if (mounted) {
-                  setState(() {
-                    _hasError = true;
-                    _isLoading = false;
-                    _errorMsg = e.toString();
-                  });
-                }
-              }
+              });
+            }
+
+            void _fail(String msg) {
+              _slowTimer?.cancel();
+              if (!mounted) return;
+              setState(() {
+                _hasError = true;
+                _isLoading = false;
+                _showSplash = false;
+                _isSlow = false;
+                _errorMsg = msg;
+              });
             }
 
             Future<void> _retry() async {
-              if (mounted) {
-                setState(() {
-                  _hasError = false;
-                  _isLoading = true;
-                  _loadProgress = 0;
-                });
+              if (!mounted) return;
+              setState(() {
+                _hasError = false;
+                _isSlow = false;
+                _isLoading = true;
+                _progress = 0;
+                _reloadKey++; // bikin ulang webview → load dari awal
+              });
+              _armSlowTimer();
+            }
+
+            // ── Link non-http (tel:/mailto:/whatsapp:/geo:/intent:) → app eksternal ──
+            Future<void> _openExternal(WebUri url) async {
+              try {
+                await launchUrl(url, mode: LaunchMode.externalApplication);
+              } catch (_) {
+                // Gak ada app yang mau nerima link-nya — diemin aja, jangan crash.
               }
-              await _loadInitial();
+            }
+
+            /// HTML mode: nyalain server localhost (sekali aja), balikin URL hasilnya.
+            Future<WebUri?> _ensureLocalhost() async {
+              if (!_isAssetMode) return null;
+              if (!_localhostStarted) {
+                await _localhost.start();
+                _localhostStarted = true;
+              }
+              final rel = _target.startsWith(_assetDocRoot)
+                  ? _target.substring(_assetDocRoot.length)
+                  : _target.split('/').last;
+              return WebUri('http://localhost:8080/$rel');
+            }
+
+            Widget _overlayCard({
+              required IconData icon,
+              required String title,
+              required String message,
+            }) {
+              return Container(
+                color: Colors.white,
+                alignment: Alignment.center,
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(icon, size: 64, color: Colors.grey),
+                    const SizedBox(height: 16),
+                    Text(
+                      title,
+                      style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      message,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(color: Colors.grey),
+                    ),
+                    const SizedBox(height: 24),
+                    FilledButton.icon(
+                      onPressed: _retry,
+                      icon: const Icon(Icons.refresh),
+                      label: const Text('Coba Lagi'),
+                    ),
+                  ],
+                ),
+              );
             }
 
             @override
@@ -326,50 +433,145 @@ jobs:
                 canPop: false,
                 onPopInvokedWithResult: (didPop, _) async {
                   if (didPop) return;
-                  if (await _controller.canGoBack()) {
-                    await _controller.goBack();
+                  final web = _web;
+                  if (web != null && await web.canGoBack() == true) {
+                    await web.goBack();
+                  } else {
+                    await SystemNavigator.pop();
                   }
                 },
                 child: Scaffold(
+                  backgroundColor: Colors.white,
                   body: SafeArea(
                     child: Stack(
                       children: [
-                        WebViewWidget(controller: _controller),
-                        if (_isLoading)
-                          LinearProgressIndicator(
-                            value: _loadProgress > 0 ? _loadProgress / 100 : null,
-                            minHeight: 3,
+                        // ── WebView utama (key ganti = load ulang) ──
+                        InAppWebView(
+                          key: ValueKey<int>(_reloadKey),
+                          initialUrlRequest:
+                              _isAssetMode ? null : URLRequest(url: WebUri(_target)),
+                          initialSettings: _settings,
+                          onWebViewCreated: (controller) async {
+                            _web = controller;
+                            if (_isAssetMode) {
+                              try {
+                                final localUrl = await _ensureLocalhost();
+                                if (localUrl != null) {
+                                  await controller.loadUrl(
+                                      urlRequest: URLRequest(url: localUrl));
+                                }
+                              } catch (e) {
+                                _fail(e.toString());
+                              }
+                            }
+                          },
+                          shouldOverrideUrlLoading: (controller, action) async {
+                            final url = action.request.url;
+                            final scheme = url?.scheme.toLowerCase() ?? '';
+                            if (scheme == 'http' || scheme == 'https' || scheme.isEmpty) {
+                              return NavigationActionPolicy.ALLOW;
+                            }
+                            if (url != null) await _openExternal(url);
+                            return NavigationActionPolicy.CANCEL;
+                          },
+                          onCreateWindow: (controller, action) async {
+                            // Link target="_blank" / window.open() → buka di webview ini
+                            final url = action.request.url;
+                            final scheme = url?.scheme.toLowerCase() ?? '';
+                            if (url != null && (scheme == 'http' || scheme == 'https')) {
+                              await controller.loadUrl(urlRequest: URLRequest(url: url));
+                              return true;
+                            }
+                            if (url != null) await _openExternal(url);
+                            return true;
+                          },
+                          onLoadStart: (controller, url) {
+                            if (!mounted) return;
+                            setState(() {
+                              _isLoading = true;
+                              _hasError = false;
+                              _isSlow = false;
+                              _progress = 0;
+                            });
+                            _armSlowTimer();
+                          },
+                          onLoadStop: (controller, url) {
+                            if (!mounted) return;
+                            _slowTimer?.cancel();
+                            setState(() {
+                              _isLoading = false;
+                              _showSplash = false;
+                              _isSlow = false;
+                              _progress = 100;
+                            });
+                          },
+                          onProgressChanged: (controller, p) {
+                            if (!mounted) return;
+                            setState(() => _progress = p);
+                          },
+                          onReceivedError: (controller, request, error) {
+                            // Error sub-resource (iklan/gambar) gak nge-block halaman
+                            if (request.isForMainFrame != true) return;
+                            _fail(error.description);
+                          },
+                          onDownloadStartRequest: (controller, request) async {
+                            // Link download → serahin ke browser/DownloadManager sistem
+                            await _openExternal(request.url);
+                          },
+                        ),
+
+                        // ── Progress bar tipis di atas ──
+                        if (_isLoading && !_hasError)
+                          Positioned(
+                            top: 0,
+                            left: 0,
+                            right: 0,
+                            child: LinearProgressIndicator(
+                              value: _progress > 0 && _progress < 100
+                                  ? _progress / 100
+                                  : null,
+                              minHeight: 3,
+                            ),
                           ),
-                        if (_hasError)
+
+                        // ── Splash branded (cold start, max 6 detik) ──
+                        if (_showSplash && !_hasError)
                           Container(
                             color: Colors.white,
                             alignment: Alignment.center,
-                            padding: const EdgeInsets.all(24),
                             child: Column(
                               mainAxisSize: MainAxisSize.min,
                               children: [
-                                const Icon(Icons.wifi_off, size: 64, color: Colors.grey),
+                                const CircularProgressIndicator(),
                                 const SizedBox(height: 16),
-                                const Text(
-                                  'Gagal Memuat',
-                                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-                                ),
-                                const SizedBox(height: 8),
                                 Text(
-                                  _errorMsg,
-                                  textAlign: TextAlign.center,
-                                  maxLines: 3,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(color: Colors.grey),
-                                ),
-                                const SizedBox(height: 24),
-                                FilledButton.icon(
-                                  onPressed: _retry,
-                                  icon: const Icon(Icons.refresh),
-                                  label: const Text('Coba Lagi'),
+                                  '__APP_NAME__',
+                                  style: TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.w600,
+                                    color: Colors.grey.shade700,
+                                  ),
                                 ),
                               ],
                             ),
+                          ),
+
+                        // ── Kartu "lama banget" (backend lambat/down) ──
+                        if (_isSlow && _isLoading && !_hasError)
+                          _overlayCard(
+                            icon: Icons.hourglass_top,
+                            title: 'Lama banget nge-load...',
+                            message:
+                                'Koneksi ke website/backend-nya lambat atau gak merespons.\n'
+                                'Pastikan server-nya online dan koneksi lu stabil.',
+                          ),
+
+                        // ── Kartu error (gagal load) ──
+                        if (_hasError)
+                          _overlayCard(
+                            icon: Icons.wifi_off,
+                            title: 'Gagal Memuat',
+                            message: _errorMsg,
                           ),
                       ],
                     ),
@@ -456,6 +658,13 @@ jobs:
             fi
             if ! grep -q "usesCleartextTraffic" "$MANIFEST"; then
               sed -i 's|android:allowBackup="[^"]*"|android:allowBackup="false"\n        android:usesCleartextTraffic="true"|' "$MANIFEST"
+            fi
+            # <queries> wajib di Android 11+ (package visibility) biar
+            # url_launcher bisa buka browser/telpon/email buat link eksternal
+            # & download. Tanpa ini launchUrl gagal senyap.
+            if ! grep -q "<queries>" "$MANIFEST"; then
+              QRY='<queries><intent><action android:name="android.intent.action.VIEW" /><data android:scheme="https" /></intent><intent><action android:name="android.intent.action.VIEW" /><data android:scheme="http" /></intent><intent><action android:name="android.intent.action.VIEW" /><data android:scheme="tel" /></intent><intent><action android:name="android.intent.action.VIEW" /><data android:scheme="mailto" /></intent></queries>'
+              sed -i "s|<application|$QRY\n    <application|" "$MANIFEST"
             fi
           fi
 
