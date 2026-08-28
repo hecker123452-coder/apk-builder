@@ -104,6 +104,12 @@ jobs:
       - name: Install Flutter
         uses: subosito/flutter-action@v2
         with:
+          # ── ⚠️ v4.8: WAJIB PIN VERSI! ──
+          # Dulu `channel: stable` doang → Flutter stable baru rilis bawa AGP 9
+          # → plugin lama (flutter_inappwebview_android) kena hard-error
+          # "proguard-android.txt is no longer supported" → build gagal massal.
+          # 3.47.2 = versi yang template-nya lolos flutter analyze 0 issue.
+          flutter-version: '3.47.2'
           channel: 'stable'
           cache: true
 
@@ -885,6 +891,14 @@ jobs:
           else
             echo "Gak ada icon URL, pake icon default Flutter"
           fi
+
+          # ── ⚙️ v4.8 AGP9 safety net: patch plugin pub-cache yang masih pake
+          # getDefaultProguardFile('proguard-android.txt') — di-blok AGP 9+.
+          # pub get eksplisit dulu biar plugin udah ada di pub-cache sebelum dipatch.
+          flutter pub get || true
+          find "$HOME/.pub-cache/hosted" -name "build.gradle" -path "*android*" \
+            -exec sed -i "s/getDefaultProguardFile('proguard-android.txt')/getDefaultProguardFile('proguard-android-optimize.txt')/g" {} + 2>/dev/null || true
+          echo "AGP9 proguard safety patch: OK"
 
           # ── Build ──
           BUILD_ARGS="--release --no-tree-shake-icons"
