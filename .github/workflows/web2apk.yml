@@ -1,53 +1,34 @@
 name: Web2APK
 
 # ============================================================================
-# DZR CloudBuilder — Web2APK Workflow v4.5 (HTML+URL, token-based, FIXED)
+# DZR CloudBuilder — Web2APK Workflow v4.6 (OPSIBAR: splash/dark/hemat)
 # ============================================================================
-# FIX LOG v4.5 (FIX LAYAR PUTIH + BACKEND SUPPORT):
-#   1. GANTI ENGINE WEBVIEW : webview_flutter -> flutter_inappwebview.
-#      Website modern (SPA React/Vue, call API backend) sekarang jalan normal:
-#      - mixedContentMode ALWAYS_ALLOW  -> halaman HTTPS boleh manggil API HTTP
-#        (dulu: DIBLOKIR TOTAL -> layar putih / muter tanpa ujung)
-#      - useHybridComposition           -> rendering anti layar-putih di
-#        banyak device (dulu: TLHC default suka blank)
-#      - DOM storage + database + cookie 3rd-party + cache AKTIF semua
-#   2. ANTI-MUTER v2        : timer 25 detik. Backend lambat/down -> kartu
-#      peringatan "Lama banget nge-load" + tombol Coba Lagi (bukan spinner
-#      tanpa ujung). Splash branded max 6 detik pas cold start.
-#   3. UPLOAD FILE          : <input type="file"> kebuka (gallery/kamera).
-#   4. LINK EKSTERNAL       : tel:/mailto:/whatsapp:/geo:/intent: -> app
-#      yang bener. target="_blank" kebuka di webview (dulu: gak kejadian apa2).
-#   5. DOWNLOAD             : link download diterusin ke DownloadManager/
-#      browser sistem.
-#   6. TOMBOL BACK FIXED    : back = history webview, mentok = keluar app
-#      (dulu: back nge-freeze, gak bisa keluar).
-#   7. HTML MODE UPGRADE    : asset HTML disajikan via InAppLocalhostServer
-#      (bukan file://) -> fetch()/CSS relatif/localStorage jalan normal.
-#   8. MANIFEST             : + <queries> VIEW http/https/tel/mailto
-#      (wajib Android 11+ biar url_launcher nemu app target).
-#   Versi plugin di-PIN persis (flutter_inappwebview 6.1.5, url_launcher
-#   6.3.2) biar build CI deterministik — API kevalidasi pake flutter analyze
-#   3.47.2 (0 issue, mode URL & HTML dua-duanya).
+# FIX LOG v4.6:
+#   1. OPSI BUILD DI BOT  : sebelum build, user bisa atur:
+#      - 🌙 Tema Gelap     (dark_mode) : splash/loading/error ikut gelap
+#      - 👻 Splash on/off  (splash)    : matiin splash screen kalo gak mau
+#      - 📦 APK Hemat      (small_apk) : build arm64-only, APK ~40% lebih kecil
+#   2. SPLASH CUSTOM      : logo/icon user ditampilin di splash screen
+#      (icon di-convert ke assets/splash_logo.png + didaftarin ke pubspec).
+#      Gak ada icon = fallback spinner + nama app.
+#   3. PULL-TO-REFRESH    : tarik ke bawah di app buat reload halaman.
+#   4. SKIP ICON          : tombol skip di bot — build tanpa kirim icon
+#      (pake icon default Flutter).
+#   Semua fitur v4.5 tetep: flutter_inappwebview anti-layar-putih + backend
+#   support (mixed content allow, hybrid composition, DOM storage, upload,
+#   link eksternal, download, timeout anti-muter, back bener, HTML via
+#   InAppLocalhostServer).
 #
+# FIX LOG v4.5:
+#   Ganti engine WebView ke flutter_inappwebview 6.1.5 (di-pin) + url_launcher
+#   6.3.2 — fix layar putih & support backend. Validasi flutter analyze 3.47.2.
 # FIX LOG v4.4:
-#   1. FIX ICON JEPIT : foto non-1:1 di-CROP TENGAH (auto-orient) sebelum
-#      resize 512x512 — icon launcher bener-bener kotak & jelas.
-#
+#   Icon crop tengah 1:1 + auto-orient.
 # FIX LOG v4.3:
-#   1. ANTI DOUBLE-Send : Step "Send to Telegram" DIHAPUS PERMANEN (bot yang
-#      kirim APK).  2. Template WebView anti-muter + error screen.
-#   3. Heredoc terminator kolom 0.  4. icon_url = direct download URL.
+#   Anti dobel (step Telegram dihapus), template anti-muter, heredoc kolom 0.
 #
-# Cara custom:
-#   1. Cari token placeholder di file ini — semua ada di bagian "TOKENS".
-#   2. Token ditulis kayak gini: __NAMA_TOKEN__ (double underscore depan+belakang).
-#   3. Token di-replace otomatis pas build jalan (step "Apply Tokens").
-#
-# Mode yang didukung:
-#   - URL mode   : web_url diisi, html_content kosong -> WebView loadRequest(url)
-#   - HTML mode  : html_content diisi (base64 / plain), web_url kosong
-#                  -> file disimpen ke assets/webapp/index.html, WebView load
-#                  via InAppLocalhostServer (http://localhost:8080/index.html)
+# Cara custom: token placeholder __NAMA_TOKEN__ di-replace otomatis pas build.
+# Mode: URL mode (web_url) / HTML mode (html_content → assets/webapp/).
 # ============================================================================
 
 on:
@@ -81,6 +62,18 @@ on:
         description: 'Telegram Bot Token (UNUSED — sengaja gak dipake lagi anti dobel)'
         required: false
         default: ''
+      splash:
+        description: 'Splash screen (true/false)'
+        required: false
+        default: 'true'
+      dark_mode:
+        description: 'Tema gelap splash/loading/error (true/false)'
+        required: false
+        default: 'false'
+      small_apk:
+        description: 'APK hemat arm64-only (~40% lebih kecil) (true/false)'
+        required: false
+        default: 'false'
 
 jobs:
   build:
@@ -97,6 +90,9 @@ jobs:
       INPUT_APP_NAME: ${{ inputs.app_name }}
       INPUT_PACKAGE_NAME: ${{ inputs.package_name }}
       INPUT_ICON_URL: ${{ inputs.icon_url }}
+      INPUT_SPLASH: ${{ inputs.splash }}
+      INPUT_DARK_MODE: ${{ inputs.dark_mode }}
+      INPUT_SMALL_APK: ${{ inputs.small_apk }}
 
     steps:
       - name: Setup JDK
@@ -202,39 +198,114 @@ jobs:
             cp /tmp/w2a/index.html assets/webapp/index.html
           fi
 
-          # ── Tulis Dart main.dart (template v4.5 flutter_inappwebview) ──
+          # ── Icon processing ──
+          # icon_url HARUS direct download URL (browser_download_url asset GitHub),
+          # BUKAN URL halaman release. Bot (server.js publishRelease) udah difix
+          # buat balikin direct URL — magic byte check di bawah tetap jaga-jaga.
+          # v4.4: foto non-1:1 di-CROP TENGAH (bukan dijepit/letterbox) + auto-orient.
+          ICON_APPLIED=false
+          if [ -n "$INPUT_ICON_URL" ]; then
+            echo "Nge-download icon dari: $INPUT_ICON_URL"
+            HTTP_CODE=$(curl -sL -w "%{http_code}" -o /tmp/app_icon_raw --retry 3 --retry-delay 2 --max-time 15 "$INPUT_ICON_URL")
+            if [ "$HTTP_CODE" -eq 200 ] && [ -s /tmp/app_icon_raw ]; then
+              FILE_MAGIC=$(xxd -l 8 -p /tmp/app_icon_raw 2>/dev/null || echo "")
+              FILE_TYPE=$(file -b /tmp/app_icon_raw 2>/dev/null || echo "unknown")
+              echo "Magic: $FILE_MAGIC | Type: $FILE_TYPE"
+
+              IS_IMAGE=false
+              if echo "$FILE_MAGIC" | grep -qi "^89504e47"; then IS_IMAGE=true; fi   # PNG
+              if echo "$FILE_MAGIC" | grep -qi "^ffd8ff"; then IS_IMAGE=true; fi    # JPEG
+              if echo "$FILE_MAGIC" | grep -qi "^47494638"; then IS_IMAGE=true; fi # GIF
+              if echo "$FILE_MAGIC" | grep -qi "^52494646"; then IS_IMAGE=true; fi  # WebP
+              if echo "$FILE_MAGIC" | grep -qi "^424d"; then IS_IMAGE=true; fi      # BMP
+              if echo "$FILE_TYPE"  | grep -qi "svg"; then IS_IMAGE=true; fi        # SVG
+
+              if [ "$IS_IMAGE" = true ]; then
+                echo "File valid sebagai image. Crop tengah 1:1 (fix icon jepit v4.4)..."
+                # ── FIX ICON JEPIT (v4.4) ──
+                # Dulu: convert -resize 512x512 -extent 512x512 → foto non-kotak
+                # (mis. screenshot 572x1280) jadi thumbnail mini dgn pita kosong —
+                # di launcher keliatan kayak "icon gak ke bikin".
+                # Sekarang: auto-orient ( hormatin EXIF rotasi HP ) → hitung crop
+                # kotak persis di TENGAH → resize 512x512. Icon bener-bener kotak.
+                RAW_W=$(identify -format "%w" /tmp/app_icon_raw 2>/dev/null | head -1 | tr -dc '0-9')
+                RAW_H=$(identify -format "%h" /tmp/app_icon_raw 2>/dev/null | head -1 | tr -dc '0-9')
+                CROP_OK=false
+                if [ -n "$RAW_W" ] && [ -n "$RAW_H" ] && [ "$RAW_W" -gt 0 ] && [ "$RAW_H" -gt 0 ] 2>/dev/null; then
+                  if [ "$RAW_W" -ge "$RAW_H" ]; then
+                    SIDE=$RAW_H; OFF_X=$(( (RAW_W - RAW_H) / 2 )); OFF_Y=0
+                  else
+                    SIDE=$RAW_W; OFF_X=0; OFF_Y=$(( (RAW_H - RAW_W) / 2 ))
+                  fi
+                  echo "Crop tengah: ${SIDE}x${SIDE}+${OFF_X}+${OFF_Y} (asli ${RAW_W}x${RAW_H})"
+                  if convert /tmp/app_icon_raw -auto-orient -strip -crop "${SIDE}x${SIDE}+${OFF_X}+${OFF_Y}" +repage -resize 512x512 -extent 512x512 -background none -define png:compression-level=9 -define png:compression-filter=5 /tmp/app_icon_valid.png 2>/dev/null; then
+                    CROP_OK=true
+                  fi
+                fi
+                if [ "$CROP_OK" = false ]; then
+                  echo "Crop pintar gagal (format aneh?), fallback cara lama..."
+                  convert /tmp/app_icon_raw -auto-orient -background none -strip -resize 512x512 -gravity center -extent 512x512 -define png:compression-level=9 -define png:compression-filter=5 /tmp/app_icon_valid.png 2>/dev/null || true
+                fi
+                PNG_MAGIC=$(xxd -l 4 -p /tmp/app_icon_valid.png 2>/dev/null || echo "")
+                if [ "$PNG_MAGIC" = "89504e47" ]; then
+                    echo "PNG valid! Applying ke mipmap directories..."
+                    for dir in android/app/src/main/res/mipmap-*; do
+                      if [ -d "$dir" ]; then
+                        dirname=$(basename "$dir")
+                        case "$dirname" in
+                          mipmap-mdpi)    SIZE=48  ;;
+                          mipmap-hdpi)    SIZE=72  ;;
+                          mipmap-xhdpi)   SIZE=96  ;;
+                          mipmap-xxhdpi)  SIZE=144 ;;
+                          mipmap-xxxhdpi) SIZE=192 ;;
+                          *)              SIZE=96  ;;
+                        esac
+                        convert /tmp/app_icon_valid.png -resize ${SIZE}x${SIZE} -define png:compression-level=9 "$dir/ic_launcher.png" 2>/dev/null && \
+                        echo "  $dirname -> ${SIZE}x${SIZE} OK" || echo "  $dirname -> GAGAL, pake default"
+                      fi
+                    done
+                    ICON_APPLIED=true
+                    echo "Icon berhasil di-apply!"
+                  else
+                    echo "Konversi PNG gagal (magic byte gak valid), pake icon default Flutter"
+                fi
+              else
+                echo "File bukan image valid (magic: $FILE_MAGIC), pake icon default Flutter"
+                echo "HINT: pastiin icon_url = direct download URL asset, bukan halaman release!"
+              fi
+            else
+              echo "Download gagal (HTTP $HTTP_CODE atau file kosong), pake icon default Flutter"
+            fi
+          else
+            echo "Gak ada icon URL, pake icon default Flutter"
+          fi
+
+          # ── Splash logo: icon jadi asset buat splash screen (v4.6) ──
+          if [ "$ICON_APPLIED" = true ]; then
+            cp /tmp/app_icon_valid.png assets/splash_logo.png && echo "Splash logo asset siap"
+          fi
+
+          # ── Tulis Dart main.dart (template v4.6: opsi splash/dark + pull-to-refresh) ──
           # ⚠️ Heredoc: body & terminator DART_EOF wajib di base indent (kolom 0
           # setelah YAML strip). Jangan naikin indentasinya!
-          # Fitur template:
-          #   - mixed content ALWAYS_ALLOW (HTTPS page boleh call API HTTP)
-          #   - Hybrid Composition (anti layar-putih) + DOM storage + cache
-          #   - Timer 25 dtk: backend lambat/down → kartu peringatan, bukan muter
-          #   - Upload file, link eksternal (wa/tel/mailto), download, tab baru
-          #   - Tombol back = history webview, mentok = keluar app
-          #   - HTML mode via InAppLocalhostServer (perilaku = website asli)
           cat > lib/main.dart << 'DART_EOF'
           // ============================================================================
-          // Web2APK Template v4.5 — flutter_inappwebview ANTI-LAYAR-PUTIH
+          // Web2APK Template v4.6 — flutter_inappwebview + OPSI BUILD
           // ============================================================================
-          // Kenapa ganti engine ke flutter_inappwebview (dari webview_flutter)?
-          //   1. LAYAR PUTIH / MUTER   : webview_flutter pake rendering TLHC yang sering
-          //      blank + gak bisa atur mixed content. Website HTTPS yang manggil API
-          //      HTTP (backend lokal/kampret) DIBLOKIR TOTAL → SPA putih/muter selamanya.
-          //      Sekarang: mixedContentMode ALWAYS_ALLOW + Hybrid Composition.
-          //   2. BACKEND FRIENDLY      : DOM storage, database, cookie 3rd-party, cache
-          //      aktif semua → React/Vue/jQuery + API jalan kayak di Chrome.
-          //   3. UPLOAD FILE           : <input type="file"> kebuka otomatis (gallery/
-          //      kamera). Versi lama: dipencet gak kejadian apa-apa.
-          //   4. LINK EKSTERNAL        : tel:, mailto:, whatsapp:, geo:, intent: →
-          //      diterusin ke app yang bener. Link target="_blank" kebuka di webview.
-          //   5. DOWNLOAD              : link download diterusin ke DownloadManager/
-          //      browser sistem.
-          //   6. ANTI-MUTER            : timer 25 detik — kalo backend lambat/down,
-          //      muncul kartu peringatan + tombol Coba Lagi (bukan muter tanpa ujung).
-          //   7. TOMBOL BACK           : navigasi balik history webview, kalo mentok
-          //      keluar app (versi lama: tombol back nge-freeze di halaman).
-          // Catatan token: __APP_NAME__ dan __WEB_URL__ di-replace saat build
-          //   (mode HTML → __WEB_URL__ jadi 'assets/webapp/index.html').
+          // Baru di v4.6 (di atas fix v4.5 anti-layar-putih + backend support):
+          //   1. SPLASH CUSTOM   : logo/icon user ditampilin pas app dibuka (bukan
+          //      spinner polos). Kalo gak ada icon → fallback spinner + nama app.
+          //      Bisa di-MATIIN via opsi "Splash" di bot (__SHOW_SPLASH__ = false).
+          //   2. TEMA GELAP      : splash + loading + error card ikut mode gelap
+          //      (__DARK_THEME__ = true).
+          //   3. PULL-TO-REFRESH : tarik ke bawah buat reload halaman.
+          // Fitur v4.5 (tetap): mixed content allow (HTTPS page manggil API HTTP jalan),
+          //   hybrid composition (anti layar putih), DOM storage/cache/cookie,
+          //   timer 25 dtk anti-muter, upload file, link eksternal (wa/tel/mailto),
+          //   download ke sistem, target=_blank, back button bener,
+          //   HTML mode via InAppLocalhostServer.
+          // Catatan token (di-replace saat build):
+          //   __APP_NAME__ __WEB_URL__ __SHOW_SPLASH__ (true/false) __DARK_THEME__ (true/false)
           // ============================================================================
 
           import 'dart:async';
@@ -248,6 +319,11 @@ jobs:
             runApp(const WebViewApp());
           }
 
+          // ── Opsi dari bot (diisi token replacement saat build) ──
+          const bool kSplashEnabled = __SHOW_SPLASH__;
+          const bool kDarkTheme = __DARK_THEME__;
+          const Color kBgColor = kDarkTheme ? Color(0xFF121212) : Colors.white;
+
           class WebViewApp extends StatelessWidget {
             const WebViewApp({super.key});
 
@@ -258,6 +334,7 @@ jobs:
                 title: '__APP_NAME__',
                 theme: ThemeData(
                   colorSchemeSeed: Colors.blue,
+                  brightness: kDarkTheme ? Brightness.dark : Brightness.light,
                   useMaterial3: true,
                 ),
                 home: const WebViewScreen(),
@@ -273,7 +350,7 @@ jobs:
           }
 
           class _WebViewScreenState extends State<WebViewScreen> {
-            // ── TARGET (diisi oleh token replacement saat build) ──
+            // ── TARGET & OPSI (diisi oleh token replacement saat build) ──
             // URL mode  : 'https://website-kamu.com'
             // HTML mode : 'assets/webapp/index.html' (dibundle, jalan offline)
             static const String _target = '__WEB_URL__';
@@ -281,16 +358,22 @@ jobs:
             // HTML mode disajikan lewat server localhost built-in biar perilaku sama
             // kayak website asli (fetch()/CSS relatif/localStorage jalan normal).
             static const String _assetDocRoot = 'assets/webapp/';
+            // Opsi dari bot: splash on/off & tema gelap (konstanta top-level)
+            static const bool _splashEnabled = kSplashEnabled;
+            static const bool _dark = kDarkTheme;
+            static const Color _bg = kBgColor;
+
             final InAppLocalhostServer _localhost =
                 InAppLocalhostServer(documentRoot: _assetDocRoot);
             bool _localhostStarted = false;
 
             // ── State UI ──
             InAppWebViewController? _web;
+            PullToRefreshController? _pullToRefresh;
             bool _isLoading = true;
             bool _hasError = false;
             bool _isSlow = false;
-            bool _showSplash = true;
+            bool _showSplash = _splashEnabled;
             int _progress = 0;
             String _errorMsg = '';
             int _reloadKey = 0;
@@ -302,7 +385,7 @@ jobs:
               domStorageEnabled: true,
               databaseEnabled: true,
               cacheEnabled: true,
-              // FIX UTAMA "data kebalik/putih": HTTPS page boleh manggil API HTTP
+              // FIX UTAMA layar putih/muter: HTTPS page boleh manggil API HTTP
               mixedContentMode: MixedContentMode.MIXED_CONTENT_ALWAYS_ALLOW,
               // FIX LAYAR PUTIH di banyak device: rendering hybrid composition
               useHybridComposition: true,
@@ -321,6 +404,14 @@ jobs:
             @override
             void initState() {
               super.initState();
+              _pullToRefresh = PullToRefreshController(
+                onRefresh: () {
+                  _web?.reload();
+                },
+                settings: PullToRefreshSettings(
+                  color: _dark ? Colors.white : Colors.blue,
+                ),
+              );
               _armSlowTimer();
               // Splash hilang maksimal 6 detik, biar halaman lambat gak keliatan "mati"
               Future.delayed(const Duration(seconds: 6), () {
@@ -348,6 +439,7 @@ jobs:
 
             void _fail(String msg) {
               _slowTimer?.cancel();
+              _pullToRefresh?.endRefreshing();
               if (!mounted) return;
               setState(() {
                 _hasError = true;
@@ -398,7 +490,7 @@ jobs:
               required String message,
             }) {
               return Container(
-                color: Colors.white,
+                color: _bg,
                 alignment: Alignment.center,
                 padding: const EdgeInsets.all(24),
                 child: Column(
@@ -408,13 +500,17 @@ jobs:
                     const SizedBox(height: 16),
                     Text(
                       title,
-                      style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                      style: TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                        color: _dark ? Colors.white : Colors.black87,
+                      ),
                     ),
                     const SizedBox(height: 8),
                     Text(
                       message,
                       textAlign: TextAlign.center,
-                      style: const TextStyle(color: Colors.grey),
+                      style: TextStyle(color: _dark ? Colors.grey.shade400 : Colors.grey),
                     ),
                     const SizedBox(height: 24),
                     FilledButton.icon(
@@ -441,7 +537,7 @@ jobs:
                   }
                 },
                 child: Scaffold(
-                  backgroundColor: Colors.white,
+                  backgroundColor: _bg,
                   body: SafeArea(
                     child: Stack(
                       children: [
@@ -451,6 +547,7 @@ jobs:
                           initialUrlRequest:
                               _isAssetMode ? null : URLRequest(url: WebUri(_target)),
                           initialSettings: _settings,
+                          pullToRefreshController: _pullToRefresh,
                           onWebViewCreated: (controller) async {
                             _web = controller;
                             if (_isAssetMode) {
@@ -498,6 +595,7 @@ jobs:
                           onLoadStop: (controller, url) {
                             if (!mounted) return;
                             _slowTimer?.cancel();
+                            _pullToRefresh?.endRefreshing();
                             setState(() {
                               _isLoading = false;
                               _showSplash = false;
@@ -512,6 +610,7 @@ jobs:
                           onReceivedError: (controller, request, error) {
                             // Error sub-resource (iklan/gambar) gak nge-block halaman
                             if (request.isForMainFrame != true) return;
+                            _pullToRefresh?.endRefreshing();
                             _fail(error.description);
                           },
                           onDownloadStartRequest: (controller, request) async {
@@ -534,23 +633,36 @@ jobs:
                             ),
                           ),
 
-                        // ── Splash branded (cold start, max 6 detik) ──
+                        // ── Splash branded (logo icon user, max 6 detik) ──
                         if (_showSplash && !_hasError)
                           Container(
-                            color: Colors.white,
+                            color: _bg,
                             alignment: Alignment.center,
                             child: Column(
                               mainAxisSize: MainAxisSize.min,
                               children: [
-                                const CircularProgressIndicator(),
+                                // Logo custom (dari icon APK). Kalo gak ada → kosong,
+                                // spinner di bawah yang jadi indikator load.
+                                Image.asset(
+                                  'assets/splash_logo.png',
+                                  width: 110,
+                                  height: 110,
+                                  errorBuilder: (_, _, _) => const SizedBox.shrink(),
+                                ),
                                 const SizedBox(height: 16),
                                 Text(
                                   '__APP_NAME__',
                                   style: TextStyle(
-                                    fontSize: 16,
-                                    fontWeight: FontWeight.w600,
-                                    color: Colors.grey.shade700,
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.w700,
+                                    color: _dark ? Colors.white : Colors.grey.shade800,
                                   ),
+                                ),
+                                const SizedBox(height: 20),
+                                const SizedBox(
+                                  width: 28,
+                                  height: 28,
+                                  child: CircularProgressIndicator(strokeWidth: 3),
                                 ),
                               ],
                             ),
@@ -563,7 +675,7 @@ jobs:
                             title: 'Lama banget nge-load...',
                             message:
                                 'Koneksi ke website/backend-nya lambat atau gak merespons.\n'
-                                'Pastikan server-nya online dan koneksi lu stabil.',
+                                'Tarik ke bawah ato pencet Coba Lagi buat reload.',
                           ),
 
                         // ── Kartu error (gagal load) ──
@@ -583,15 +695,19 @@ jobs:
           DART_EOF
 
           # ── APPLY TOKENS ──
-          # ⚠️ Heredoc: body & terminator PYEOF wajib di base indent (kolom 0
-          # setelah YAML strip). Single python buat SEMUA mode biar gak ada
-          # duplikasi heredoc yang rawan salah indentasi kayak versi lama.
+          # ⚠️ Heredoc: body & terminator PYEOF wajib di base indent (kolom 0).
           python3 << 'PYEOF'
           import os, re
 
           app_name = os.environ.get('INPUT_APP_NAME', 'WebApp') or 'WebApp'
           web_url = os.environ.get('INPUT_WEB_URL', '') or ''
           mode = os.environ.get('W2A_MODE', 'url')
+          splash = (os.environ.get('INPUT_SPLASH', 'true') or 'true').strip().lower()
+          dark = (os.environ.get('INPUT_DARK_MODE', 'false') or 'false').strip().lower()
+
+          # Normalisasi bool (true/1/yes/on = true, sisanya false)
+          splash = 'true' if splash in ('1', 'true', 'yes', 'on') else 'false'
+          dark = 'true' if dark in ('1', 'true', 'yes', 'on') else 'false'
 
           # Normalisasi URL (defense-in-depth: bot udah normalize, sini jaga-jaga)
           if mode == 'url':
@@ -615,38 +731,58 @@ jobs:
                   return app_name_safe
               if tok == '__WEB_URL__':
                   return 'assets/webapp/index.html' if mode == 'html' else web_url_safe
+              if tok == '__SHOW_SPLASH__':
+                  return splash
+              if tok == '__DARK_THEME__':
+                  return dark
               return tok
 
-          src = re.sub(r'__(?:APP_NAME|WEB_URL)__', repl, src)
+          src = re.sub(r'__(?:APP_NAME|WEB_URL|SHOW_SPLASH|DARK_THEME)__', repl, src)
 
           # Safety net: gak boleh ada token tersisa di main.dart
-          leftover = re.findall(r'__(?:APP_NAME|WEB_URL)__', src)
+          leftover = re.findall(r'__(?:APP_NAME|WEB_URL|SHOW_SPLASH|DARK_THEME)__', src)
           if leftover:
               raise SystemExit('ERROR: token tersisa di main.dart: %s' % leftover)
 
           with open('lib/main.dart', 'w', encoding='utf-8') as f:
               f.write(src)
 
-          # HTML mode: daftarin assets/webapp/ ke pubspec.yaml
+          # ── Daftarin assets ke pubspec.yaml ──
+          assets = []
           if mode == 'html':
+              assets.append('assets/webapp/')
+          if os.path.exists('assets/splash_logo.png'):
+              assets.append('assets/splash_logo.png')
+
+          if assets:
               with open('pubspec.yaml', 'r', encoding='utf-8') as f:
                   pubspec = f.read()
-              if 'assets/webapp' not in pubspec:
+              need = [a for a in assets if a not in pubspec]
+              if need:
                   if re.search(r'^flutter:\s*$', pubspec, re.M):
-                      pubspec = re.sub(
-                          r'^flutter:\s*$',
-                          'flutter:\n  assets:\n    - assets/webapp/',
-                          pubspec, count=1, flags=re.M,
-                      )
+                      if re.search(r'^\s+assets:', pubspec, re.M):
+                          # assets section udah ada — nambahin entri di bawahnya
+                          pubspec = re.sub(
+                              r'^(\s+assets:)$',
+                              lambda mm: mm.group(1) + ''.join('\n    - ' + a for a in need),
+                              pubspec, count=1, flags=re.M,
+                          )
+                      else:
+                          pubspec = re.sub(
+                              r'^flutter:\s*$',
+                              'flutter:\n  assets:\n' + ''.join('    - ' + a + '\n' for a in need),
+                              pubspec, count=1, flags=re.M,
+                          )
                   else:
-                      pubspec += '\nflutter:\n  assets:\n    - assets/webapp/\n'
+                      pubspec += '\nflutter:\n  assets:\n' + ''.join('    - ' + a + '\n' for a in need)
                   with open('pubspec.yaml', 'w', encoding='utf-8') as f:
                       f.write(pubspec)
-              print('Assets registered in pubspec.yaml')
+              print('Assets registered:', need)
 
-          print('Token applied. Mode:', mode)
+          print('Token applied. Mode:', mode, '| splash:', splash, '| dark:', dark)
           if mode == 'url':
               print('URL set to:', web_url)
+
           PYEOF
 
           # ── Patch Android Manifest ──
@@ -751,7 +887,14 @@ jobs:
           fi
 
           # ── Build ──
-          flutter build apk --release --no-tree-shake-icons 2>&1 | tee build_output.txt
+          BUILD_ARGS="--release --no-tree-shake-icons"
+          if [ "$INPUT_SMALL_APK" = "true" ]; then
+            # APK hemat: cuma compile buat arm64-v8a (HP modern sejak ~2015) —
+            # ukuran ~40% lebih kecil dibanding universal.
+            BUILD_ARGS="$BUILD_ARGS --target-platform android-arm64"
+            echo "Small APK mode: arm64-only"
+          fi
+          flutter build apk $BUILD_ARGS 2>&1 | tee build_output.txt
 
           APK_PATH=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1 || find build/app/outputs/apk -name "*.apk" 2>/dev/null | head -1)
           if [ -z "$APK_PATH" ]; then
