@@ -1,11 +1,45 @@
 name: Web2APK
 
+# ============================================================================
+# DZR CloudBuilder — Web2APK Workflow v4.3 (HTML+URL, token-based, FIXED)
+# ============================================================================
+# FIX LOG v4.3:
+#   1. ANTI DOUBLE-Send : Step "Send to Telegram" DIHAPUS PERMANEN.
+#      Bot (index.js) satu-satunya yang kirim APK ke user. Workflow cuma
+#      build + upload artifact. (Versi lama kirim 2x → user dapet APK dobel.)
+#   2. FIX MUTER-MUTER  : Template WebView baru — loadRequest dibungkus
+#      try/catch, URL tanpa scheme di-normalisasi, ada error screen + tombol
+#      "Coba Lagi" kalo halaman gagal dimuat. App selalu render frame pertama.
+#   3. FIX HEREDOC      : Semua terminator heredoc (DART_EOF / PYEOF) sekarang
+#   ⚠️  WAJIB rata sama base indent block `run:` biar bash nemu terminator-nya.
+#      (Versi lama: PYEOF mode HTML keindeteksi +2 spasi → bash gak nemu
+#      terminator → seluruh script ke-telan → build HTML mode gagal total.)
+#   4. FIX ICON         : icon_url sekarang HARUS direct download URL asset
+#      (browser_download_url), bukan URL halaman release. Diperbaiki di sisi
+#      bot (server.js → publishRelease). Magic byte check tetap jadi safety.
+#
+# Cara custom:
+#   1. Cari token placeholder di file ini — semua ada di bagian "TOKENS".
+#   2. Token ditulis kayak gini: __NAMA_TOKEN__ (double underscore depan+belakang).
+#   3. Token di-replace otomatis pas build jalan (step "Apply Tokens").
+#
+# Mode yang didukung:
+#   - URL mode   : web_url diisi, html_content kosong → WebView loadRequest(url)
+#   - HTML mode  : html_content diisi (base64 / plain), web_url kosong
+#                  → file disimpen ke assets/webapp/index.html, WebView loadFlutterAsset
+# ============================================================================
+
 on:
   workflow_dispatch:
     inputs:
       web_url:
-        description: 'URL website'
-        required: true
+        description: 'URL website (kosongin kalo mau pake HTML file)'
+        required: false
+        default: ''
+      html_content:
+        description: 'Isi HTML (base64 atau plain text). Diutamain base64 biar gak ganggu YAML.'
+        required: false
+        default: ''
       app_name:
         description: 'Nama Aplikasi'
         required: true
@@ -15,15 +49,15 @@ on:
         required: false
         default: 'com.deruzuan.webapp'
       icon_url:
-        description: 'Icon URL'
+        description: 'Icon URL (direct download URL asset, bukan halaman release!)'
         required: false
         default: ''
       chat_id:
-        description: 'Telegram Chat ID'
+        description: 'Telegram Chat ID (UNUSED — bot yang handle kirim APK)'
         required: false
         default: ''
       bot_token:
-        description: 'Telegram Bot Token'
+        description: 'Telegram Bot Token (UNUSED — sengaja gak dipake lagi anti dobel)'
         required: false
         default: ''
 
@@ -38,11 +72,10 @@ jobs:
       LC_ALL: C.UTF-8
       LANG: C.UTF-8
       INPUT_WEB_URL: ${{ inputs.web_url }}
+      INPUT_HTML_CONTENT: ${{ inputs.html_content }}
       INPUT_APP_NAME: ${{ inputs.app_name }}
       INPUT_PACKAGE_NAME: ${{ inputs.package_name }}
       INPUT_ICON_URL: ${{ inputs.icon_url }}
-      INPUT_CHAT_ID: ${{ inputs.chat_id }}
-      INPUT_BOT_TOKEN: ${{ inputs.bot_token }}
 
     steps:
       - name: Setup JDK
@@ -72,8 +105,60 @@ jobs:
       - name: Install ImageMagick
         run: sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick
 
+      # ─── DECODE HTML CONTENT (kalo ada) ───────────────────────────────────
+      # Token: INPUT_HTML_CONTENT bisa base64 atau plain text.
+      # Hasil decode disimpen ke /tmp/w2a/index.html buat di-paste ke assets.
+      - name: Decode HTML content
+        run: |
+          mkdir -p /tmp/w2a
+          if [ -n "$INPUT_HTML_CONTENT" ]; then
+            echo "HTML content detected, decoding..."
+            # ── Strategi decode yang robust ──
+            # 1. Coba decode base64. Kalo sukses DAN hasilnya valid HTML → pake.
+            # 2. Kalo input asli langsung keliatan kayak HTML (ada '<') → pake.
+            # 3. Kalo decode sukses tapi gak ada '<' tetep pake hasil decode.
+            # 4. Fallback terakhir: simpen input apa adanya.
+            DECODED_OK=false
+            DECODED=""
+            if DECODED=$(printf '%s' "$INPUT_HTML_CONTENT" | base64 -d 2>/dev/null); then
+              if printf '%s' "$DECODED" | grep -q '<'; then
+                printf '%s' "$DECODED" > /tmp/w2a/index.html
+                DECODED_OK=true
+                echo "Decoded as base64"
+              fi
+            fi
+            if [ "$DECODED_OK" = false ]; then
+              if printf '%s' "$INPUT_HTML_CONTENT" | grep -q '<'; then
+                printf '%s' "$INPUT_HTML_CONTENT" > /tmp/w2a/index.html
+                echo "Saved as plain text"
+              elif [ -n "$DECODED" ]; then
+                printf '%s' "$DECODED" > /tmp/w2a/index.html
+                echo "Decoded as base64 (no '<' tag, using decoded anyway)"
+              else
+                printf '%s' "$INPUT_HTML_CONTENT" > /tmp/w2a/index.html
+                echo "Saved as plain text (fallback)"
+              fi
+            fi
+            # Validasi minimal: file gak kosong
+            if [ ! -s /tmp/w2a/index.html ]; then
+              echo "ERROR: HTML content kosong setelah decode!"
+              exit 1
+            fi
+            SIZE=$(wc -c < /tmp/w2a/index.html)
+            echo "HTML size: $SIZE bytes"
+            echo "W2A_MODE=html" >> $GITHUB_ENV
+          else
+            if [ -z "$INPUT_WEB_URL" ]; then
+              echo "ERROR: harus isi web_url ATAU html_content!"
+              exit 1
+            fi
+            echo "W2A_MODE=url" >> $GITHUB_ENV
+          fi
+
+      # ─── CREATE PROJECT + WEBVIEW + APPLY TOKENS + BUILD ──────────────────
       - name: Create Project + WebView + Icon + Build
         run: |
+          # ── Sanitize inputs ──
           SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
           SAFE_PKG=$(echo "$INPUT_PACKAGE_NAME" | sed 's/[^a-zA-Z0-9.]//g' | sed 's/^\.*//' | sed 's/\.*$//')
           [ -z "$SAFE_PKG" ] && SAFE_PKG="com.deruzuan.webapp"
@@ -82,12 +167,27 @@ jobs:
           PROJ_NAME=$(echo "$SAFE_PKG" | rev | cut -d. -f1 | rev | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]//g')
           [ -z "$PROJ_NAME" ] && PROJ_NAME="webapp"
 
-          echo "App: $SAFE_APP_NAME | Pkg: $SAFE_PKG | Proj: $PROJ_NAME | URL: $INPUT_WEB_URL"
+          echo "App: $SAFE_APP_NAME | Pkg: $SAFE_PKG | Proj: $PROJ_NAME | Mode: $W2A_MODE"
 
           flutter create --project-name "$PROJ_NAME" --org "$(echo "$SAFE_PKG" | rev | cut -d. -f2- | rev)" "$PROJ_NAME"
           cd "$PROJ_NAME"
           flutter pub add webview_flutter
 
+          # ── HTML mode: siapin assets + daftarin ke pubspec ──
+          if [ "$W2A_MODE" = "html" ]; then
+            mkdir -p assets/webapp
+            cp /tmp/w2a/index.html assets/webapp/index.html
+          fi
+
+          # ── Tulis Dart main.dart (template ANTI-MUTER v4.3) ──
+          # ⚠️ Heredoc: body & terminator DART_EOF wajib di base indent (kolom 0
+          # setelah YAML strip). Jangan naikin indentasinya!
+          # Fitur template:
+          #   - loadRequest dibungkus try/catch (URL rusak = error screen, BUKAN crash)
+          #   - Error screen + tombol "Coba Lagi" kalo halaman gagal dimuat
+          #   - Background putih solid (gak blink transparan)
+          #   - Loading bar progres + tombol back navigasi WebView
+          #   - HTML mode otomatis loadFlutterAsset (deteksi path 'assets/')
           cat > lib/main.dart << 'DART_EOF'
           import 'package:flutter/material.dart';
           import 'package:webview_flutter/webview_flutter.dart';
@@ -103,6 +203,7 @@ jobs:
             Widget build(BuildContext context) {
               return MaterialApp(
                 debugShowCheckedModeBanner: false,
+                title: '__APP_NAME__',
                 theme: ThemeData(
                   colorSchemeSeed: Colors.blue,
                   useMaterial3: true,
@@ -120,22 +221,95 @@ jobs:
           }
 
           class _WebViewScreenState extends State<WebViewScreen> {
-            late final WebViewController controller;
-            bool isLoading = true;
+            late final WebViewController _controller;
+            bool _isLoading = true;
+            int _loadProgress = 0;
+            bool _hasError = false;
+            String _errorMsg = '';
 
             @override
             void initState() {
               super.initState();
-              controller = WebViewController()
+              _controller = WebViewController()
                 ..setJavaScriptMode(JavaScriptMode.unrestricted)
-                ..setBackgroundColor(const Color(0x00000000))
+                ..setBackgroundColor(const Color(0xFFFFFFFF))
+                ..enableZoom(true)
                 ..setNavigationDelegate(
                   NavigationDelegate(
-                    onPageStarted: (_) => setState(() => isLoading = true),
-                    onPageFinished: (_) => setState(() => isLoading = false),
+                    onProgress: (p) {
+                      if (mounted) {
+                        setState(() {
+                          _loadProgress = p;
+                          _isLoading = p < 100;
+                        });
+                      }
+                    },
+                    onPageStarted: (_) {
+                      if (mounted) {
+                        setState(() {
+                          _isLoading = true;
+                          _hasError = false;
+                          _loadProgress = 0;
+                        });
+                      }
+                    },
+                    onPageFinished: (_) {
+                      if (mounted) {
+                        setState(() {
+                          _isLoading = false;
+                          _loadProgress = 100;
+                        });
+                      }
+                    },
+                    onWebResourceError: (err) {
+                      // Hanya anggap fatal kalo error-nya di main frame
+                      // (error sub-resource like iklan/gambar gak usah nge-block)
+                      if (err.isForMainFrame == true && mounted) {
+                        setState(() {
+                          _hasError = true;
+                          _isLoading = false;
+                          _errorMsg = err.description ?? 'Gagal memuat halaman';
+                        });
+                      }
+                    },
                   ),
-                )
-                ..loadRequest(Uri.parse('WEBURL_PLACEHOLDER'));
+                );
+              _loadInitial();
+            }
+
+            Future<void> _loadInitial() async {
+              try {
+                const target = '__WEB_URL__';
+                if (target.startsWith('assets/')) {
+                  // HTML mode — konten dibundle di asset, jalan offline
+                  await _controller.loadFlutterAsset(target);
+                } else {
+                  final uri = Uri.parse(target);
+                  if (!uri.scheme.startsWith('http')) {
+                    throw const FormatException('URL tidak valid: $target');
+                  }
+                  await _controller.loadRequest(uri);
+                }
+              } catch (e) {
+                if (mounted) {
+                  setState(() {
+                    _hasError = true;
+                    _isLoading = false;
+                    _errorMsg = e.toString();
+                  });
+                }
+              }
+            }
+
+            Future<void> _retry() async {
+              if (mounted) {
+                setState(() {
+                  _hasError = false;
+                  _isLoading = true;
+                  _loadProgress = 0;
+                });
+              }
+              await _loadInitial();
             }
 
             @override
@@ -144,17 +318,51 @@ jobs:
                 canPop: false,
                 onPopInvokedWithResult: (didPop, _) async {
                   if (didPop) return;
-                  if (await controller.canGoBack()) {
-                    controller.goBack();
+                  if (await _controller.canGoBack()) {
+                    await _controller.goBack();
                   }
                 },
                 child: Scaffold(
                   body: SafeArea(
                     child: Stack(
                       children: [
-                        WebViewWidget(controller: controller),
-                        if (isLoading)
-                          const Center(child: CircularProgressIndicator()),
+                        WebViewWidget(controller: _controller),
+                        if (_isLoading)
+                          LinearProgressIndicator(
+                            value: _loadProgress > 0 ? _loadProgress / 100 : null,
+                            minHeight: 3,
+                          ),
+                        if (_hasError)
+                          Container(
+                            color: Colors.white,
+                            alignment: Alignment.center,
+                            padding: const EdgeInsets.all(24),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(Icons.wifi_off, size: 64, color: Colors.grey),
+                                const SizedBox(height: 16),
+                                const Text(
+                                  'Gagal Memuat',
+                                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                                ),
+                                const SizedBox(height: 8),
+                                Text(
+                                  _errorMsg,
+                                  textAlign: TextAlign.center,
+                                  maxLines: 3,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(color: Colors.grey),
+                                ),
+                                const SizedBox(height: 24),
+                                FilledButton.icon(
+                                  onPressed: _retry,
+                                  icon: const Icon(Icons.refresh),
+                                  label: const Text('Coba Lagi'),
+                                ),
+                              ],
+                            ),
+                          ),
                       ],
                     ),
                   ),
@@ -164,55 +372,112 @@ jobs:
           }
           DART_EOF
 
-          sed -i "s|WEBURL_PLACEHOLDER|$(echo "$INPUT_WEB_URL" | sed 's/[&/\]/\\&/g')|g" lib/main.dart
+          # ── APPLY TOKENS ──
+          # ⚠️ Heredoc: body & terminator PYEOF wajib di base indent (kolom 0
+          # setelah YAML strip). Single python buat SEMUA mode biar gak ada
+          # duplikasi heredoc yang rawan salah indentasi kayak versi lama.
+          python3 << 'PYEOF'
+          import os, re
 
-          # Patch Android
+          app_name = os.environ.get('INPUT_APP_NAME', 'WebApp') or 'WebApp'
+          web_url = os.environ.get('INPUT_WEB_URL', '') or ''
+          mode = os.environ.get('W2A_MODE', 'url')
+
+          # Normalisasi URL (defense-in-depth: bot udah normalize, sini jaga-jaga)
+          if mode == 'url':
+              web_url = web_url.strip()
+              if web_url and not web_url.lower().startswith(('http://', 'https://')):
+                  web_url = 'https://' + web_url
+              if not web_url:
+                  raise SystemExit('ERROR: URL mode tapi web_url kosong!')
+
+          # Sanitize buat Dart string literal (escape backslash & single quote)
+          app_name_safe = app_name.replace('\\', '\\\\').replace("'", "\\'")
+          web_url_safe = web_url.replace('\\', '\\\\').replace("'", "\\'")
+
+          with open('lib/main.dart', 'r', encoding='utf-8') as f:
+              src = f.read()
+
+          # Single-pass replacement (anti bug token-di-dalam-token)
+          def repl(m):
+              tok = m.group(0)
+              if tok == '__APP_NAME__':
+                  return app_name_safe
+              if tok == '__WEB_URL__':
+                  return 'assets/webapp/index.html' if mode == 'html' else web_url_safe
+              return tok
+
+          src = re.sub(r'__(?:APP_NAME|WEB_URL)__', repl, src)
+
+          # Safety net: gak boleh ada token tersisa di main.dart
+          leftover = re.findall(r'__(?:APP_NAME|WEB_URL)__', src)
+          if leftover:
+              raise SystemExit('ERROR: token tersisa di main.dart: %s' % leftover)
+
+          with open('lib/main.dart', 'w', encoding='utf-8') as f:
+              f.write(src)
+
+          # HTML mode: daftarin assets/webapp/ ke pubspec.yaml
+          if mode == 'html':
+              with open('pubspec.yaml', 'r', encoding='utf-8') as f:
+                  pubspec = f.read()
+              if 'assets/webapp' not in pubspec:
+                  if re.search(r'^flutter:\s*$', pubspec, re.M):
+                      pubspec = re.sub(
+                          r'^flutter:\s*$',
+                          'flutter:\n  assets:\n    - assets/webapp/',
+                          pubspec, count=1, flags=re.M,
+                      )
+                  else:
+                      pubspec += '\nflutter:\n  assets:\n    - assets/webapp/\n'
+                  with open('pubspec.yaml', 'w', encoding='utf-8') as f:
+                      f.write(pubspec)
+              print('Assets registered in pubspec.yaml')
+
+          print('Token applied. Mode:', mode)
+          if mode == 'url':
+              print('URL set to:', web_url)
+          PYEOF
+
+          # ── Patch Android Manifest ──
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           if [ -f "$MANIFEST" ]; then
             sed -i "s|android:label=\"[^\"]*\"|android:label=\"$SAFE_APP_NAME\"|g" "$MANIFEST"
             if ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
-              sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />\n    <application|' "$MANIFEST"
+              sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />\n    <application|' "$MANIFEST"
             fi
             if ! grep -q "usesCleartextTraffic" "$MANIFEST"; then
               sed -i 's|android:allowBackup="[^"]*"|android:allowBackup="false"\n        android:usesCleartextTraffic="true"|' "$MANIFEST"
             fi
           fi
 
-          # ── Icon processing with ImageMagick + PNG validation ──
+          # ── Icon processing ──
+          # icon_url HARUS direct download URL (browser_download_url asset GitHub),
+          # BUKAN URL halaman release. Bot (server.js publishRelease) udah difix
+          # buat balikin direct URL — magic byte check di bawah tetap jaga-jaga.
           ICON_APPLIED=false
           if [ -n "$INPUT_ICON_URL" ]; then
             echo "Nge-download icon dari: $INPUT_ICON_URL"
             HTTP_CODE=$(curl -sL -w "%{http_code}" -o /tmp/app_icon_raw --retry 3 --retry-delay 2 --max-time 15 "$INPUT_ICON_URL")
             if [ "$HTTP_CODE" -eq 200 ] && [ -s /tmp/app_icon_raw ]; then
-              # Check file is actually an image via magic bytes
               FILE_MAGIC=$(xxd -l 8 -p /tmp/app_icon_raw 2>/dev/null || echo "")
               FILE_TYPE=$(file -b /tmp/app_icon_raw 2>/dev/null || echo "unknown")
               echo "Magic: $FILE_MAGIC | Type: $FILE_TYPE"
 
               IS_IMAGE=false
-              # PNG: 89504e47
-              if echo "$FILE_MAGIC" | grep -qi "^89504e47"; then IS_IMAGE=true; fi
-              # JPEG: ffd8ff
-              if echo "$FILE_MAGIC" | grep -qi "^ffd8ff"; then IS_IMAGE=true; fi
-              # GIF: 47494638
-              if echo "$FILE_MAGIC" | grep -qi "^47494638"; then IS_IMAGE=true; fi
-              # WebP: 52494646...57454250
-              if echo "$FILE_MAGIC" | grep -qi "^52494646"; then IS_IMAGE=true; fi
-              # BMP: 424d
-              if echo "$FILE_MAGIC" | grep -qi "^424d"; then IS_IMAGE=true; fi
-              # SVG (text-based, check file type)
-              if echo "$FILE_TYPE" | grep -qi "svg"; then IS_IMAGE=true; fi
+              if echo "$FILE_MAGIC" | grep -qi "^89504e47"; then IS_IMAGE=true; fi   # PNG
+              if echo "$FILE_MAGIC" | grep -qi "^ffd8ff"; then IS_IMAGE=true; fi    # JPEG
+              if echo "$FILE_MAGIC" | grep -qi "^47494638"; then IS_IMAGE=true; fi # GIF
+              if echo "$FILE_MAGIC" | grep -qi "^52494646"; then IS_IMAGE=true; fi  # WebP
+              if echo "$FILE_MAGIC" | grep -qi "^424d"; then IS_IMAGE=true; fi      # BMP
+              if echo "$FILE_TYPE"  | grep -qi "svg"; then IS_IMAGE=true; fi        # SVG
 
               if [ "$IS_IMAGE" = true ]; then
                 echo "File valid sebagai image, konversi ke PNG..."
-                # Convert to proper PNG with ImageMagick
-                # -strip removes metadata, -resize fits, -define png:compression-level=9 optimizes
-                if convert /tmp/app_icon_raw -strip -resize 512x512 -gravity center -extent 512x512 -define png:compression-level=9 -define png:compression-filter=5 /tmp/app_icon_valid.png 2>/dev/null; then
-                  # Double-check: verify the converted PNG magic bytes
+                if convert /tmp/app_icon_raw -background none -strip -resize 512x512 -gravity center -extent 512x512 -define png:compression-level=9 -define png:compression-filter=5 /tmp/app_icon_valid.png 2>/dev/null; then
                   PNG_MAGIC=$(xxd -l 4 -p /tmp/app_icon_valid.png 2>/dev/null || echo "")
                   if [ "$PNG_MAGIC" = "89504e47" ]; then
                     echo "PNG valid! Applying ke mipmap directories..."
-                    # Android mipmap sizes: mdpi=48, hdpi=72, xhdpi=96, xxhdpi=144, xxxhdpi=192
                     for dir in android/app/src/main/res/mipmap-*; do
                       if [ -d "$dir" ]; then
                         dirname=$(basename "$dir")
@@ -238,6 +503,7 @@ jobs:
                 fi
               else
                 echo "File bukan image valid (magic: $FILE_MAGIC), pake icon default Flutter"
+                echo "HINT: pastiin icon_url = direct download URL asset, bukan halaman release!"
               fi
             else
               echo "Download gagal (HTTP $HTTP_CODE atau file kosong), pake icon default Flutter"
@@ -246,7 +512,7 @@ jobs:
             echo "Gak ada icon URL, pake icon default Flutter"
           fi
 
-          # Build
+          # ── Build ──
           flutter build apk --release --no-tree-shake-icons 2>&1 | tee build_output.txt
 
           APK_PATH=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1 || find build/app/outputs/apk -name "*.apk" 2>/dev/null | head -1)
@@ -265,30 +531,10 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-      - name: Send to Telegram
-        if: inputs.chat_id != '' && inputs.bot_token != ''
-        run: |
-          SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
-          APK=$(find . -path "*/flutter-apk/*.apk" 2>/dev/null | head -1 || find . -path "*/apk/*.apk" -name "*.apk" 2>/dev/null | head -1)
-          if [ -n "$APK" ]; then
-            SIZE=$(du -sh "$APK" | cut -f1)
-            CAPTION=$(printf '✅ Web2APK Udah Jadi!\n%s | %s | %s' "$SAFE_APP_NAME" "$INPUT_WEB_URL" "$SIZE")
-            curl -s -X POST "https://api.telegram.org/bot${INPUT_BOT_TOKEN}/sendDocument" \
-              -F "chat_id=${INPUT_CHAT_ID}" -F "document=@$APK" --form-string "caption=$CAPTION"
-          fi
-
-      - name: Notify Failure
-        if: failure()
-        run: |
-          ERROR_SUMMARY="Web2APK gagal"
-          if [ -f build_output.txt ]; then
-            ERROR_SUMMARY=$(grep -i "error\|failed\|exception" build_output.txt 2>/dev/null | head -5 | tr '\n' ' ')
-          fi
-          [ -z "$ERROR_SUMMARY" ] && ERROR_SUMMARY="Web2APK gagal di awal."
-          ERROR_SUMMARY=$(echo "$ERROR_SUMMARY" | cut -c1-500)
-          if [ -n "$INPUT_CHAT_ID" ] && [ -n "$INPUT_BOT_TOKEN" ]; then
-            SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
-            MSG=$(printf '❌ Web2APK Gagal\n%s | %s\n%s' "$SAFE_APP_NAME" "$INPUT_WEB_URL" "$ERROR_SUMMARY")
-            curl -s -X POST "https://api.telegram.org/bot${INPUT_BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${INPUT_CHAT_ID}" --data-urlencode "text=$MSG"
-          fi
+      # NOTE: "Send to Telegram" step DIHAPUS PERMANEN (fix APK dobel).
+      # Bot (index.js) satu-satunya pengirim APK ke user via client.sendFile()
+      # — dia yang pull artifact dari workflow ini terus kirim dengan caption
+      # yang informatif. GAK ADA STEP KIRIM DI SINI, JANGAN DITAMBAHIN LAGI!
+      #
+      # NOTE: "Notify Failure" step juga DIHAPUS — bot yang handle semua
+      # notifikasi error (dengan detail log dari getFailedStepLog).
