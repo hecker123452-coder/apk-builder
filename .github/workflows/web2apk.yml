@@ -1,8 +1,16 @@
 name: Web2APK
 
 # ============================================================================
-# DZR CloudBuilder — Web2APK Workflow v4.3 (HTML+URL, token-based, FIXED)
+# DZR CloudBuilder — Web2APK Workflow v4.4 (HTML+URL, token-based, FIXED)
 # ============================================================================
+# FIX LOG v4.4:
+#   1. FIX ICON JEPIT : foto non-1:1 (mis. screenshot 572x1280) dulu di-jepit
+#      pake -extent (letterbox) → icon jadi thumbnail kecil gak jelas. Sekarang
+#      -auto-orient (EXIF rotasi HP) + CROP TENGAH persis 1:1 dulu, baru
+#      di-resize 512x512. Icon launcher bener-bener kotak & jelas.
+#   2. Catatan v4.3 (tetep berlaku): tanpa step kirim Telegram (anti dobel),
+#      template WebView anti-muter, heredoc terminator kolom 0.
+#
 # FIX LOG v4.3:
 #   1. ANTI DOUBLE-Send : Step "Send to Telegram" DIHAPUS PERMANEN.
 #      Bot (index.js) satu-satunya yang kirim APK ke user. Workflow cuma
@@ -455,6 +463,7 @@ jobs:
           # icon_url HARUS direct download URL (browser_download_url asset GitHub),
           # BUKAN URL halaman release. Bot (server.js publishRelease) udah difix
           # buat balikin direct URL — magic byte check di bawah tetap jaga-jaga.
+          # v4.4: foto non-1:1 di-CROP TENGAH (bukan dijepit/letterbox) + auto-orient.
           ICON_APPLIED=false
           if [ -n "$INPUT_ICON_URL" ]; then
             echo "Nge-download icon dari: $INPUT_ICON_URL"
@@ -473,10 +482,33 @@ jobs:
               if echo "$FILE_TYPE"  | grep -qi "svg"; then IS_IMAGE=true; fi        # SVG
 
               if [ "$IS_IMAGE" = true ]; then
-                echo "File valid sebagai image, konversi ke PNG..."
-                if convert /tmp/app_icon_raw -background none -strip -resize 512x512 -gravity center -extent 512x512 -define png:compression-level=9 -define png:compression-filter=5 /tmp/app_icon_valid.png 2>/dev/null; then
-                  PNG_MAGIC=$(xxd -l 4 -p /tmp/app_icon_valid.png 2>/dev/null || echo "")
-                  if [ "$PNG_MAGIC" = "89504e47" ]; then
+                echo "File valid sebagai image. Crop tengah 1:1 (fix icon jepit v4.4)..."
+                # ── FIX ICON JEPIT (v4.4) ──
+                # Dulu: convert -resize 512x512 -extent 512x512 → foto non-kotak
+                # (mis. screenshot 572x1280) jadi thumbnail mini dgn pita kosong —
+                # di launcher keliatan kayak "icon gak ke bikin".
+                # Sekarang: auto-orient ( hormatin EXIF rotasi HP ) → hitung crop
+                # kotak persis di TENGAH → resize 512x512. Icon bener-bener kotak.
+                RAW_W=$(identify -format "%w" /tmp/app_icon_raw 2>/dev/null | head -1 | tr -dc '0-9')
+                RAW_H=$(identify -format "%h" /tmp/app_icon_raw 2>/dev/null | head -1 | tr -dc '0-9')
+                CROP_OK=false
+                if [ -n "$RAW_W" ] && [ -n "$RAW_H" ] && [ "$RAW_W" -gt 0 ] && [ "$RAW_H" -gt 0 ] 2>/dev/null; then
+                  if [ "$RAW_W" -ge "$RAW_H" ]; then
+                    SIDE=$RAW_H; OFF_X=$(( (RAW_W - RAW_H) / 2 )); OFF_Y=0
+                  else
+                    SIDE=$RAW_W; OFF_X=0; OFF_Y=$(( (RAW_H - RAW_W) / 2 ))
+                  fi
+                  echo "Crop tengah: ${SIDE}x${SIDE}+${OFF_X}+${OFF_Y} (asli ${RAW_W}x${RAW_H})"
+                  if convert /tmp/app_icon_raw -auto-orient -strip -crop "${SIDE}x${SIDE}+${OFF_X}+${OFF_Y}" +repage -resize 512x512 -extent 512x512 -background none -define png:compression-level=9 -define png:compression-filter=5 /tmp/app_icon_valid.png 2>/dev/null; then
+                    CROP_OK=true
+                  fi
+                fi
+                if [ "$CROP_OK" = false ]; then
+                  echo "Crop pintar gagal (format aneh?), fallback cara lama..."
+                  convert /tmp/app_icon_raw -auto-orient -background none -strip -resize 512x512 -gravity center -extent 512x512 -define png:compression-level=9 -define png:compression-filter=5 /tmp/app_icon_valid.png 2>/dev/null || true
+                fi
+                PNG_MAGIC=$(xxd -l 4 -p /tmp/app_icon_valid.png 2>/dev/null || echo "")
+                if [ "$PNG_MAGIC" = "89504e47" ]; then
                     echo "PNG valid! Applying ke mipmap directories..."
                     for dir in android/app/src/main/res/mipmap-*; do
                       if [ -d "$dir" ]; then
@@ -497,9 +529,6 @@ jobs:
                     echo "Icon berhasil di-apply!"
                   else
                     echo "Konversi PNG gagal (magic byte gak valid), pake icon default Flutter"
-                  fi
-                else
-                  echo "ImageMagick convert gagal, pake icon default Flutter"
                 fi
               else
                 echo "File bukan image valid (magic: $FILE_MAGIC), pake icon default Flutter"
