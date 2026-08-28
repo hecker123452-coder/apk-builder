@@ -275,41 +275,12 @@ jobs:
           path: build/app/outputs/bundle/**/*.aab
           retention-days: 7
 
-      - name: Send to Telegram
-        if: inputs.chat_id != '' && inputs.bot_token != ''
-        run: |
-          SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
-          if [ "$INPUT_BUILD_FORMAT" = "apk" ] || [ "$INPUT_BUILD_FORMAT" = "both" ]; then
-            APK=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1)
-            if [ -n "$APK" ]; then
-              SIZE=$(du -sh "$APK" | cut -f1)
-              CAPTION=$(printf '✅ APK Udah Jadi!\n%s | %s | %s' "$SAFE_APP_NAME" "$INPUT_BUILD_TYPE" "$SIZE")
-              curl -s -X POST "https://api.telegram.org/bot${INPUT_BOT_TOKEN}/sendDocument" \
-                -F "chat_id=${INPUT_CHAT_ID}" -F "document=@$APK" --form-string "caption=$CAPTION"
-            fi
-          fi
-          if [ "$INPUT_BUILD_FORMAT" = "aab" ] || [ "$INPUT_BUILD_FORMAT" = "both" ]; then
-            AAB=$(find build/app/outputs/bundle -name "*.aab" 2>/dev/null | head -1)
-            if [ -n "$AAB" ]; then
-              SIZE=$(du -sh "$AAB" | cut -f1)
-              CAPTION=$(printf '✅ AAB Udah Jadi!\n%s | %s | %s' "$SAFE_APP_NAME" "$INPUT_BUILD_TYPE" "$SIZE")
-              curl -s -X POST "https://api.telegram.org/bot${INPUT_BOT_TOKEN}/sendDocument" \
-                -F "chat_id=${INPUT_CHAT_ID}" -F "document=@$AAB" --form-string "caption=$CAPTION"
-            fi
-          fi
+      # NOTE: "Send to Telegram" step DIHAPUS — bot (index.js) yang handle kirim APK
+      # ke user via client.sendFile() dengan format caption yang lebih informatif.
+      # Workflow cuma upload artifact, bot yang deliver.
+      # Ini mencegah DOUBLE APK (workflow kirim + bot kirim = user kirim 2x).
 
-      - name: Notify Failure
-        if: failure()
-        run: |
-          ERROR_SUMMARY="Build gagal"
-          if [ -f build_output.txt ]; then
-            ERROR_SUMMARY=$(grep -i "error\|failed\|exception" build_output.txt 2>/dev/null | head -5 | tr '\n' ' ')
-          fi
-          [ -z "$ERROR_SUMMARY" ] && ERROR_SUMMARY="Build gagal di awal."
-          ERROR_SUMMARY=$(echo "$ERROR_SUMMARY" | cut -c1-500)
-          if [ -n "$INPUT_CHAT_ID" ] && [ -n "$INPUT_BOT_TOKEN" ]; then
-            SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
-            MSG=$(printf '❌ Build Gagal\n%s | %s\n%s' "$SAFE_APP_NAME" "$INPUT_BUILD_TYPE" "$ERROR_SUMMARY")
-            curl -s -X POST "https://api.telegram.org/bot${INPUT_BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${INPUT_CHAT_ID}" --data-urlencode "text=$MSG"
-          fi
+      # NOTE: "Notify Failure" step DIHAPUS — bot (index.js) yang handle error
+      # notification ke user dengan detail error log + file attachment.
+      # Workflow cuma build + upload artifact, bot yang handle semua notifikasi.
+      # Ini mencegah DOUBLE error message (workflow kirim + bot kirim).
