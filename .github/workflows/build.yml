@@ -288,7 +288,7 @@ jobs:
               applied.append(label + ' ' + old + ' -> ' + tgt)
 
           # 1) Gradle wrapper
-          m = re.search(r"Your project's Gradle version \(" + V + r"\) is lower than Flutter's minimum supported version of " + V, err)
+          m = re.search(r"Your project's Gradle version \((?:Gradle version )?" + V + r"\) is lower than Flutter's minimum supported version of (?:Gradle version )?" + V, err)
           if m:
               tgt = re.sub(r'\.0$', '', m.group(2))  # dist gradle gak ada X.Y.0
               path = 'android/gradle/wrapper/gradle-wrapper.properties'
@@ -305,7 +305,7 @@ jobs:
                       applied.append('Gradle wrapper ' + mm.group(1) + ' -> ' + tgt)
 
           # 2) Android Gradle Plugin
-          m = re.search(r"Your project's Android Gradle Plugin version \(" + V + r"\) is lower than Flutter's minimum supported version of " + V, err)
+          m = re.search(r"Your project's Android Gradle Plugin version \((?:Android Gradle Plugin version )?" + V + r"\) is lower than Flutter's minimum supported version of (?:Android Gradle Plugin version )?" + V, err)
           if m:
               tgt = m.group(2)
               patch('android/settings.gradle', r'(?m)(id\s+["\']com\.android\.application["\']\s+version\s+["\'])([\d.]+)', tgt, 'AGP(settings.gradle)')
@@ -314,7 +314,7 @@ jobs:
               patch('android/build.gradle.kts', r'(com\.android\.tools\.build:gradle:)([\d.]+)', tgt, 'AGP(build.gradle.kts)')
 
           # 3) Kotlin Gradle Plugin
-          m = re.search(r"Your project's Kotlin version \(" + V + r"\) is lower than Flutter's minimum supported version of " + V, err)
+          m = re.search(r"Your project's Kotlin version \((?:Kotlin version )?" + V + r"\) is lower than Flutter's minimum supported version of (?:Kotlin version )?" + V, err)
           if m:
               tgt = m.group(2)
               patch('android/settings.gradle', r'(?m)(id\s+["\']org\.jetbrains\.kotlin(?:\.android)?["\']\s+version\s+["\'])([\d.]+)', tgt, 'KGP(settings.gradle)')
