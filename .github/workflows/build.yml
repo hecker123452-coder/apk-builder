@@ -295,6 +295,13 @@ jobs:
             exit 1
           fi
 
+
+      - name: Write Auto-Fix Helpers + Toolchain Check
+        run: |
+          # Step pemisah dari "Download + Extract + Deps + Patch": GitHub
+          # Actions nolak run block > 21.000 char (max expression length).
+          # Isi: helper python anti-stale toolchain (v5.4) + dartfix (v5.5)
+          # + gradlefix check + patch font_awesome lama.
           # ── ⚙️ v5.4 TOOLCHAIN ANTI-STALE ──
           # Project ZIP user sering bawa toolchain Android ke tua, padahal
           # Flutter 3.47.2 (DependencyVersionChecker) nolak: Gradle < 8.14.0,
