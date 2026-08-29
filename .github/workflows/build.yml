@@ -231,6 +231,7 @@ jobs:
           import os, re, sys
 
           min_ver = sys.argv[1] if len(sys.argv) > 1 else '8.14.0'
+          min_ver = re.sub(r'\.0$', '', min_ver)  # dist gradle gak ada X.Y.0 (8.14.0 -> 8.14)
           path = 'android/gradle/wrapper/gradle-wrapper.properties'
           if not os.path.isfile(path):
               print('GRADLE-FIX: gak ada gradle-wrapper.properties, skip')
@@ -289,18 +290,19 @@ jobs:
           # 1) Gradle wrapper
           m = re.search(r"Your project's Gradle version \(" + V + r"\) is lower than Flutter's minimum supported version of " + V, err)
           if m:
+              tgt = re.sub(r'\.0$', '', m.group(2))  # dist gradle gak ada X.Y.0
               path = 'android/gradle/wrapper/gradle-wrapper.properties'
               if os.path.isfile(path):
                   with open(path, encoding='utf-8') as f:
                       content = f.read()
                   mm = re.search(r'distributionUrl\s*=\s*\S*gradle-' + V + r'-(bin|all)\.zip', content)
-                  if mm and vkey(mm.group(1)) < vkey(m.group(2)):
-                      url = 'https\\://services.gradle.org/distributions/gradle-' + m.group(2) + '-' + mm.group(2) + '.zip'
+                  if mm and vkey(mm.group(1)) < vkey(tgt):
+                      url = 'https\\://services.gradle.org/distributions/gradle-' + tgt + '-' + mm.group(2) + '.zip'
                       content = re.sub(r'(?m)^distributionUrl\s*=.*$', lambda g: 'distributionUrl=' + url, content)
                       content = re.sub(r'(?m)^distributionSha256Sum\s*=.*\n?', '', content)
                       with open(path, 'w', encoding='utf-8') as f:
                           f.write(content)
-                      applied.append('Gradle wrapper ' + mm.group(1) + ' -> ' + m.group(2))
+                      applied.append('Gradle wrapper ' + mm.group(1) + ' -> ' + tgt)
 
           # 2) Android Gradle Plugin
           m = re.search(r"Your project's Android Gradle Plugin version \(" + V + r"\) is lower than Flutter's minimum supported version of " + V, err)
