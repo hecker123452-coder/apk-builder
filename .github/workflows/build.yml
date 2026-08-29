@@ -46,7 +46,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # v5.4: 18 menit — auto-fix toolchain bisa retry build beberapa kali
+    # (gradle/AGP/kotlin bump + download dist gradle baru + full compile)
+    timeout-minutes: 18
     permissions:
       contents: write
       actions: write
@@ -213,6 +215,129 @@ jobs:
             exit 1
           fi
 
+          # ── ⚙️ v5.4 TOOLCHAIN ANTI-STALE ──
+          # Project ZIP user sering bawa toolchain Android ke tua, padahal
+          # Flutter 3.47.2 (DependencyVersionChecker) nolak: Gradle < 8.14.0,
+          # AGP < 8.11.1, Kotlin < 2.2.20, minSdk < 23 → build mati di
+          # "Failed to apply plugin dev.flutter.flutter-gradle-plugin".
+          # Dua lapis fix (pola sama kayak anti-conflict pub v5.2):
+          #   (a) PROAKTIF — gradlefix.py: bump gradle-wrapper.properties ke
+          #       minimum Flutter SEBELUM build (8.14.0 = min Flutter 3.47.2;
+          #       kalau flutter-version di atas diganti, sesuaikan angka ini,
+          #       lapis reaktif di step build tetap jadi jaring pengaman).
+          #   (b) REAKTIF — bldfix.py: baca error build di step "Patch Android
+          #       + Build", patch file toolchain yang ditolak, terus retry.
+          cat > /tmp/gradlefix.py <<'PYGW'
+          import os, re, sys
+
+          min_ver = sys.argv[1] if len(sys.argv) > 1 else '8.14.0'
+          path = 'android/gradle/wrapper/gradle-wrapper.properties'
+          if not os.path.isfile(path):
+              print('GRADLE-FIX: gak ada gradle-wrapper.properties, skip')
+              sys.exit(0)
+          with open(path, encoding='utf-8') as f:
+              content = f.read()
+          m = re.search(r'distributionUrl\s*=\s*\S*gradle-(\d+(?:\.\d+)*)-(bin|all)\.zip', content)
+          if not m:
+              print('GRADLE-FIX: distributionUrl gak kebaca, skip')
+              sys.exit(0)
+
+          def vkey(v):
+              return [int(x) for x in v.split('.') if x.isdigit()]
+
+          cur = m.group(1)
+          if vkey(cur) >= vkey(min_ver):
+              print('GRADLE-FIX: Gradle ' + cur + ' >= min ' + min_ver + ', aman')
+          else:
+              url = 'https\\://services.gradle.org/distributions/gradle-' + min_ver + '-' + m.group(2) + '.zip'
+              content = re.sub(r'(?m)^distributionUrl\s*=.*$', lambda g: 'distributionUrl=' + url, content)
+              content = re.sub(r'(?m)^distributionSha256Sum\s*=.*\n?', '', content)
+              with open(path, 'w', encoding='utf-8') as f:
+                  f.write(content)
+              print('GRADLE-FIX: Gradle ' + cur + ' < min ' + min_ver + ' -> wrapper di-bump ke ' + min_ver)
+          PYGW
+          cat > /tmp/bldfix.py <<'PYBLD'
+          import os, re
+
+          err = os.environ.get('BLD_ERR', '')
+          applied = []
+          V = r'(\d+(?:\.\d+)*)'
+
+          def vkey(v):
+              return [int(x) for x in v.split('.') if x.isdigit()]
+
+          def patch(path, pat, tgt, label, count=1):
+              if not os.path.isfile(path) or not tgt:
+                  return
+              with open(path, encoding='utf-8') as f:
+                  content = f.read()
+              if count == 0:
+                  content2, n = re.subn(pat, lambda g: g.group(1) + tgt, content)
+                  if n == 0:
+                      return
+                  old = str(n) + ' lokasi'
+              else:
+                  mm = re.search(pat, content)
+                  if not mm:
+                      return
+                  old = mm.group(2)
+                  content2 = content[:mm.start(2)] + tgt + content[mm.end(2):]
+              with open(path, 'w', encoding='utf-8') as f:
+                  f.write(content2)
+              applied.append(label + ' ' + old + ' -> ' + tgt)
+
+          # 1) Gradle wrapper
+          m = re.search(r"Your project's Gradle version \(" + V + r"\) is lower than Flutter's minimum supported version of " + V, err)
+          if m:
+              path = 'android/gradle/wrapper/gradle-wrapper.properties'
+              if os.path.isfile(path):
+                  with open(path, encoding='utf-8') as f:
+                      content = f.read()
+                  mm = re.search(r'distributionUrl\s*=\s*\S*gradle-' + V + r'-(bin|all)\.zip', content)
+                  if mm and vkey(mm.group(1)) < vkey(m.group(2)):
+                      url = 'https\\://services.gradle.org/distributions/gradle-' + m.group(2) + '-' + mm.group(2) + '.zip'
+                      content = re.sub(r'(?m)^distributionUrl\s*=.*$', lambda g: 'distributionUrl=' + url, content)
+                      content = re.sub(r'(?m)^distributionSha256Sum\s*=.*\n?', '', content)
+                      with open(path, 'w', encoding='utf-8') as f:
+                          f.write(content)
+                      applied.append('Gradle wrapper ' + mm.group(1) + ' -> ' + m.group(2))
+
+          # 2) Android Gradle Plugin
+          m = re.search(r"Your project's Android Gradle Plugin version \(" + V + r"\) is lower than Flutter's minimum supported version of " + V, err)
+          if m:
+              tgt = m.group(2)
+              patch('android/settings.gradle', r'(?m)(id\s+["\']com\.android\.application["\']\s+version\s+["\'])([\d.]+)', tgt, 'AGP(settings.gradle)')
+              patch('android/settings.gradle.kts', r'(?m)(id\(\s*["\']com\.android\.application["\']\s*\)\s+version\s+["\'])([\d.]+)', tgt, 'AGP(settings.gradle.kts)')
+              patch('android/build.gradle', r'(com\.android\.tools\.build:gradle:)([\d.]+)', tgt, 'AGP(build.gradle)')
+              patch('android/build.gradle.kts', r'(com\.android\.tools\.build:gradle:)([\d.]+)', tgt, 'AGP(build.gradle.kts)')
+
+          # 3) Kotlin Gradle Plugin
+          m = re.search(r"Your project's Kotlin version \(" + V + r"\) is lower than Flutter's minimum supported version of " + V, err)
+          if m:
+              tgt = m.group(2)
+              patch('android/settings.gradle', r'(?m)(id\s+["\']org\.jetbrains\.kotlin(?:\.android)?["\']\s+version\s+["\'])([\d.]+)', tgt, 'KGP(settings.gradle)')
+              patch('android/settings.gradle.kts', r'(?m)(id\(\s*["\']org\.jetbrains\.kotlin(?:\.android)?["\']\s*\)\s+version\s+["\'])([\d.]+)', tgt, 'KGP(settings.gradle.kts)')
+              patch('android/build.gradle', r'(org\.jetbrains\.kotlin:kotlin-gradle-plugin:)([\d.]+)', tgt, 'KGP(build.gradle)')
+              patch('android/build.gradle.kts', r'(org\.jetbrains\.kotlin:kotlin-gradle-plugin:)([\d.]+)', tgt, 'KGP(build.gradle.kts)')
+              patch('android/build.gradle', r'(?m)(ext\.kotlin_version\s*=\s*["\'])([\d.]+)', tgt, 'Kotlin(ext)')
+
+          # 4) minSdk (< 23 ditolak Flutter 3.47.2)
+          m = re.search(r"Your project's minimum Android SDK(?: \(flavor='[^']*'\))? version \((\d+)\) is lower than Flutter's minimum supported version of (\d+)", err)
+          if m:
+              tgt = m.group(2)
+              patch('android/app/build.gradle', r'(?m)(minSdkVersion\s+)(\d+)', tgt, 'minSdk(app/build.gradle)', count=0)
+              patch('android/app/build.gradle.kts', r'(?m)(minSdk\s*=\s*)(\d+)', tgt, 'minSdk(app/build.gradle.kts)', count=0)
+
+          if applied:
+              print('AUTO-FIX toolchain:', '; '.join(applied))
+              with open('/tmp/bldfix_applied', 'w') as f:
+                  f.write('; '.join(applied))
+          else:
+              print('AUTO-FIX: gak ada pola toolchain yang cocok buat dipatch')
+          PYBLD
+          echo "── v5.4 toolchain check: gradle wrapper vs min Flutter ──"
+          python3 /tmp/gradlefix.py "8.14.0" || true
+
           # Auto-fix incompatible packages
           FLUTTER_VER=$(flutter --version 2>/dev/null | head -1 | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "0.0.0")
           FLUTTER_MAJOR=$(echo "$FLUTTER_VER" | cut -d. -f1)
@@ -307,10 +432,41 @@ jobs:
           find "$HOME/.pub-cache/hosted" -name "build.gradle" -path "*android*" \
             -exec sed -i "s/getDefaultProguardFile('proguard-android.txt')/getDefaultProguardFile('proguard-android-optimize.txt')/g" {} + 2>/dev/null || true
           echo "AGP9 proguard safety patch (APK): OK"
-          if [ "$INPUT_BUILD_TYPE" = "release" ]; then
-            flutter build apk --release --no-tree-shake-icons 2>&1 | tee build_output.txt
-          else
-            flutter build apk --debug --no-tree-shake-icons 2>&1 | tee build_output.txt
+          # ── ⚙️ v5.4: build + auto-fix toolchain reaktif (max 5 percobaan) ──
+          # Kalau Flutter nolak toolchain project (Gradle/AGP/Kotlin/minSdk ke
+          # tua), /tmp/bldfix.py patch filenya otomatis terus build di-retry.
+          rm -f /tmp/bldfix_applied
+          BUILD_ATTEMPT=0
+          BUILD_OK=false
+          while [ "$BUILD_ATTEMPT" -lt 5 ]; do
+            BUILD_ATTEMPT=$((BUILD_ATTEMPT+1))
+            echo "🔨 flutter build apk — percobaan $BUILD_ATTEMPT/5 ($INPUT_BUILD_TYPE)"
+            BUILD_RC=0
+            if [ "$INPUT_BUILD_TYPE" = "release" ]; then
+              BUILD_OUT=$(flutter build apk --release --no-tree-shake-icons 2>&1) || BUILD_RC=$?
+            else
+              BUILD_OUT=$(flutter build apk --debug --no-tree-shake-icons 2>&1) || BUILD_RC=$?
+            fi
+            printf '%s\n' "$BUILD_OUT" | tee build_output.txt
+            if [ "$BUILD_RC" -eq 0 ]; then
+              BUILD_OK=true
+              break
+            fi
+            echo "⚠️ build gagal (percobaan $BUILD_ATTEMPT/5) → cek toolchain auto-fix..."
+            BLD_ERR="$BUILD_OUT" python3 /tmp/bldfix.py || true
+            if [ -s /tmp/bldfix_applied ]; then
+              echo "🔁 retry build setelah auto-fix: $(head -1 /tmp/bldfix_applied)"
+              rm -f /tmp/bldfix_applied
+            else
+              echo "❌ gak ada auto-fix yang cocok — error asli ada di atas"
+              break
+            fi
+          done
+          rm -f /tmp/bldfix_applied
+          if [ "$BUILD_OK" != "true" ]; then
+            echo "=== BUILD FAILED ==="
+            tail -40 build_output.txt
+            exit 1
           fi
           APK_PATH=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1 || find build/app/outputs/apk -name "*.apk" 2>/dev/null | head -1)
           if [ -z "$APK_PATH" ]; then
@@ -332,10 +488,40 @@ jobs:
           find "$HOME/.pub-cache/hosted" -name "build.gradle" -path "*android*" \
             -exec sed -i "s/getDefaultProguardFile('proguard-android.txt')/getDefaultProguardFile('proguard-android-optimize.txt')/g" {} + 2>/dev/null || true
           echo "AGP9 proguard safety patch (AAB): OK"
-          if [ "$INPUT_BUILD_TYPE" = "release" ]; then
-            flutter build appbundle --release --no-tree-shake-icons 2>&1 | tee build_output_aab.txt
-          else
-            flutter build appbundle --debug --no-tree-shake-icons 2>&1 | tee build_output_aab.txt
+          # ── ⚙️ v5.4: build AAB + auto-fix toolchain reaktif (max 5 percobaan) ──
+          # Sama kayak step APK: toolchain ke tua di-patch otomatis, build di-retry.
+          rm -f /tmp/bldfix_applied
+          BUILD_ATTEMPT=0
+          BUILD_OK=false
+          while [ "$BUILD_ATTEMPT" -lt 5 ]; do
+            BUILD_ATTEMPT=$((BUILD_ATTEMPT+1))
+            echo "🔨 flutter build appbundle — percobaan $BUILD_ATTEMPT/5 ($INPUT_BUILD_TYPE)"
+            BUILD_RC=0
+            if [ "$INPUT_BUILD_TYPE" = "release" ]; then
+              BUILD_OUT=$(flutter build appbundle --release --no-tree-shake-icons 2>&1) || BUILD_RC=$?
+            else
+              BUILD_OUT=$(flutter build appbundle --debug --no-tree-shake-icons 2>&1) || BUILD_RC=$?
+            fi
+            printf '%s\n' "$BUILD_OUT" | tee build_output_aab.txt
+            if [ "$BUILD_RC" -eq 0 ]; then
+              BUILD_OK=true
+              break
+            fi
+            echo "⚠️ build AAB gagal (percobaan $BUILD_ATTEMPT/5) → cek toolchain auto-fix..."
+            BLD_ERR="$BUILD_OUT" python3 /tmp/bldfix.py || true
+            if [ -s /tmp/bldfix_applied ]; then
+              echo "🔁 retry build setelah auto-fix: $(head -1 /tmp/bldfix_applied)"
+              rm -f /tmp/bldfix_applied
+            else
+              echo "❌ gak ada auto-fix yang cocok — error asli ada di atas"
+              break
+            fi
+          done
+          rm -f /tmp/bldfix_applied
+          if [ "$BUILD_OK" != "true" ]; then
+            echo "=== AAB BUILD FAILED ==="
+            tail -40 build_output_aab.txt
+            exit 1
           fi
           AAB_PATH=$(find build/app/outputs/bundle -name "*.aab" 2>/dev/null | head -1)
           if [ -z "$AAB_PATH" ]; then
