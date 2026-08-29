@@ -142,13 +142,16 @@ jobs:
           fi
           rm -rf project project.zip
 
-          # ── ⚙️ v5.2 Pub get ANTI-CONFLICT ──
+          # ── ⚙️ v5.2/v5.5 Pub get ANTI-CONFLICT ──
           # Project ZIP user sering ada konflik dependensi (mis. pubspec pin
           # package_info_plus ^9.0.0 tapi better_player dari git butuh ^10.1.0
           # via wakelock_plus) → pub get mati total. Sekarang: error dibaca,
           # constraint paket langsung yang bentrok di-BUMP otomatis ngikutin
           # versi yang diminta dependensi transitif, terus di-retry (max 4x).
-          # Kalau parsing gak nemu apa-apa → fallback pub upgrade --major-versions.
+          # v5.5: pola "is incompatible" (device_info_plus <13 vs win32 ^6
+          # dari wakelock_plus) → dep langsung di-bump ke major setelah upper
+          # bound-nya — biar GAK perlu fallback pub upgrade --major-versions
+          # yang ngerewrite 25+ constraint dan bikin kode user gak kompil.
           rm -f /tmp/pubfix_applied
           PUB_ATTEMPT=0
           PUB_OK=false
@@ -192,6 +195,83 @@ jobs:
               bump(pkg, ver)
           for pkg, ver in re.findall(r'which depends on ([a-z0-9_]+) \^(\d+\.\d+\.\d+)', err):
               bump(pkg, ver)
+
+          # v5.5: pola "is incompatible" — kumpulin semua klausa
+          # "X <range> depends on Y <range>" / "X requires Y <range>" (termasuk
+          # bentuk "which depends on" dan "from git"), terus cek tiap kandidat
+          # langsung di baris "depends on both A ... and B": kalau klausa
+          # kandidat minta paket P di rentang yang GAK cocok sama klausa lain,
+          # bump kandidat ke major sesudah upper bound-nya
+          # ("^12.3.0" → "^13.0.0", ">=11.3.2 <13.0.0" → "^13.0.0").
+          clauses = []
+          for m in re.finditer(r'([a-z0-9_]+)((?:\s+[\^><=~]{0,2}[\d.]+)(?:\s*[<>]=?\s*[\d.]+)?)?(?:\s+from\s+git)?\s+(?:which\s+)?(?:depends on|requires)\s+([a-z0-9_]+)\s+([\^><=~]{0,2}[\d.]+(?:\s*[<>]=?\s*[\d.]+)?)', err):
+              clauses.append((m.group(1), m.group(2) or '', m.group(3), m.group(4)))
+          bothc = re.findall(r'depends on both ([a-z0-9_]+) [^\s]+(?: and ([a-z0-9_]+))?', err)
+
+          def rlim(rng):
+              parts = [int(x) for x in re.search(r'[\d.]+', rng).group(0).split('.') if x.isdigit()]
+              lo = tuple((parts + [0, 0, 0])[:3])
+              hi = None
+              if rng.lstrip().startswith('^'):
+                  hi = (lo[0] + 1, 0, 0)
+              m2 = re.search(r'<\s*(\d+)\.(\d+)\.(\d+)', rng)
+              if m2:
+                  hi = (int(m2.group(1)), int(m2.group(2)), int(m2.group(3)))
+              return (lo, hi)
+
+          def disjoint(r1, r2):
+              lo1, hi1 = rlim(r1)
+              lo2, hi2 = rlim(r2)
+              return (hi1 and lo2 >= hi1) or (hi2 and lo1 >= hi2)
+
+          def caret_of(rng):
+              m5 = re.search(r'[\^><=~]{0,2}(\d+(?:\.\d+){0,2})', rng)
+              if not m5:
+                  return None
+              parts = [x for x in m5.group(1).split('.') if x != '']
+              while len(parts) < 3:
+                  parts.append('0')
+              return '^' + '.'.join(parts[:3])
+
+          cands = [c for tup in bothc for c in tup if c]
+          bumped = False
+          # Kasus 2: kandidat jadi OBJEK dua klausa yang rentangnya berbenturan
+          # (mis. wakelock_plus butuh package_info_plus ^11.0.0 padahal app pin
+          # ^9.0.0) → bump kandidat ngikutin rentang sisi lain yang lebih tinggi.
+          for cand in cands:
+              if bumped:
+                  break
+              rngs = [dr for (sp, sr, dp, dr) in clauses if dp == cand and sp != cand]
+              for i in range(len(rngs)):
+                  for j in range(i + 1, len(rngs)):
+                      if disjoint(rngs[i], rngs[j]):
+                          tgt = caret_of(rngs[i] if rlim(rngs[i])[0] >= rlim(rngs[j])[0] else rngs[j])
+                          if tgt:
+                              bump(cand, tgt)
+                              bumped = True
+                          break
+                  if bumped:
+                      break
+          # Kasus 1: kandidat jadi SUBJEK klausa yang minta paket P di rentang
+          # benturan sama klausa lain (mis. device_info_plus <13 butuh win32 ^5
+          # padahal wakelock_plus butuh win32 ^6) → bump kandidat ke major
+          # sesudah upper bound-nya ("^12.3.0" / ">=11.3.2 <13.0.0" → "^13.0.0").
+          if not bumped:
+              for cand in cands:
+                  if bumped:
+                      break
+                  for (sp, sr, dp, dr) in clauses:
+                      if sp != cand or bumped:
+                          continue
+                      if any(dp2 == dp and sp2 != cand and disjoint(dr, dr2) for (sp2, sr2, dp2, dr2) in clauses):
+                          m3 = re.search(r'\^(\d+)', sr)
+                          m4 = re.search(r'<\s*(\d+)\.', sr)
+                          if m3:
+                              bump(cand, '^' + str(int(m3.group(1)) + 1) + '.0.0')
+                              bumped = True
+                          elif m4:
+                              bump(cand, '^' + m4.group(1) + '.0.0')
+                              bumped = True
 
           with open('pubspec.yaml', 'w', encoding='utf-8') as f:
               f.write(content)
@@ -337,6 +417,166 @@ jobs:
           else:
               print('AUTO-FIX: gak ada pola toolchain yang cocok buat dipatch')
           PYBLD
+          cat > /tmp/dartfix.py <<'PYDART'
+          import json, os, re, sys, urllib.request
+
+          # v5.5 DART-FIX: heal error kompilasi Dart setelah pub upgrade
+          # --major-versions naikin major package (API lama dihapus di kode
+          # user / di source package). SEMUA patch di sini ERROR-DRIVEN: cuma
+          # nge-patch file & pola yang beneran kena error di build_output.txt,
+          # jadi project yang aman gak akan tersentuh.
+          out_path = sys.argv[1] if len(sys.argv) > 1 else 'build_output.txt'
+          if not os.path.isfile(out_path):
+              sys.exit(0)
+          with open(out_path, encoding='utf-8', errors='replace') as f:
+              out = f.read()
+
+          applied = []
+          pubspec_changed = False
+          err_files = set(re.findall(r'(?:^|[\s>])((?:lib|test)/[\w./-]+\.dart):\d+:\d+: Error', out, re.M))
+
+          def read_f(p):
+              with open(p, encoding='utf-8') as f:
+                  return f.read()
+
+          def write_f(p, c):
+              with open(p, 'w', encoding='utf-8') as f:
+                  f.write(c)
+
+          def add_overrides(mapping):
+              global pubspec_changed
+              if not os.path.isfile('pubspec.yaml'):
+                  return
+              lines = read_f('pubspec.yaml').split('\n')
+              done = set()
+              res = []
+              sec = False
+              for ln in lines:
+                  if re.match(r'^dependency_overrides\s*:', ln):
+                      sec = True
+                      res.append(ln)
+                      continue
+                  if sec:
+                      if ln[:1] in (' ', '\t'):
+                          mm = re.match(r'^\s*([A-Za-z0-9_.-]+)\s*:', ln)
+                          if mm and mm.group(1) in mapping:
+                              res.append('  ' + mm.group(1) + ': ' + mapping[mm.group(1)])
+                              done.add(mm.group(1))
+                              continue
+                      elif ln.strip() and not ln.startswith('#'):
+                          sec = False
+                  res.append(ln)
+              if not any(re.match(r'^dependency_overrides\s*:', x) for x in lines):
+                  if res and res[-1].strip():
+                      res.append('')
+                  res.append('dependency_overrides:')
+              for pkg, ver in mapping.items():
+                  if pkg not in done:
+                      res.append('  ' + pkg + ': ' + ver)
+              newc = '\n'.join(res)
+              if newc != '\n'.join(lines):
+                  write_f('pubspec.yaml', newc)
+                  pubspec_changed = True
+
+          def latest_same_major(pkg, ver):
+              # rilis stabil terakhir di major yang sama (pub.dev API)
+              try:
+                  req = urllib.request.Request('https://pub.dev/api/packages/' + pkg, headers={'User-Agent': 'dzr-builder'})
+                  with urllib.request.urlopen(req, timeout=25) as r:
+                      data = json.load(r)
+                  maj = ver.split('.')[0]
+                  cands = []
+                  for v in data.get('versions', []):
+                      vv = v['version']
+                      if '+' in vv or '-' in vv or vv.split('.')[0] != maj:
+                          continue
+                      try:
+                          cands.append(tuple(int(x) for x in vv.split('.')))
+                      except ValueError:
+                          pass
+                  if not cands:
+                      return None
+                  return '.'.join(str(x) for x in max(cands))
+              except Exception:
+                  return None
+
+          fp12 = bool(re.search(r"Type 'FilePickerResult' not found|'FilePickerResult' isn't a type", out))
+
+          # R1: flutter_secure_storage >=11 hapus opsi encryptedSharedPreferences
+          for f in err_files:
+              if not os.path.isfile(f) or not re.search(re.escape(f) + r":\d+:\d+: Error: No named parameter with the name 'encryptedSharedPreferences'", out):
+                  continue
+              src = read_f(f)
+              src2 = re.sub(r'encryptedSharedPreferences\s*:\s*(?:true|false)\s*,?\s*', '', src)
+              src2 = re.sub(r'AndroidOptions\(\s*\)', 'AndroidOptions()', src2)
+              if src2 != src:
+                  write_f(f, src2)
+                  applied.append(f + ': encryptedSharedPreferences dibuang (flutter_secure_storage >=11)')
+
+          if fp12:
+              # R6: file_picker >=12 ngerewrite total API-nya (FilePickerResult +
+              # FilePicker.platform dihapus) → refactor kode terlalu dalem buat
+              # di-regex. Balikin API lama via dependency_overrides ke 11.0.3
+              # (rilis terakhir sebelum rewrite 12.0.0) + win32 ^6 buat project
+              # yang bawa better_player/wakelock_plus (kode win32 gak pernah
+              # dikompil buat APK/AAB, aman dipaksa).
+              if not os.path.exists('/tmp/dartfix_fp_done'):
+                  add_overrides({'file_picker': '11.0.3', 'win32': '^6.0.1'})
+                  applied.append('file_picker -> 11.0.3 + win32 ^6.0.1 via dependency_overrides (API lama dikembalikan)')
+                  with open('/tmp/dartfix_fp_done', 'w') as f:
+                      f.write('ok')
+          else:
+              # R2/R3: file_picker >=12 API baru (semua static)
+              for f in err_files:
+                  if not os.path.isfile(f):
+                      continue
+                  src = read_f(f)
+                  src2 = re.sub(r'\bFilePicker(?:Windows|Linux|IO|MacOS|Web)\(\)\.', 'FilePicker.', src)
+                  src2 = re.sub(r'\bFilePicker\.platform\.', 'FilePicker.', src2)
+                  if src2 != src:
+                      write_f(f, src2)
+                      applied.append(f + ': API file_picker >=12 (FilePicker static)')
+
+          # R4: geocoding >=4 fungsi top-level dihapus → class Geocoding()
+          for f in err_files:
+              if not os.path.isfile(f) or not re.search(re.escape(f) + r":\d+:\d+: Error: The method '(?:placemarkFromCoordinates|locationFromAddress)' isn't defined", out):
+                  continue
+              src = read_f(f)
+              src2 = re.sub(r'(?<![\w.])placemarkFromCoordinates\(', 'Geocoding().placemarkFromCoordinates(', src)
+              src2 = re.sub(r'(?<![\w.])locationFromAddress\(', 'Geocoding().locationFromAddress(', src2)
+              if src2 != src:
+                  write_f(f, src2)
+                  applied.append(f + ': panggilan geocoding dipindah ke Geocoding().* (geocoding >=4)')
+
+          # R5: error kompilasi DI DALAM source package pub-cache (package-nya
+          # sendiri gak kompatibel sama SDK) → override ke rilis terakhir
+          # major yang sama (semver-compatible, kode user gak perlu diubah)
+          m = re.search(r'\.pub-cache/hosted/pub\.dev/([a-z0-9_]+)-(\d+(?:\.\d+)*)/', out)
+          if m:
+              pkg, ver = m.group(1), m.group(2)
+              tag = pkg + ':' + ver
+              done_txt = ''
+              if os.path.exists('/tmp/dartfix_pkg_done'):
+                  with open('/tmp/dartfix_pkg_done', encoding='utf-8') as f:
+                      done_txt = f.read()
+              if tag not in done_txt:
+                  latest = latest_same_major(pkg, ver)
+                  if latest and latest != ver:
+                      add_overrides({pkg: latest})
+                      applied.append(pkg + ' ' + ver + ' -> ' + latest + ' (error di source package, override rilis terakhir major sama)')
+                  with open('/tmp/dartfix_pkg_done', 'a', encoding='utf-8') as f:
+                      f.write(tag + '\n')
+
+          if applied:
+              print('DART-FIX:', '; '.join(applied))
+              with open('/tmp/dartfix_applied', 'w') as f:
+                  f.write('; '.join(applied))
+              if pubspec_changed:
+                  with open('/tmp/dartfix_pubspec', 'w') as f:
+                      f.write('ok')
+          else:
+              print('DART-FIX: gak ada pola error Dart yang dikenali')
+          PYDART
           echo "── v5.4 toolchain check: gradle wrapper vs min Flutter ──"
           python3 /tmp/gradlefix.py "8.14.0" || true
 
@@ -434,10 +674,10 @@ jobs:
           find "$HOME/.pub-cache/hosted" -name "build.gradle" -path "*android*" \
             -exec sed -i "s/getDefaultProguardFile('proguard-android.txt')/getDefaultProguardFile('proguard-android-optimize.txt')/g" {} + 2>/dev/null || true
           echo "AGP9 proguard safety patch (APK): OK"
-          # ── ⚙️ v5.4: build + auto-fix toolchain reaktif (max 5 percobaan) ──
-          # Kalau Flutter nolak toolchain project (Gradle/AGP/Kotlin/minSdk ke
-          # tua), /tmp/bldfix.py patch filenya otomatis terus build di-retry.
-          rm -f /tmp/bldfix_applied
+          # ── ⚙️ v5.4/v5.5: build + auto-fix reaktif (max 5 percobaan) ──
+          # Toolchain ke tua → bldfix.py. Error kompilasi Dart (API package
+          # hasil major-upgrade) → dartfix.py. Terus retry sampai OK.
+          rm -f /tmp/bldfix_applied /tmp/dartfix_applied /tmp/dartfix_pubspec
           BUILD_ATTEMPT=0
           BUILD_OK=false
           while [ "$BUILD_ATTEMPT" -lt 5 ]; do
@@ -460,11 +700,22 @@ jobs:
               echo "🔁 retry build setelah auto-fix: $(head -1 /tmp/bldfix_applied)"
               rm -f /tmp/bldfix_applied
             else
-              echo "❌ gak ada auto-fix yang cocok — error asli ada di atas"
-              break
+              # ── ⚙️ v5.5: coba heal error kompilasi Dart ──
+              python3 /tmp/dartfix.py build_output.txt || true
+              if [ -s /tmp/dartfix_applied ]; then
+                if [ -s /tmp/dartfix_pubspec ]; then
+                  echo "🔁 pub get setelah dependency_overrides ditambahkan..."
+                  flutter pub get || true
+                fi
+                echo "🔁 retry build setelah Dart auto-fix: $(head -1 /tmp/dartfix_applied)"
+                rm -f /tmp/dartfix_applied /tmp/dartfix_pubspec
+              else
+                echo "❌ gak ada auto-fix yang cocok — error asli ada di atas"
+                break
+              fi
             fi
           done
-          rm -f /tmp/bldfix_applied
+          rm -f /tmp/bldfix_applied /tmp/dartfix_applied /tmp/dartfix_pubspec
           if [ "$BUILD_OK" != "true" ]; then
             echo "=== BUILD FAILED ==="
             tail -40 build_output.txt
@@ -490,9 +741,10 @@ jobs:
           find "$HOME/.pub-cache/hosted" -name "build.gradle" -path "*android*" \
             -exec sed -i "s/getDefaultProguardFile('proguard-android.txt')/getDefaultProguardFile('proguard-android-optimize.txt')/g" {} + 2>/dev/null || true
           echo "AGP9 proguard safety patch (AAB): OK"
-          # ── ⚙️ v5.4: build AAB + auto-fix toolchain reaktif (max 5 percobaan) ──
-          # Sama kayak step APK: toolchain ke tua di-patch otomatis, build di-retry.
-          rm -f /tmp/bldfix_applied
+          # ── ⚙️ v5.4/v5.5: build AAB + auto-fix reaktif (max 5 percobaan) ──
+          # Sama kayak step APK: toolchain ke tua → bldfix.py, error Dart →
+          # dartfix.py, terus retry.
+          rm -f /tmp/bldfix_applied /tmp/dartfix_applied /tmp/dartfix_pubspec
           BUILD_ATTEMPT=0
           BUILD_OK=false
           while [ "$BUILD_ATTEMPT" -lt 5 ]; do
@@ -515,11 +767,22 @@ jobs:
               echo "🔁 retry build setelah auto-fix: $(head -1 /tmp/bldfix_applied)"
               rm -f /tmp/bldfix_applied
             else
-              echo "❌ gak ada auto-fix yang cocok — error asli ada di atas"
-              break
+              # ── ⚙️ v5.5: coba heal error kompilasi Dart ──
+              python3 /tmp/dartfix.py build_output_aab.txt || true
+              if [ -s /tmp/dartfix_applied ]; then
+                if [ -s /tmp/dartfix_pubspec ]; then
+                  echo "🔁 pub get setelah dependency_overrides ditambahkan..."
+                  flutter pub get || true
+                fi
+                echo "🔁 retry build setelah Dart auto-fix: $(head -1 /tmp/dartfix_applied)"
+                rm -f /tmp/dartfix_applied /tmp/dartfix_pubspec
+              else
+                echo "❌ gak ada auto-fix yang cocok — error asli ada di atas"
+                break
+              fi
             fi
           done
-          rm -f /tmp/bldfix_applied
+          rm -f /tmp/bldfix_applied /tmp/dartfix_applied /tmp/dartfix_pubspec
           if [ "$BUILD_OK" != "true" ]; then
             echo "=== AAB BUILD FAILED ==="
             tail -40 build_output_aab.txt
