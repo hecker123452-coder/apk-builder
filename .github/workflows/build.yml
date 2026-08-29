@@ -140,8 +140,78 @@ jobs:
           fi
           rm -rf project project.zip
 
-          # Pub get
-          flutter pub get || { echo "ERROR: pub get failed!"; exit 1; }
+          # ── ⚙️ v5.2 Pub get ANTI-CONFLICT ──
+          # Project ZIP user sering ada konflik dependensi (mis. pubspec pin
+          # package_info_plus ^9.0.0 tapi better_player dari git butuh ^10.1.0
+          # via wakelock_plus) → pub get mati total. Sekarang: error dibaca,
+          # constraint paket langsung yang bentrok di-BUMP otomatis ngikutin
+          # versi yang diminta dependensi transitif, terus di-retry (max 4x).
+          # Kalau parsing gak nemu apa-apa → fallback pub upgrade --major-versions.
+          rm -f /tmp/pubfix_applied
+          PUB_ATTEMPT=0
+          PUB_OK=false
+          while [ "$PUB_ATTEMPT" -lt 4 ]; do
+            PUB_ATTEMPT=$((PUB_ATTEMPT+1))
+            if PUB_OUT=$(flutter pub get 2>&1); then
+              PUB_OK=true
+              echo "$PUB_OUT"
+              break
+            fi
+            echo "$PUB_OUT"
+            echo "⚠️ pub get gagal (percobaan $PUB_ATTEMPT/4) → auto-fix konflik dependensi..."
+            PUB_ERR="$PUB_OUT" python3 - <<'PYFIX' || true
+          import os, re
+
+          err = os.environ.get('PUB_ERR', '')
+          with open('pubspec.yaml', encoding='utf-8') as f:
+              content = f.read()
+          fixed = []
+
+          def bump(pkg, newver):
+              global content
+              pat = re.compile(r'(?m)^(\s*' + re.escape(pkg) + r':\s*)([^\n#]+?)(\s*#.*)?$')
+              m = pat.search(content)
+              if not m:
+                  return
+              val = m.group(2).strip()
+              if ':' in val or not re.search(r'\d', val):
+                  return
+              nv = newver if newver.startswith('^') else '^' + newver
+              if val == nv:
+                  return
+              content = pat.sub(lambda mm: mm.group(1) + nv + (mm.group(3) or ''), content, count=1)
+              fixed.append(pkg + ': ' + val + ' -> ' + nv)
+
+          need = dict(re.findall(r'depends on ([a-z0-9_]+) \^(\d+\.\d+\.\d+)', err))
+          for pkg, oldver in re.findall(r'depends on both ([a-z0-9_]+) \^(\d+\.\d+\.\d+)', err):
+              if pkg in need and need[pkg] != oldver:
+                  bump(pkg, need[pkg])
+          for pkg, ver in re.findall(r'which requires ([a-z0-9_]+) \^(\d+\.\d+\.\d+)', err):
+              bump(pkg, ver)
+          for pkg, ver in re.findall(r'which depends on ([a-z0-9_]+) \^(\d+\.\d+\.\d+)', err):
+              bump(pkg, ver)
+
+          with open('pubspec.yaml', 'w', encoding='utf-8') as f:
+              f.write(content)
+          if fixed:
+              print('AUTO-FIX pubspec.yaml:', '; '.join(fixed))
+              with open('/tmp/pubfix_applied', 'w') as f:
+                  f.write('; '.join(fixed))
+          else:
+              print('AUTO-FIX: gak nemu constraint yang bisa di-bump otomatis')
+          PYFIX
+            if [ -s /tmp/pubfix_applied ]; then
+              echo "🔁 retry pub get setelah auto-fix..."
+              rm -f /tmp/pubfix_applied
+            else
+              echo "🔁 fallback: flutter pub upgrade --major-versions..."
+              flutter pub upgrade --major-versions || true
+            fi
+          done
+          if [ "$PUB_OK" != "true" ]; then
+            echo "ERROR: pub get failed! Konflik dependensi gak bisa di-auto-fix — cek pubspec.yaml (paket dipin versi lama padahal plugin lain butuh versi lebih tinggi)"
+            exit 1
+          fi
 
           # Auto-fix incompatible packages
           FLUTTER_VER=$(flutter --version 2>/dev/null | head -1 | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "0.0.0")
