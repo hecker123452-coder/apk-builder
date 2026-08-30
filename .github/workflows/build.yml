@@ -494,6 +494,45 @@ jobs:
                   if mdone:
                       applied.append('MainActivity swap ke embedding v2: ' + ', '.join(mdone))
 
+          # 6) v5.6: compileSdk ke-rendah buat metadata AAR plugin (run #53
+          # project arshi): "Dependency ':flutter_plugin_android_lifecycle'
+          # requires ... compile against version 36 or later ... :file_picker
+          # is currently compiled against android-34." → bump compileSdk
+          # module yang ke-rendah: plugin di pub-cache, atau :app sendiri.
+          # Angka di build.gradle plugin bisa literal atau flutter.compileSdkVersion.
+          m = re.search(r"Dependency ':[\w.]+'.*?compile against version (\d+) or later of the\s+Android APIs\.\s*:?([\w.]+) is currently compiled against android-(\d+)", err, re.S)
+          if m:
+              import glob as _glob
+              seen_mods = set()
+              for mm in re.finditer(r"Dependency ':([\w.]+)'.*?compile against version (\d+) or later of the\s+Android APIs\.\s*:?([\w.]+) is currently compiled against android-(\d+)", err, re.S):
+                  mod, tgt = mm.group(3), mm.group(2)
+                  if mod in seen_mods:
+                      continue
+                  seen_mods.add(mod)
+                  tgti = int(tgt)
+                  paths = []
+                  if mod == 'app':
+                      for cand in ('android/app/build.gradle', 'android/app/build.gradle.kts'):
+                          if os.path.isfile(cand):
+                              paths.append(cand)
+                  else:
+                      paths = _glob.glob(os.path.expanduser('~/.pub-cache/hosted/pub.dev/' + mod + '-*/android/build.gradle')) + _glob.glob(os.path.expanduser('~/.pub-cache/hosted/pub.dev/' + mod + '-*/android/build.gradle.kts'))
+                  for path in paths:
+                      with open(path, encoding='utf-8') as f:
+                          g = f.read()
+
+                      def _bump_sdk(mmm):
+                          cur = mmm.group(2)
+                          if cur == 'flutter.compileSdkVersion' or int(cur) < tgti:
+                              return mmm.group(1) + tgt
+                          return mmm.group(0)
+
+                      g2 = re.sub(r'(?m)(compileSdk(?:Version)?\s*=?\s*)(\d+|flutter\.compileSdkVersion)', _bump_sdk, g)
+                      if g2 != g:
+                          with open(path, 'w', encoding='utf-8') as f:
+                              f.write(g2)
+                          applied.append('compileSdk ' + mod + ' -> ' + tgt)
+
           if applied:
               print('AUTO-FIX toolchain:', '; '.join(applied))
               with open('/tmp/bldfix_applied', 'w') as f:
