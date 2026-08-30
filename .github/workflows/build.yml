@@ -651,13 +651,22 @@ jobs:
           #     aman dibuang TANPA kehilangan fungsi (run #36/#40 project arshi).
           #   - onDownloadRequested: nama salah; yang bener onDownloadStartRequest
           #     (signature sama persis: (controller, DownloadStartRequest)).
-          phantom = re.search(r"No named parameter with the name '(?:onFileChooser|onDownloadRequested)'|'(?:FileChooserParams|FileChooserResult|FileChooserMode)' isn't defined|Method not found: 'FileChooser(?:Params|Result|Mode)'", out)
+          #   - PermissionRequest.grant(): GAK ADA di 6.x — cara yang bener:
+          #     callback onPermissionRequest harus RETURN PermissionResponse(
+          #     resources: ..., action: PermissionResponseAction.GRANT).
+          phantom = re.search(r"No named parameter with the name '(?:onFileChooser|onDownloadRequested)'|'(?:FileChooserParams|FileChooserResult|FileChooserMode)' isn't defined|Method not found: 'FileChooser(?:Params|Result|Mode)'|The method 'grant' isn't defined for the type 'PermissionRequest'", out)
           if phantom:
               for f in err_files:
                   if not os.path.isfile(f):
                       continue
                   src = read_f(f)
-                  src2 = re.sub(r'\bonDownloadRequested\s*:', 'onDownloadStartRequest:', src)
+                  # R7c: req.grant(req.resources) → return PermissionResponse(GRANT)
+                  src2 = re.sub(r"\b(\w+)\.grant\(\s*\1\.resources\s*\)\s*;",
+                                r"return PermissionResponse(resources: \1.resources, action: PermissionResponseAction.GRANT);", src)
+                  grant_fixed = src2 != src
+                  # R7b: onDownloadRequested -> onDownloadStartRequest
+                  src2b = re.sub(r'\bonDownloadRequested\s*:', 'onDownloadStartRequest:', src2)
+                  src2 = src2b
                   dropped = []
 
                   def _drop_param(mo):
@@ -714,7 +723,11 @@ jobs:
                       src2 = src2[:pos] + shim + src2[pos:]
                   if src2 != src:
                       write_f(f, src2)
-                      applied.append(f + ': API WebView fiktif dibenerin (onDownloadRequested->onDownloadStartRequest, onFileChooser+method-nya dibuang)')
+                      r7_note = 'API WebView fiktif dibenerin ('
+                      if grant_fixed:
+                          r7_note += 'PermissionRequest.grant->PermissionResponse(GRANT), '
+                      r7_note += 'onDownloadRequested->onDownloadStartRequest, onFileChooser+method-nya dibuang)'
+                      applied.append(f + ': ' + r7_note)
 
           # R5: error kompilasi DI DALAM source package pub-cache (package-nya
           # sendiri gak kompatibel sama SDK) → override ke rilis terakhir
