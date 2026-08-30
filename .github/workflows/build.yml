@@ -149,20 +149,28 @@ jobs:
           # Solusi: generate android/ pake `flutter create` — file yang udah ada
           # (lib/, pubspec.yaml, test/, assets/) GAK ditimpa, cuma folder kurang
           # yang ditambah. Org/paket diambil dari name: pubspec (dibersihin).
-          if [ ! -d "android" ] && grep -q "sdk:[[:space:]]*flutter" pubspec.yaml 2>/dev/null; then
-            PKG_NAME=$(sed -n "s/^name:[[:space:]]*[\"']\{0,1\}\([a-zA-Z0-9_]\+\)[\"']\{0,1\}[[:space:]]*$/\1/p" pubspec.yaml | head -1)
-            PKG_NAME=$(echo "$PKG_NAME" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9_]//g')
-            case "$PKG_NAME" in
-              "") PKG_NAME="app" ;;
-              [0-9]*) PKG_NAME="a$PKG_NAME" ;;
-            esac
-            echo "🆕 android/ gak ada di ZIP → generate pake flutter create (pkg: $PKG_NAME, org: com.dzrbuild)..."
-            flutter create --platforms=android --org com.dzrbuild --project-name "$PKG_NAME" . || true
-            if [ -d "android" ]; then
-              echo "✅ android/ berhasil di-generate — file project existing gak disentuh"
+          # NOTE: if bersarang + echo di tiap lapis — biar kalo kondisi nyangkut
+          # kelihatan jelas di log (run #50: blok ini ke-skip diam-diam).
+          echo "🔎 [bootstrap-check] pwd=$PWD | android-exists=$([ -d android ] && echo YES || echo NO) | pubspec=$([ -f pubspec.yaml ] && echo YES || echo NO)"
+          if [ ! -d "android" ]; then
+            echo "🔎 [bootstrap] android/ gak ada di workspace (pwd=$PWD) — cek pubspec..."
+            if [ -f "pubspec.yaml" ] && grep -q "flutter" pubspec.yaml && grep -q "sdk:" pubspec.yaml; then
+              PKG_NAME=$(sed -n "s/^name:[[:space:]]*[\"']\{0,1\}\([a-zA-Z0-9_]\+\)[\"']\{0,1\}[[:space:]]*$/\1/p" pubspec.yaml | head -1)
+              PKG_NAME=$(echo "$PKG_NAME" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9_]//g')
+              case "$PKG_NAME" in
+                "") PKG_NAME="app" ;;
+                [0-9]*) PKG_NAME="a$PKG_NAME" ;;
+              esac
+              echo "🆕 android/ gak ada di ZIP → generate pake flutter create (pkg: $PKG_NAME, org: com.dzrbuild)..."
+              flutter create --platforms=android --org com.dzrbuild --project-name "$PKG_NAME" . || true
+              if [ -d "android" ]; then
+                echo "✅ android/ berhasil di-generate — file project existing gak disentuh"
+              else
+                echo "ERROR: android/ gak berhasil di-generate (flutter create gagal)"
+                exit 1
+              fi
             else
-              echo "ERROR: android/ gak berhasil di-generate (flutter create gagal)"
-              exit 1
+              echo "🔎 [bootstrap] pubspec gak nandain project Flutter (sdk:flutter) — skip bootstrap"
             fi
           fi
 
@@ -825,6 +833,15 @@ jobs:
       - name: Patch Android + Build APK
         if: inputs.build_format == 'apk' || inputs.build_format == 'both'
         run: |
+          # ── 🆕 v5.6: second-chance bootstrap android/ (bila step deps ke-skip) ──
+          if [ ! -d "android" ] && [ -f "pubspec.yaml" ]; then
+            echo "🔁 [bootstrap-2] android/ masih gak ada di step build → generate sekarang..."
+            PKG_NAME=$(sed -n "s/^name:[[:space:]]*[\"']\{0,1\}\([a-zA-Z0-9_]\+\)[\"']\{0,1\}[[:space:]]*$/\1/p" pubspec.yaml | head -1)
+            PKG_NAME=$(echo "$PKG_NAME" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9_]//g')
+            case "$PKG_NAME" in "") PKG_NAME="app" ;; [0-9]*) PKG_NAME="a$PKG_NAME" ;; esac
+            flutter create --platforms=android --org com.dzrbuild --project-name "$PKG_NAME" . || true
+            if [ -d "android" ]; then echo "✅ [bootstrap-2] android/ generated"; else echo "❌ [bootstrap-2] flutter create gagal — build bakal mati di v1 embedding"; fi
+          fi
           SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           if [ -f "$MANIFEST" ] && [ -n "$SAFE_APP_NAME" ] && [ "$SAFE_APP_NAME" != "MyApp" ]; then
@@ -904,6 +921,15 @@ jobs:
       - name: Patch Android + Build AAB
         if: inputs.build_format == 'aab' || inputs.build_format == 'both'
         run: |
+          # ── 🆕 v5.6: second-chance bootstrap android/ (idempoten) ──
+          if [ ! -d "android" ] && [ -f "pubspec.yaml" ]; then
+            echo "🔁 [bootstrap-2] android/ masih gak ada di step AAB → generate sekarang..."
+            PKG_NAME=$(sed -n "s/^name:[[:space:]]*[\"']\{0,1\}\([a-zA-Z0-9_]\+\)[\"']\{0,1\}[[:space:]]*$/\1/p" pubspec.yaml | head -1)
+            PKG_NAME=$(echo "$PKG_NAME" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9_]//g')
+            case "$PKG_NAME" in "") PKG_NAME="app" ;; [0-9]*) PKG_NAME="a$PKG_NAME" ;; esac
+            flutter create --platforms=android --org com.dzrbuild --project-name "$PKG_NAME" . || true
+            if [ -d "android" ]; then echo "✅ [bootstrap-2] android/ generated"; else echo "❌ [bootstrap-2] flutter create gagal"; fi
+          fi
           SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           if [ -f "$MANIFEST" ] && [ -n "$SAFE_APP_NAME" ] && [ "$SAFE_APP_NAME" != "MyApp" ]; then
