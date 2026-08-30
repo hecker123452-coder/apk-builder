@@ -87,7 +87,6 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-            android/.gradle
             ~/.pub-cache
             .dart_tool
           key: gpub-${{ hashFiles('pubspec.yaml', 'pubspec.lock', 'android/**/build.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
@@ -150,7 +149,15 @@ jobs:
           # (lib/, pubspec.yaml, test/, assets/) GAK ditimpa, cuma folder kurang
           # yang ditambah. Org/paket diambil dari name: pubspec (dibersihin).
           # NOTE: if bersarang + echo di tiap lapis — biar kalo kondisi nyangkut
-          # kelihatan jelas di log (run #50: blok ini ke-skip diam-diam).
+          # kelihatan jelas di log (run #50/#51: blok ke-skip karena actions/
+          # cache@v4 PRE-CREATE folder path cache → android/.gradle dibuatkan
+          # walau project gak punya android/ → android-exists=YES palsu).
+          # v5.6b: android/.gradle dicabut dari path cache + shell kosong
+          # android/ (tanpa manifest) dihapus sebelum cek.
+          if [ -d "android" ] && [ ! -f "android/app/src/main/AndroidManifest.xml" ]; then
+            echo "🧹 [bootstrap] android/ cuma shell kosong (sisa pre-create cache path) → dihapus"
+            rm -rf android
+          fi
           echo "🔎 [bootstrap-check] pwd=$PWD | android-exists=$([ -d android ] && echo YES || echo NO) | pubspec=$([ -f pubspec.yaml ] && echo YES || echo NO)"
           if [ ! -d "android" ]; then
             echo "🔎 [bootstrap] android/ gak ada di workspace (pwd=$PWD) — cek pubspec..."
@@ -834,6 +841,10 @@ jobs:
         if: inputs.build_format == 'apk' || inputs.build_format == 'both'
         run: |
           # ── 🆕 v5.6: second-chance bootstrap android/ (bila step deps ke-skip) ──
+          if [ -d "android" ] && [ ! -f "android/app/src/main/AndroidManifest.xml" ]; then
+            echo "🧹 [bootstrap-2] android/ shell kosong → dihapus"
+            rm -rf android
+          fi
           if [ ! -d "android" ] && [ -f "pubspec.yaml" ]; then
             echo "🔁 [bootstrap-2] android/ masih gak ada di step build → generate sekarang..."
             PKG_NAME=$(sed -n "s/^name:[[:space:]]*[\"']\{0,1\}\([a-zA-Z0-9_]\+\)[\"']\{0,1\}[[:space:]]*$/\1/p" pubspec.yaml | head -1)
@@ -922,6 +933,10 @@ jobs:
         if: inputs.build_format == 'aab' || inputs.build_format == 'both'
         run: |
           # ── 🆕 v5.6: second-chance bootstrap android/ (idempoten) ──
+          if [ -d "android" ] && [ ! -f "android/app/src/main/AndroidManifest.xml" ]; then
+            echo "🧹 [bootstrap-2] android/ shell kosong → dihapus"
+            rm -rf android
+          fi
           if [ ! -d "android" ] && [ -f "pubspec.yaml" ]; then
             echo "🔁 [bootstrap-2] android/ masih gak ada di step AAB → generate sekarang..."
             PKG_NAME=$(sed -n "s/^name:[[:space:]]*[\"']\{0,1\}\([a-zA-Z0-9_]\+\)[\"']\{0,1\}[[:space:]]*$/\1/p" pubspec.yaml | head -1)
