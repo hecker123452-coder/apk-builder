@@ -937,9 +937,9 @@ jobs:
             echo "🔨 flutter build apk — percobaan $BUILD_ATTEMPT/5 ($INPUT_BUILD_TYPE)"
             BUILD_RC=0
             if [ "$INPUT_BUILD_TYPE" = "release" ]; then
-              BUILD_OUT=$(flutter build apk --release --no-tree-shake-icons 2>&1) || BUILD_RC=$?
+              BUILD_OUT=$(flutter build apk --release --no-tree-shake-icons --build-number="${GITHUB_RUN_NUMBER:-1}" 2>&1) || BUILD_RC=$?
             else
-              BUILD_OUT=$(flutter build apk --debug --no-tree-shake-icons 2>&1) || BUILD_RC=$?
+              BUILD_OUT=$(flutter build apk --debug --no-tree-shake-icons --build-number="${GITHUB_RUN_NUMBER:-1}" 2>&1) || BUILD_RC=$?
             fi
             printf '%s\n' "$BUILD_OUT" | tee build_output.txt
             if [ "$BUILD_RC" -eq 0 ]; then
@@ -980,6 +980,80 @@ jobs:
             exit 1
           fi
           echo "APK: $APK_PATH ($(du -sh "$APK_PATH" | cut -f1))"
+
+      # ─── 🔐 v5.9: STABLE SIGNING jalur ZIP project ────
+      # Sama kayak web2apk.yml: keystore release di repo (signing/dzr-release.jks)
+      # → signature build ZIP project juga TETAP antar build → project Flutter
+      # yang di-rebuild bisa update-over-install (tanpa uninstall).
+      # Catatan: OTA banner in-app CUMA buat app hasil Web2APK — project ZIP
+      # punya MainActivity sendiri, jadi yang berubah di sini signature doang.
+      - name: Stable signing (ZIP project)
+        if: inputs.build_format == 'apk' || inputs.build_format == 'both'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          KS_PASS: dzr-stable-2026
+        run: |
+          APK=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1 || find build/app/outputs/apk -name "*.apk" 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            echo "WARNING: APK gak ketemu buat re-sign (skip, non-fatal)"
+            exit 0
+          fi
+
+          REPO_API="https://api.github.com/repos/${GH_REPO}"
+          AUTHH="Authorization: Bearer ${GH_TOKEN}"
+          APPH="Accept: application/vnd.github+json"
+          KS=/tmp/dzr-release.jks
+
+          fetch_ks() {
+            local HTTP
+            HTTP=$(curl -sL -w "%{http_code}" -H "$AUTHH" -H "$APPH" \
+              -o /tmp/ks_meta.json "${REPO_API}/contents/signing/dzr-release.jks?ref=main")
+            if [ "$HTTP" = "200" ]; then
+              python3 -c "import json,base64;open('/tmp/dzr-release.jks.fromrepo','wb').write(base64.b64decode(json.load(open('/tmp/ks_meta.json'))['content']))" 2>/dev/null \
+                && mv /tmp/dzr-release.jks.fromrepo "$KS"
+            fi
+            echo "$HTTP"
+          }
+
+          KS_OK=false
+          [ -s "$KS" ] || fetch_ks > /dev/null
+          if [ -s "$KS" ] && keytool -list -keystore "$KS" -storepass "$KS_PASS" -alias dzr >/dev/null 2>&1; then
+            KS_OK=true
+            echo "Keystore stabil: DIPAKE dari repo"
+          fi
+          if [ "$KS_OK" = false ]; then
+            echo "Keystore belum ada / gak valid — generate BARU..."
+            rm -f "$KS"
+            keytool -genkeypair -v -keystore "$KS" -alias dzr -keyalg RSA -keysize 2048 \
+              -validity 10950 -storepass "$KS_PASS" -keypass "$KS_PASS" \
+              -dname "CN=DZR CloudBuilder, OU=Deruzuan, O=DZR, L=Jakarta, C=ID" >/dev/null 2>&1
+            PAYLOAD=$(python3 -c "import base64,json;print(json.dumps({'message':'chore: stable signing keystore (auto-generate)','content':base64.b64encode(open('/tmp/dzr-release.jks','rb').read()).decode(),'branch':'main'}))")
+            PUT_HTTP=$(curl -sL -o /tmp/ks_put.json -w "%{http_code}" -X PUT \
+              -H "$AUTHH" -H "$APPH" -d "$PAYLOAD" "${REPO_API}/contents/signing/dzr-release.jks")
+            if [ "$PUT_HTTP" != "200" ] && [ "$PUT_HTTP" != "201" ]; then
+              echo "Commit keystore gagal (HTTP $PUT_HTTP) — race guard: pake yang di repo..."
+              fetch_ks > /dev/null || true
+            fi
+          fi
+
+          if [ -s "$KS" ] && ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* >/dev/null 2>&1; then
+            BT=$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* | sort -V | tail -1)
+            if [ -x "$BT/zipalign" ] && [ -x "$BT/apksigner" ]; then
+              cp "$APK" /tmp/pre_sign.apk
+              "$BT/zipalign" -f -p 4 /tmp/pre_sign.apk /tmp/aligned.apk
+              "$BT/apksigner" sign --ks "$KS" --ks-key-alias dzr \
+                --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \
+                --out "$APK" /tmp/aligned.apk
+              "$BT/apksigner" verify "$APK" \
+                && echo "✅ APK ke-sign keystore stabil (jalur ZIP)" \
+                || echo "WARNING: verify gagal (non-fatal, APK tetep ke-upload)"
+            else
+              echo "WARNING: zipalign/apksigner gak ada (skip re-sign)"
+            fi
+          else
+            echo "WARNING: keystore/build-tools gak siap (skip re-sign, non-fatal)"
+          fi
 
       - name: Patch Android + Build AAB
         if: inputs.build_format == 'aab' || inputs.build_format == 'both'
@@ -1023,9 +1097,9 @@ jobs:
             echo "🔨 flutter build appbundle — percobaan $BUILD_ATTEMPT/5 ($INPUT_BUILD_TYPE)"
             BUILD_RC=0
             if [ "$INPUT_BUILD_TYPE" = "release" ]; then
-              BUILD_OUT=$(flutter build appbundle --release --no-tree-shake-icons 2>&1) || BUILD_RC=$?
+              BUILD_OUT=$(flutter build appbundle --release --no-tree-shake-icons --build-number="${GITHUB_RUN_NUMBER:-1}" 2>&1) || BUILD_RC=$?
             else
-              BUILD_OUT=$(flutter build appbundle --debug --no-tree-shake-icons 2>&1) || BUILD_RC=$?
+              BUILD_OUT=$(flutter build appbundle --debug --no-tree-shake-icons --build-number="${GITHUB_RUN_NUMBER:-1}" 2>&1) || BUILD_RC=$?
             fi
             printf '%s\n' "$BUILD_OUT" | tee build_output_aab.txt
             if [ "$BUILD_RC" -eq 0 ]; then
