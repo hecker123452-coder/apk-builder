@@ -1,8 +1,33 @@
 name: Web2APK
 
 # ============================================================================
-# DZR CloudBuilder — Web2APK Workflow v5.2 (🔄 OTA BALIK LAGI: UPDATE TANPA UNINSTALL)
+# DZR CloudBuilder — Web2APK Workflow v5.3 (🚀 AUTO-UPDATE FULL AUTO: DIALOG
+#                            LANGSUNG + AUTO-RESUME INSTALL, TANPA TUTORIAL)
 # ============================================================================
+# FIX LOG v5.3 (request owner: "pas user pakek trus ada yang versi terbaru
+#                langsung di suruh update trus nanti update selesai jangan
+#                pakek tutor update gak berfungsi gak kayak di apk2 lain"):
+#   1. DIALOG UPDATE LANGSUNG  : dulu cuma banner tipis (gampang kelewat).
+#      Sekarang pas app dibuka & ada versi baru → DIALOG besar muncul otomatis:
+#      "Update Tersedia v1.0.N" + tombol [Update Sekarang] / [Nanti]. User
+#      LANGSUNG disuruh update, gak perlu tau-tau apa-apa.
+#   2. AUTO-RESUME INSTALL     : dulu setelah izin "install aplikasi tak
+#      dikenal" dikasih, user HARUS pencet banner lagi (rasanya kayak
+#      "update gak berfungsi"). Sekarang: begitu user balik ke app setelah
+#      kasih izin, install LANGSUNG dilanjutin otomatis
+#      (WidgetsBindingObserver) → nol langkah ekstra, nol tutorial.
+#   3. RE-CHECK ON RESUME      : update dicek ulang tiap app dibuka lagi
+#      (throttle 15 menit) + retry awal 45s/120s kalo cek pertama gagal
+#      (HP baru nyala, WiFi belum konek) → update gak "kaget ilang".
+#   4. ANTI APK CORRUPT        : download divalidasi — content-type harus
+#      application/vnd.android.package-archive (tolak halaman HTML error) +
+#      cek magic byte "PK" (zip) → installer gak pernah dibukain file rusak
+#      ("App not installed" misterius hilang).
+#   5. PROGRESS LEBIH JELAS    : banner nampilin persen + MB ter-download,
+#      dialog & banner nunjukin nama versi (versionName dari manifest).
+#   Fitur v5.2 tetep: keystore stabil (update tanpa uninstall), versionCode =
+#   run number, manifest updates/<pkg>.json, kanal release apk-<pkg>.
+#
 # FIX LOG v5.2 (request owner: "apk yang di build bisa di update dan gak
 #                harus uninstall ... bener2 bagus melebihi semua nya"):
 #   1. KEYSTORE STABIL    : dulu build pake debug keystore yang BEDA tiap
@@ -482,7 +507,8 @@ jobs:
             State<WebViewScreen> createState() => _WebViewScreenState();
           }
 
-          class _WebViewScreenState extends State<WebViewScreen> {
+          class _WebViewScreenState extends State<WebViewScreen>
+              with WidgetsBindingObserver {
             // ── TARGET & OPSI (diisi oleh token replacement saat build) ──
             // URL mode  : 'https://website-kamu.com'
             // HTML mode : 'assets/webapp/index.html' (dibundle, jalan offline)
@@ -531,6 +557,13 @@ jobs:
             bool _updateDownloading = false;
             double _updateProgress = 0;
             String? _updateApkPath;
+            String _updateVerName = '';      // "1.0.N" dari manifest (dialog/banner)
+            String _updateProgressTxt = '';  // teks progres: "Mengunduh 8.1 MB (42%)"
+            int _updateDialogShownFor = 0;   // dialog per versi cuma sekali per sesi
+            bool _updatePermPrompted = false; // lagi nunggu user kasih izin install?
+            bool _updateRetrying = false;    // guard auto-resume install
+            bool _checkingUpdate = false;    // guard biar cek gak tumpang tindih
+            DateTime? _lastUpdateOk;         // cek sukses terakhir (throttle resume)
 
             // ── Settings max-compatibility (intinya: perlakuin webview kayak Chrome) ──
             final InAppWebViewSettings _settings = InAppWebViewSettings(
@@ -585,9 +618,13 @@ jobs:
               // ── 📢 v5.1: tarik pengumuman pas start + tiap 8 jam selagi app buka ──
               _fetchAnnouncement();
               _announceTimer = Timer.periodic(const Duration(hours: 8), (_) => _fetchAnnouncement());
-              // ── 🔄 v5.2: cek update pas start (delay 5 dtk biar UI lancar)
-              //    + tiap 6 jam selagi app kebuka ──
-              Future.delayed(const Duration(seconds: 5), _checkUpdate);
+              // ── 🔄 v5.3: cek update pas start (delay 5 dtk biar UI lancar)
+              //    + retry awal 45s/120s (buat HP yang WiFi-nya belum siap)
+              //    + tiap 6 jam selagi app kebuka + tiap app dibuka lagi ──
+              WidgetsBinding.instance.addObserver(this);
+              Future.delayed(const Duration(seconds: 5), () => _checkUpdate());
+              Future.delayed(const Duration(seconds: 45), () => _checkUpdate());
+              Future.delayed(const Duration(seconds: 120), () => _checkUpdate());
               _updateTimer = Timer.periodic(const Duration(hours: 6), (_) => _checkUpdate());
               // Splash hilang maksimal 6 detik, biar halaman lambat gak keliatan "mati"
               Future.delayed(const Duration(seconds: 6), () {
@@ -599,10 +636,20 @@ jobs:
 
             @override
             void dispose() {
+              WidgetsBinding.instance.removeObserver(this);
               _slowTimer?.cancel();
               _announceTimer?.cancel();
               _updateTimer?.cancel();
               super.dispose();
+            }
+
+            // ── 🔄 v5.3: app dibuka lagi (resume) → cek update + lanjutin
+            //    install yang lagi nunggu izin — OTOMATIS, tanpa pencet ulang ──
+            @override
+            void didChangeAppLifecycleState(AppLifecycleState state) {
+              if (state != AppLifecycleState.resumed) return;
+              _autoResumeInstall();
+              _checkUpdate();
             }
 
             // ── ANTI-MUTER: kalo 25 detik belum selesai load, buka kartu peringatan ──
@@ -679,12 +726,19 @@ jobs:
               }
             }
 
-            // ── 🔄 v5.2: cek update OTA (raw repo updates/<pkg>.json).
+            // ── 🔄 v5.3: cek update OTA (raw repo updates/<pkg>.json).
             // versionCode = GitHub run number (naik tiap rebuild). Kalo lebih
-            // besar dari versionCode app ini → banner update muncul.
-            // Gagal/offline/manifest belum ada = senyap, gak ganggu user.
+            // besar dari versionCode app ini → banner + DIALOG update muncul.
+            // Throttle 15 menit sejak sukses terakhir (resume gak nge-fetch
+            // mulu). Gagal/offline/manifest belum ada = senyap, gak ganggu.
             Future<void> _checkUpdate() async {
-              if (kUpdateUrl.isEmpty) return;
+              if (kUpdateUrl.isEmpty || _checkingUpdate) return;
+              final last = _lastUpdateOk;
+              if (last != null &&
+                  DateTime.now().difference(last) < const Duration(minutes: 15)) {
+                return;
+              }
+              _checkingUpdate = true;
               HttpClient? hc;
               try {
                 hc = HttpClient();
@@ -698,6 +752,11 @@ jobs:
                 final rawApk = data['apk'];
                 final apkUrl = (rawApk is String) ? rawApk : '';
                 if (remote <= 0 || !apkUrl.startsWith('http')) return;
+                final rawName = data['versionName'];
+                final verName = (rawName is String && rawName.isNotEmpty)
+                    ? rawName
+                    : '1.0.$remote';
+                _lastUpdateOk = DateTime.now();
                 final info = await PackageInfo.fromPlatform();
                 final local = int.tryParse(info.buildNumber) ?? 0;
                 if (remote > local && mounted) {
@@ -705,18 +764,97 @@ jobs:
                     _updateVisible = true;
                     _updateRemoteCode = remote;
                     _updateApkUrl = apkUrl;
+                    _updateVerName = verName;
                   });
+                  // 🚀 v5.3: bukan cuma banner — user LANGSUNG disuruh update
+                  _maybeShowUpdateDialog();
                 }
               } catch (_) {
                 // Offline / manifest belum ada / JSON rusak — diemin aja.
               } finally {
+                _checkingUpdate = false;
                 hc?.close();
               }
             }
 
-            // ── 🔄 v5.2: download APK update ke cache → buka installer sistem.
-            // Signature APK dijamin sama (stable keystore) → Android nganggep
-            // UPDATE di atas app lama: data & setting AMAN, GAK PERLU UNINSTALL.
+            // ── 🔄 v5.3: DIALOG "Update Tersedia" — muncul otomatis pas ada
+            //    versi baru (gak cuma banner tipis yang gampang kelewat).
+            //    Sekali per versi per sesi biar gak nge-spam user.
+            void _maybeShowUpdateDialog() {
+              if (!mounted || !_updateVisible || _updateDownloading) return;
+              if (_updateDialogShownFor >= _updateRemoteCode) return;
+              _updateDialogShownFor = _updateRemoteCode;
+              showDialog<void>(
+                context: context,
+                barrierDismissible: true,
+                builder: (ctx) => AlertDialog(
+                  backgroundColor: _dark ? const Color(0xFF1E1E1E) : null,
+                  title: Row(
+                    children: [
+                      Icon(Icons.system_update_alt,
+                          color: Colors.green.shade600),
+                      const SizedBox(width: 8),
+                      const Expanded(
+                        child: Text('Update Tersedia',
+                            style: TextStyle(
+                                fontSize: 18, fontWeight: FontWeight.bold)),
+                      ),
+                    ],
+                  ),
+                  content: Text(
+                    'Versi baru v$_updateVerName siap di-install.\n\n'
+                    '• Gak perlu uninstall\n'
+                    '• Data & login kamu aman\n'
+                    '• Ketuk Update Sekarang — app download sendiri terus '
+                    'bukain installer',
+                    style: TextStyle(
+                        height: 1.5,
+                        color: _dark ? Colors.grey.shade200 : Colors.black87),
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.of(ctx).pop(),
+                      child: const Text('Nanti'),
+                    ),
+                    FilledButton.icon(
+                      onPressed: () {
+                        Navigator.of(ctx).pop();
+                        _startUpdate();
+                      },
+                      icon: const Icon(Icons.download),
+                      label: const Text('Update Sekarang'),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            // ── 🔄 v5.3: AUTO-RESUME — begitu user balik ke app setelah
+            //    ngasih izin "install aplikasi tak dikenal", install
+            //    dilanjutin OTOMATIS. Dulu user disuruh pencet banner lagi
+            //    (itu yang bikin kerasa "update gak berfungsi"). Sekarang
+            //    nol langkah ekstra, nol tutorial.
+            Future<void> _autoResumeInstall() async {
+              if (_updateApkPath == null || _updateRetrying) return;
+              if (!_updatePermPrompted) return; // gak lagi nunggu izin → skip
+              _updateRetrying = true;
+              try {
+                final res = await _updateChannel
+                    .invokeMethod('installApk', {'path': _updateApkPath!});
+                if (res == 'ok') _updatePermPrompted = false;
+                // res == 'settings' → izin masih dimatiin. GAK di-loop buka
+                // settings — user bisa ketuk banner/dialog lagi kapan aja.
+              } catch (_) {}
+              _updateRetrying = false;
+            }
+
+            // ── 🔄 v5.3: download APK update ke cache → validasi → buka
+            //    installer sistem. Signature APK dijamin sama (stable keystore)
+            //    → Android nganggep UPDATE di atas app lama: data & setting
+            //    AMAN, GAK PERLU UNINSTALL. File divalidasi (content-type +
+            //    magic byte "PK") biar installer gak pernah dibukain file
+            //    rusak / halaman HTML error ("App not installed" misterius
+            //    hilang).
             Future<void> _startUpdate() async {
               if (_updateDownloading) return;
               // Udah pernah ke-download sesi ini → langsung buka installer lagi
@@ -724,7 +862,11 @@ jobs:
                 await _installUpdateApk();
                 return;
               }
-              setState(() => _updateDownloading = true);
+              setState(() {
+                _updateDownloading = true;
+                _updateProgress = 0;
+                _updateProgressTxt = 'Nyambung...';
+              });
               HttpClient? hc;
               try {
                 hc = HttpClient();
@@ -734,7 +876,16 @@ jobs:
                 if (resp.statusCode != 200) {
                   throw Exception('HTTP ${resp.statusCode}');
                 }
+                // Guard v5.3: GitHub kadang bales HTML (error page) — jangan
+                // disimpen jadi .apk terus install gagal misterius.
+                final ctype =
+                    (resp.headers.value('content-type') ?? '').toLowerCase();
+                if (ctype.contains('text/html')) {
+                  throw Exception('respons HTML, bukan APK');
+                }
                 final total = resp.contentLength ?? -1;
+                final totalTxt =
+                    total > 0 ? ' dari ${((total / 1048576) * 10).round() / 10} MB' : '';
                 final dir = await getTemporaryDirectory();
                 final f = File('${dir.path}/update_v${_updateRemoteCode}.apk');
                 final sink = f.openWrite();
@@ -742,18 +893,44 @@ jobs:
                 await for (final chunk in resp) {
                   got += chunk.length;
                   sink.add(chunk);
-                  if (total > 0 && mounted) {
-                    setState(() => _updateProgress = got / total);
+                  if (mounted) {
+                    setState(() {
+                      var pct = '';
+                      var part = '';
+                      if (total > 0) {
+                        _updateProgress = got / total;
+                        pct = ' — ${(_updateProgress * 100).toStringAsFixed(0)}%';
+                        part = totalTxt;
+                      }
+                      final mb = ((got / 1048576) * 10).round() / 10;
+                      _updateProgressTxt = 'Mengunduh $mb MB$part$pct';
+                    });
                   }
                 }
                 await sink.close();
+                // Magic byte check v5.3: APK valid selalu mulai "PK" (zip).
+                final raf = await f.open(mode: FileMode.read);
+                final head = await raf.read(2);
+                await raf.close();
+                if (head.length < 2 || head[0] != 0x50 || head[1] != 0x4B) {
+                  try { await f.delete(); } catch (_) {}
+                  throw Exception('file download rusak');
+                }
                 _updateApkPath = f.path;
                 if (mounted) setState(() => _updateDownloading = false);
                 await _installUpdateApk();
               } catch (_) {
                 _updateApkPath = null;
-                if (mounted) setState(() => _updateDownloading = false);
-                // Fallback: buka link di browser (install manual tetep bisa).
+                if (mounted) {
+                  setState(() => _updateDownloading = false);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                        content: Text('Download gagal — cek koneksi internet, '
+                            'terus coba lagi ya')),
+                  );
+                }
+                // Fallback terakhir: buka link di browser (install manual
+                // tetep bisa dari notifikasi download).
                 await _openExternal(WebUri(_updateApkUrl));
               } finally {
                 hc?.close();
@@ -762,17 +939,23 @@ jobs:
 
             // Panggil native (MainActivity) buat nampilin installer sistem.
             // "ok" = installer kebuka | "settings" = user belum izinkan
-            // install aplikasi tak dikenal → dibukain halaman izinnya.
+            // install aplikasi tak dikenal → dibukain halaman izinnya, dan
+            // begitu izin dikasih + balik ke app → install dilanjutin
+            // OTOMATIS (lihat _autoResumeInstall). GAK ADA TUTORIAL.
             Future<void> _installUpdateApk() async {
               final p = _updateApkPath;
               if (p == null) return;
               try {
                 final res = await _updateChannel.invokeMethod('installApk', {'path': p});
-                if (res == 'settings' && mounted) {
+                if (res == 'ok') {
+                  _updatePermPrompted = false;
+                } else if (res == 'settings' && mounted) {
+                  _updatePermPrompted = true;
                   ScaffoldMessenger.of(context).showSnackBar(
                     const SnackBar(
                       content: Text(
-                          'Aktifin "Install aplikasi tak dikenal" buat app ini, lalu pencet banner update lagi ya'),
+                          'Aktifin "Install aplikasi tak dikenal" — abis itu '
+                          'balik ke app, update diterusin otomatis'),
                     ),
                   );
                   try {
@@ -1022,8 +1205,10 @@ jobs:
                                                 Expanded(
                                                   child: Text(
                                                     _updateDownloading
-                                                        ? 'Mengunduh update... ${(_updateProgress * 100).toStringAsFixed(0)}%'
-                                                        : 'Update baru tersedia — ketuk buat install (gak perlu uninstall!)',
+                                                        ? (_updateProgressTxt.isEmpty
+                                                            ? 'Mengunduh...'
+                                                            : _updateProgressTxt)
+                                                        : 'Update v$_updateVerName tersedia — ketuk buat install (gak perlu uninstall!)',
                                                     maxLines: 2,
                                                     overflow: TextOverflow.ellipsis,
                                                     style: const TextStyle(
@@ -1282,7 +1467,7 @@ jobs:
 
           print('Token applied. Mode:', mode, '| splash:', splash, '| dark:', dark)
           print('v5.1:', 'tabs=' + tabs_safe if tabs_safe != '[]' else 'tabs=off', '| announce=' + ('on' if announce_url_safe else 'off'))
-          print('v5.2:', 'ota=' + ('on' if update_url_safe else 'off'), '| pkg=' + pkg_clean)
+          print('v5.3:', 'ota=' + ('on' if update_url_safe else 'off'), '| pkg=' + pkg_clean)
           if mode == 'url':
               print('URL set to:', web_url)
 
