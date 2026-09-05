@@ -1,0 +1,349 @@
+name: Build APK Kotlin Native
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  DZR CloudBuilder — Mode build #2: Android NATIVE (Kotlin/Java + Gradle)
+#  100% TERPISAH dari build.yml (Flutter):
+#   • GAK ADA Flutter SDK — gak di-install, gak dipanggil, gak di-emulate
+#   • APK dibangun murni ./gradlew assembleRelease (atau gradle fallback)
+#   • Signing stable per-user DISALIN dari build.yml (keystores/u<id>.jks +
+#     keytool generate + commit ke repo + zipalign + apksigner) — Android-
+#     generic, identik hasilnya dengan jalur Flutter.
+#   • Bot (index.js) yang deliver APK — workflow CUMA upload artifact
+#     (anti APK dobel, konsisten dgn build.yml).
+# ═══════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: 'URL ZIP project Android native (Kotlin/Java)'
+        required: true
+      tag:
+        description: 'Build tag'
+        required: true
+      build_type:
+        description: 'Build Type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      build_format:
+        description: 'Output format'
+        required: false
+        default: 'apk'
+        type: choice
+        options:
+          - apk
+          - aab
+          - both
+      app_name:
+        description: 'App Name'
+        required: false
+        default: 'MyApp'
+      icon_url:
+        description: 'Icon URL'
+        required: false
+        default: ''
+      chat_id:
+        description: 'Telegram Chat ID'
+        required: false
+        default: ''
+      bot_token:
+        description: 'Telegram Bot Token'
+        required: false
+        default: ''
+      keystore_id:
+        description: 'v6.2 ID keystore per user (mis. 12345 → keystores/u12345.jks). Kosong = keystore global.'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Native Gradle build umumnya lebih cepet dari Flutter, tapi project
+    # gede + download dependencies pertama kali bisa lama — samain 18 menit
+    # biar sinkron sama BUILD_TIMEOUT_MS bot.
+    timeout-minutes: 18
+    permissions:
+      contents: write
+      actions: write
+    env:
+      LC_ALL: C.UTF-8
+      LANG: C.UTF-8
+      INPUT_APP_NAME: ${{ inputs.app_name }}
+      INPUT_ZIP_URL: ${{ inputs.zip_url }}
+      INPUT_CHAT_ID: ${{ inputs.chat_id }}
+      INPUT_BOT_TOKEN: ${{ inputs.bot_token }}
+      INPUT_TAG: ${{ inputs.tag }}
+      INPUT_ICON_URL: ${{ inputs.icon_url }}
+      INPUT_BUILD_TYPE: ${{ inputs.build_type }}
+      INPUT_BUILD_FORMAT: ${{ inputs.build_format }}
+      INPUT_KEYSTORE_ID: ${{ inputs.keystore_id }}
+
+    steps:
+      # ── ⚠️ SESUAI PROMPT: GAK ADA step install Flutter di workflow ini ──
+      # Android SDK + build-tools (zipalign/apksigner) udah pre-installed di
+      # ubuntu-latest (ANDROID_HOME). JDK 17 buat Gradle.
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # ── ⚡ Rolling cache (pola sama dgn build.yml): key per run_id + prefix
+      # restore → cache selalu ke-update, dependency gradle makin cepet. ──
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gkotlin-v1-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            gkotlin-v1-${{ runner.os }}-
+
+      - name: Download + Extract + Locate Project
+        run: |
+          # ── Download (identik dgn build.yml) ──
+          HTTP_CODE=$(curl -sL -w "%{http_code}" -o project.zip \
+            --retry 3 --retry-delay 2 --retry-connrefused \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "$INPUT_ZIP_URL")
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "ERROR: Download failed! HTTP $HTTP_CODE"
+            exit 1
+          fi
+          MAGIC=$(od -A n -t x1 -N 4 project.zip 2>/dev/null | tr -d ' ')
+          if ! echo "$MAGIC" | grep -qi "^504b"; then
+            echo "ERROR: Not a valid ZIP file!"
+            exit 1
+          fi
+          echo "ZIP: $(du -sh project.zip | cut -f1)"
+
+          # ── Extract ──
+          mkdir -p project
+          if ! unzip -q project.zip -d project; then
+            echo "ERROR: Extraction failed!"
+            exit 1
+          fi
+
+          # ── Cari project dir: settings.gradle(.kts) / build.gradle(.kts) ──
+          # (padanan PROJECT_DIR dgn pubspec.yaml di build.yml — cari root
+          # dulu, terus maxdepth 3 buat ZIP yang di-bungkus folder)
+          PROJECT_DIR=""
+          if [ -f "project/settings.gradle" ] || [ -f "project/settings.gradle.kts" ] \
+             || [ -f "project/build.gradle" ] || [ -f "project/build.gradle.kts" ]; then
+            PROJECT_DIR="project"
+          else
+            INNER=$(find project -maxdepth 3 \( -name "settings.gradle" -o -name "settings.gradle.kts" -o -name "build.gradle" -o -name "build.gradle.kts" \) | head -1)
+            if [ -n "$INNER" ]; then
+              PROJECT_DIR=$(dirname "$INNER")
+            fi
+          fi
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: No settings.gradle / build.gradle found (bukan project Android native?)"
+            ls -R project | head -40
+            exit 1
+          fi
+          echo "Project: $PROJECT_DIR"
+          rsync -a --remove-source-files "$PROJECT_DIR/" . 2>/dev/null || {
+            cp -r "$PROJECT_DIR"/* . 2>/dev/null || true
+            cp -r "$PROJECT_DIR"/.* . 2>/dev/null || true
+          }
+          if [ ! -f "settings.gradle" ] && [ ! -f "settings.gradle.kts" ] \
+             && [ ! -f "build.gradle" ] && [ ! -f "build.gradle.kts" ]; then
+            echo "ERROR: Gradle files missing setelah extract!"
+            exit 1
+          fi
+          rm -rf project project.zip
+
+          # ── gradlew: exec permission + fallback tanpa wrapper ──
+          if [ -f "gradlew" ]; then
+            chmod +x gradlew
+            echo "GRADLE_CMD=./gradlew" >> "$GITHUB_ENV"
+          elif command -v gradle >/dev/null 2>&1; then
+            echo "⚠️ gradlew gak ada di ZIP → pake system gradle ($(gradle --version 2>/dev/null | grep Gradle | head -1))"
+            echo "GRADLE_CMD=gradle" >> "$GITHUB_ENV"
+          else
+            echo "ERROR: Project gak bawa gradlew DAN system gradle gak ada."
+            exit 1
+          fi
+
+          # ── Sanity: minimal ada module app/ (build.gradle di root doang gak cukup) ──
+          if [ ! -f "app/build.gradle" ] && [ ! -f "app/build.gradle.kts" ]; then
+            MODULE_G=$(find . -maxdepth 2 \( -name "build.gradle" -o -name "build.gradle.kts" \) -not -path "./build.gradle*" | head -1)
+            if [ -n "$MODULE_G" ]; then
+              echo "ℹ️ Module app bukan 'app/' — ketemu: $MODULE_G (biarin, gradle yang atur)"
+            else
+              echo "WARNING: gak nemu module-level build.gradle — build mungkin gagal (project multi-module gak standar?)"
+            fi
+          fi
+
+      # ── 🔨 Build + retry sederhana (max 3x) ──
+      # Gak ada auto-fix Dart/pub — project Gradle native jauh lebih simpel.
+      # --stacktrace biar error keliatan jelas di log buat autodiag bot.
+      - name: Build APK (Gradle assemble)
+        if: inputs.build_format == 'apk' || inputs.build_format == 'both'
+        run: |
+          TYPE=$(echo "$INPUT_BUILD_TYPE" | tr 'a-z' 'A-Z' | head -c 1)$(echo "$INPUT_BUILD_TYPE" | cut -c2-)
+          BUILD_OK=false
+          ATTEMPT=0
+          while [ "$ATTEMPT" -lt 3 ]; do
+            ATTEMPT=$((ATTEMPT+1))
+            echo "🔨 ${GRADLE_CMD} assemble${TYPE} — percobaan $ATTEMPT/3"
+            if ${GRADLE_CMD} "assemble${TYPE}" --no-daemon --stacktrace 2>&1 | tee build_output.txt; then
+              BUILD_OK=true
+              break
+            fi
+            echo "⚠️ build gagal (percobaan $ATTEMPT/3) — retry..."
+            sleep 5
+          done
+          if [ "$BUILD_OK" != "true" ]; then
+            echo "=== BUILD FAILED ==="
+            tail -50 build_output.txt
+            exit 1
+          fi
+          # Kumpulin hasil APK ke folder stabil (path output native gradle bisa
+          # beda-beda antar project — jangan nebak-nebak di step signing/upload)
+          mkdir -p apk_out
+          find . \( -path "*/build/outputs/apk/*" -o -path "*/build/intermediates/*" \) -name "*.apk" -not -path "*intermediates*" -exec cp -f {} apk_out/ \; 2>/dev/null || true
+          if [ -z "$(ls -A apk_out 2>/dev/null)" ]; then
+            echo "ERROR: Gak ada APK hasil build!"
+            find . -name "*.apk" | head -10
+            exit 1
+          fi
+          echo "APK terkumpul:"; ls -lh apk_out/
+
+      - name: Build AAB (Gradle bundle)
+        if: inputs.build_format == 'aab' || inputs.build_format == 'both'
+        run: |
+          TYPE=$(echo "$INPUT_BUILD_TYPE" | tr 'a-z' 'A-Z' | head -c 1)$(echo "$INPUT_BUILD_TYPE" | cut -c2-)
+          BUILD_OK=false
+          ATTEMPT=0
+          while [ "$ATTEMPT" -lt 3 ]; do
+            ATTEMPT=$((ATTEMPT+1))
+            echo "🔨 ${GRADLE_CMD} bundle${TYPE} — percobaan $ATTEMPT/3"
+            if ${GRADLE_CMD} "bundle${TYPE}" --no-daemon --stacktrace 2>&1 | tee build_output_aab.txt; then
+              BUILD_OK=true
+              break
+            fi
+            echo "⚠️ build AAB gagal (percobaan $ATTEMPT/3) — retry..."
+            sleep 5
+          done
+          if [ "$BUILD_OK" != "true" ]; then
+            echo "=== AAB BUILD FAILED ==="
+            tail -50 build_output_aab.txt
+            exit 1
+          fi
+          mkdir -p aab_out
+          find . -path "*/build/outputs/bundle/*" -name "*.aab" -exec cp -f {} aab_out/ \; 2>/dev/null || true
+          if [ -z "$(ls -A aab_out 2>/dev/null)" ]; then
+            echo "ERROR: Gak ada AAB hasil build!"
+            exit 1
+          fi
+          echo "AAB terkumpul:"; ls -lh aab_out/
+
+      # ─── 🔐 v6.2: STABLE SIGNING per user — DISALIN IDENTIK dari build.yml ────
+      # Keystore per user (keystores/u<id>.jks) di repo → fetch via API →
+      # gak ada / gak valid → keytool generate + commit → race guard fallback.
+      # Sign: zipalign -p 4 + apksigner (build-tools terbaru di ANDROID_HOME).
+      # MURNI Android-generic — gak ada sangkut paut Flutter.
+      - name: Stable signing (Kotlin native)
+        if: inputs.build_format == 'apk' || inputs.build_format == 'both'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          KS_PASS: dzr-stable-2026
+        run: |
+          APK=$(ls -t apk_out/*.apk 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            echo "WARNING: APK gak ketemu buat re-sign (skip, non-fatal)"
+            exit 0
+          fi
+
+          REPO_API="https://api.github.com/repos/${GH_REPO}"
+          AUTHH="Authorization: Bearer ${GH_TOKEN}"
+          APPH="Accept: application/vnd.github+json"
+
+          # ── path keystore per user (sanitasi ketat: cuma alfanumerik) ──
+          KID=$(printf '%s' "${INPUT_KEYSTORE_ID:-}" | tr -cd 'a-zA-Z0-9')
+          if [ -n "$KID" ]; then
+            KS_PATH="keystores/u${KID}.jks"
+            echo "🔐 Keystore PER-USER: $KS_PATH"
+          else
+            KS_PATH="signing/dzr-release.jks"
+            echo "🔐 Keystore GLOBAL (keystore_id kosong): $KS_PATH"
+          fi
+          KS=/tmp/keystore.jks
+
+          fetch_ks() {
+            local HTTP
+            HTTP=$(curl -sL -w "%{http_code}" -H "$AUTHH" -H "$APPH" \
+              -o /tmp/ks_meta.json "${REPO_API}/contents/${KS_PATH}?ref=main")
+            if [ "$HTTP" = "200" ]; then
+              python3 -c "import json,base64;open('/tmp/keystore.fromrepo','wb').write(base64.b64decode(json.load(open('/tmp/ks_meta.json'))['content']))" 2>/dev/null \
+                && mv /tmp/keystore.fromrepo "$KS"
+            fi
+            echo "$HTTP"
+          }
+
+          KS_OK=false
+          [ -s "$KS" ] || fetch_ks > /dev/null
+          if [ -s "$KS" ] && keytool -list -keystore "$KS" -storepass "$KS_PASS" -alias dzr >/dev/null 2>&1; then
+            KS_OK=true
+            echo "Keystore stabil: DIPAKE dari repo ($KS_PATH)"
+          fi
+          if [ "$KS_OK" = false ]; then
+            echo "Keystore belum ada / gak valid — generate BARU ($KS_PATH)..."
+            rm -f "$KS"
+            keytool -genkeypair -v -keystore "$KS" -alias dzr -keyalg RSA -keysize 2048 \
+              -validity 10950 -storepass "$KS_PASS" -keypass "$KS_PASS" \
+              -dname "CN=DZR CloudBuilder, OU=Deruzuan, O=DZR, L=Jakarta, C=ID" >/dev/null 2>&1
+            PAYLOAD=$(python3 -c "import base64,json;print(json.dumps({'message':'chore: stable signing keystore ($KS_PATH)','content':base64.b64encode(open('/tmp/keystore.jks','rb').read()).decode(),'branch':'main'}))")
+            PUT_HTTP=$(curl -sL -o /tmp/ks_put.json -w "%{http_code}" -X PUT \
+              -H "$AUTHH" -H "$APPH" -d "$PAYLOAD" "${REPO_API}/contents/${KS_PATH}")
+            if [ "$PUT_HTTP" != "200" ] && [ "$PUT_HTTP" != "201" ]; then
+              echo "Commit keystore gagal (HTTP $PUT_HTTP) — race guard: pake yang di repo..."
+              fetch_ks > /dev/null || true
+            fi
+          fi
+
+          if [ -s "$KS" ] && ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* >/dev/null 2>&1; then
+            BT=$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* | sort -V | tail -1)
+            if [ -x "$BT/zipalign" ] && [ -x "$BT/apksigner" ]; then
+              cp "$APK" /tmp/pre_sign.apk
+              "$BT/zipalign" -f -p 4 /tmp/pre_sign.apk /tmp/aligned.apk
+              "$BT/apksigner" sign --ks "$KS" --ks-key-alias dzr \
+                --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \
+                --out "$APK" /tmp/aligned.apk
+              "$BT/apksigner" verify "$APK" \
+                && echo "✅ APK Kotlin ke-sign keystore stabil (jalur native)" \
+                || echo "WARNING: verify gagal (non-fatal, APK tetep ke-upload)"
+            else
+              echo "WARNING: zipalign/apksigner gak ada (skip re-sign)"
+            fi
+          else
+            echo "WARNING: keystore/build-tools gak siap (skip re-sign, non-fatal)"
+          fi
+
+      - name: Upload APK
+        if: inputs.build_format == 'apk' || inputs.build_format == 'both'
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-output
+          path: apk_out/*.apk
+          retention-days: 7
+
+      - name: Upload AAB
+        if: inputs.build_format == 'aab' || inputs.build_format == 'both'
+        uses: actions/upload-artifact@v4
+        with:
+          name: aab-output
+          path: aab_out/*.aab
+          retention-days: 7
+
+      # NOTE: GAK ADA step "Send to Telegram" — bot (index.js) yang handle
+      # kirim APK ke user + semua notifikasi error (konsisten dgn build.yml,
+      # anti dobel kirim).
