@@ -42,6 +42,10 @@ on:
         description: 'Telegram Bot Token'
         required: false
         default: ''
+      keystore_id:
+        description: 'v6.2 ID keystore per user (mis. 12345 → keystores/u12345.jks). Kosong = keystore global.'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -63,6 +67,7 @@ jobs:
       INPUT_ICON_URL: ${{ inputs.icon_url }}
       INPUT_BUILD_TYPE: ${{ inputs.build_type }}
       INPUT_BUILD_FORMAT: ${{ inputs.build_format }}
+      INPUT_KEYSTORE_ID: ${{ inputs.keystore_id }}
 
     steps:
       - name: Setup JDK
@@ -81,6 +86,17 @@ jobs:
           channel: 'stable'
           cache: true
 
+      # ── ⚡ v6.2: ROLLING CACHE — fix cache beku ──
+      # Dulu key = hashFiles(pubspec.yaml, ...) — TAPI step ini jalan SEBELUM
+      # project di-download/extract, jadi file-nya GAK ADA → hash selalu
+      # kosong → key konstan "gpub-" → build pertama nyimpen cache, build
+      # berikutnya exact-match key yang sama → actions/cache GAK PERNAH
+      # nyimpen ulang → cache beku di isi build pertama selamanya.
+      # Sekarang: key rolling (per run_id) + restore prefix runner — tiap
+      # run restore cache TERBARU, abis run nyimpen versi barunya. Dep baru
+      # yang ke-download tetap ke-cache, build berikutnya makin cepat.
+      # Catatan: .dart_tool pre-created dulu bikin bootstrap-check palsu —
+      # udah di-guard di step Download (v5.6b), gak masalah.
       - name: Cache Gradle + Pub
         uses: actions/cache@v4
         with:
@@ -89,9 +105,9 @@ jobs:
             ~/.gradle/wrapper
             ~/.pub-cache
             .dart_tool
-          key: gpub-${{ hashFiles('pubspec.yaml', 'pubspec.lock', 'android/**/build.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          key: gpub-v2-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
-            gpub-
+            gpub-v2-${{ runner.os }}-
 
       - name: Download + Extract + Deps + Patch
         run: |
@@ -910,6 +926,16 @@ jobs:
           if [ -f "$MANIFEST" ] && [ -n "$SAFE_APP_NAME" ] && [ "$SAFE_APP_NAME" != "MyApp" ]; then
             sed -i "s|android:label=\"[^\"]*\"|android:label=\"$SAFE_APP_NAME\"|g" "$MANIFEST"
           fi
+          # ── 🔐 v6.1: izin INTERNET buat project bootstrap ──
+          # Template `flutter create` GAK naro uses-permission INTERNET di
+          # main manifest (cuma di debug/profile) → APK release dari project
+          # yang gak bawa android/ jalan TANPA izin internet → WebView blank
+          # + fetch API/font gagal semua (kasus run #60: arshi layar item).
+          # web2apk.yml udah lama inject; jalur ZIP project kelewat.
+          if [ -f "$MANIFEST" ] && ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
+            sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />\n    <application|' "$MANIFEST"
+            echo "🔐 [v6.1] Izin INTERNET + NETWORK_STATE + WIFI_STATE di-inject ke manifest"
+          fi
           # ── ⚙️ v4.8 AGP9 safety net: patch plugin pub-cache lama yang masih
           # pake proguard-android.txt (di-blok AGP 9+). Non-fatal. (APK step)
           find "$HOME/.pub-cache/hosted" -name "build.gradle" -path "*android*" \
@@ -981,12 +1007,18 @@ jobs:
           fi
           echo "APK: $APK_PATH ($(du -sh "$APK_PATH" | cut -f1))"
 
-      # ─── 🔐 v5.9: STABLE SIGNING jalur ZIP project ────
-      # Sama kayak web2apk.yml: keystore release di repo (signing/dzr-release.jks)
-      # → signature build ZIP project juga TETAP antar build → project Flutter
-      # yang di-rebuild bisa update-over-install (tanpa uninstall).
-      # Catatan: OTA banner in-app CUMA buat app hasil Web2APK — project ZIP
-      # punya MainActivity sendiri, jadi yang berubah di sini signature doang.
+      # ─── 🔐 v5.9 → v6.2: STABLE SIGNING jalur ZIP project (PER USER) ────
+      # v5.9 dulu: SATU keystore global (signing/dzr-release.jks) buat SEMUA
+      # user → signature stabil antar build, TAPI semua app semua user share
+      # kunci yang sama.
+      # v6.2 sekarang: tiap user punya keystore SENDIRI (keystores/u<id>.jks)
+      # → rebuild app yang sama = signature SAMA (update-over-install jalan
+      # terus), dan app user A gak share kunci sama user B.
+      # Fallback aman: keystore_id kosong (dispatch manual lama) = keystore
+      # global seperti v5.9 — 100% backward compatible.
+      # Mekanisme sama dengan dulu: keystore gak ada → keytool generate →
+      # commit ke repo (permissions.contents=write) → race guard: kalo
+      # commit gagal, pake yang udah ada di repo.
       - name: Stable signing (ZIP project)
         if: inputs.build_format == 'apk' || inputs.build_format == 'both'
         env:
@@ -1003,15 +1035,25 @@ jobs:
           REPO_API="https://api.github.com/repos/${GH_REPO}"
           AUTHH="Authorization: Bearer ${GH_TOKEN}"
           APPH="Accept: application/vnd.github+json"
-          KS=/tmp/dzr-release.jks
+
+          # ── v6.2: path keystore per user (sanitasi ketat: cuma alfanumerik) ──
+          KID=$(printf '%s' "${INPUT_KEYSTORE_ID:-}" | tr -cd 'a-zA-Z0-9')
+          if [ -n "$KID" ]; then
+            KS_PATH="keystores/u${KID}.jks"
+            echo "🔐 Keystore PER-USER: $KS_PATH"
+          else
+            KS_PATH="signing/dzr-release.jks"
+            echo "🔐 Keystore GLOBAL (keystore_id kosong): $KS_PATH"
+          fi
+          KS=/tmp/keystore.jks
 
           fetch_ks() {
             local HTTP
             HTTP=$(curl -sL -w "%{http_code}" -H "$AUTHH" -H "$APPH" \
-              -o /tmp/ks_meta.json "${REPO_API}/contents/signing/dzr-release.jks?ref=main")
+              -o /tmp/ks_meta.json "${REPO_API}/contents/${KS_PATH}?ref=main")
             if [ "$HTTP" = "200" ]; then
-              python3 -c "import json,base64;open('/tmp/dzr-release.jks.fromrepo','wb').write(base64.b64decode(json.load(open('/tmp/ks_meta.json'))['content']))" 2>/dev/null \
-                && mv /tmp/dzr-release.jks.fromrepo "$KS"
+              python3 -c "import json,base64;open('/tmp/keystore.fromrepo','wb').write(base64.b64decode(json.load(open('/tmp/ks_meta.json'))['content']))" 2>/dev/null \
+                && mv /tmp/keystore.fromrepo "$KS"
             fi
             echo "$HTTP"
           }
@@ -1020,17 +1062,17 @@ jobs:
           [ -s "$KS" ] || fetch_ks > /dev/null
           if [ -s "$KS" ] && keytool -list -keystore "$KS" -storepass "$KS_PASS" -alias dzr >/dev/null 2>&1; then
             KS_OK=true
-            echo "Keystore stabil: DIPAKE dari repo"
+            echo "Keystore stabil: DIPAKE dari repo ($KS_PATH)"
           fi
           if [ "$KS_OK" = false ]; then
-            echo "Keystore belum ada / gak valid — generate BARU..."
+            echo "Keystore belum ada / gak valid — generate BARU ($KS_PATH)..."
             rm -f "$KS"
             keytool -genkeypair -v -keystore "$KS" -alias dzr -keyalg RSA -keysize 2048 \
               -validity 10950 -storepass "$KS_PASS" -keypass "$KS_PASS" \
               -dname "CN=DZR CloudBuilder, OU=Deruzuan, O=DZR, L=Jakarta, C=ID" >/dev/null 2>&1
-            PAYLOAD=$(python3 -c "import base64,json;print(json.dumps({'message':'chore: stable signing keystore (auto-generate)','content':base64.b64encode(open('/tmp/dzr-release.jks','rb').read()).decode(),'branch':'main'}))")
+            PAYLOAD=$(python3 -c "import base64,json;print(json.dumps({'message':'chore: stable signing keystore ($KS_PATH)','content':base64.b64encode(open('/tmp/keystore.jks','rb').read()).decode(),'branch':'main'}))")
             PUT_HTTP=$(curl -sL -o /tmp/ks_put.json -w "%{http_code}" -X PUT \
-              -H "$AUTHH" -H "$APPH" -d "$PAYLOAD" "${REPO_API}/contents/signing/dzr-release.jks")
+              -H "$AUTHH" -H "$APPH" -d "$PAYLOAD" "${REPO_API}/contents/${KS_PATH}")
             if [ "$PUT_HTTP" != "200" ] && [ "$PUT_HTTP" != "201" ]; then
               echo "Commit keystore gagal (HTTP $PUT_HTTP) — race guard: pake yang di repo..."
               fetch_ks > /dev/null || true
@@ -1075,6 +1117,16 @@ jobs:
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           if [ -f "$MANIFEST" ] && [ -n "$SAFE_APP_NAME" ] && [ "$SAFE_APP_NAME" != "MyApp" ]; then
             sed -i "s|android:label=\"[^\"]*\"|android:label=\"$SAFE_APP_NAME\"|g" "$MANIFEST"
+          fi
+          # ── 🔐 v6.1: izin INTERNET buat project bootstrap ──
+          # Template `flutter create` GAK naro uses-permission INTERNET di
+          # main manifest (cuma di debug/profile) → APK release dari project
+          # yang gak bawa android/ jalan TANPA izin internet → WebView blank
+          # + fetch API/font gagal semua (kasus run #60: arshi layar item).
+          # web2apk.yml udah lama inject; jalur ZIP project kelewat.
+          if [ -f "$MANIFEST" ] && ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
+            sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />\n    <application|' "$MANIFEST"
+            echo "🔐 [v6.1] Izin INTERNET + NETWORK_STATE + WIFI_STATE di-inject ke manifest"
           fi
           # ── ⚙️ v4.8 AGP9 safety net (AAB step) — sama kayak step APK.
           find "$HOME/.pub-cache/hosted" -name "build.gradle" -path "*android*" \
