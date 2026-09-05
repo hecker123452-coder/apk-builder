@@ -1,8 +1,30 @@
 name: Web2APK
 
 # ============================================================================
-# DZR CloudBuilder — Web2APK Workflow v5.1 (OTA DICABUT → PENGUMUMAN GLOBAL)
+# DZR CloudBuilder — Web2APK Workflow v5.2 (🔄 OTA BALIK LAGI: UPDATE TANPA UNINSTALL)
 # ============================================================================
+# FIX LOG v5.2 (request owner: "apk yang di build bisa di update dan gak
+#                harus uninstall ... bener2 bagus melebihi semua nya"):
+#   1. KEYSTORE STABIL    : dulu build pake debug keystore yang BEDA tiap
+#      runner → signature beda tiap build → Android PAKSA uninstall dulu
+#      sebelum install APK baru. Sekarang: keystore release disimpan di
+#      repo (signing/dzr-release.jks) — build pertama bikin + commit,
+#      build berikutnya pake yang sama → signature SELALU identik.
+#      APK di-re-sign pakai apksigner (zipalign dulu) setelah build.
+#   2. VERSIONCODE NAIK   : --build-number=$GITHUB_RUN_NUMBER → versionCode
+#      = run number (naik terus tiap build). Dulu selalu 1 → Android anggap
+#      "sama aja"/downgrade. Sekarang update-over-install jalan mulus.
+#   3. OTA IN-APP UPDATE  : app hasil build nge-fetch updates/<pkg>.json
+#      (raw repo) pas start + tiap 6 jam. Kalo versionCode repo > punya
+#      app → banner hijau "Update tersedia" → ketuk → download + install
+#      langsung dari dalam app (REQUEST_INSTALL_PACKAGES + FileProvider +
+#      MethodChannel installApk di MainActivity). GAK PERLU UNINSTALL.
+#      Kanal APK-nya: release `apk-<pkg>` asset `app.apk` (di-upload
+#      workflow ini tiap build, rolling/overwrite).
+#   4. SISANYA SAMA       : pengumuman global (v5.1), situs offline ZIP +
+#      multi-tab (v5.0), splash/dark/small_apk (v4.6-4.8), engine
+#      flutter_inappwebview 6.1.5 + Flutter 3.47.2 + AGP9 safety net.
+#
 # FIX LOG v5.1 (request owner: "malas 2 nya lu gantiin aja" — OTA ditukar):
 #   1. OTA IN-APP UPDATE DICABUT  : input update_url & version_code dihapus,
 #      Dart _checkUpdate + banner update + manifest per-app (updates/<pkg>.json)
@@ -146,6 +168,11 @@ jobs:
           channel: 'stable'
           cache: true
 
+      # ── ⚡ v6.2: ROLLING CACHE — fix cache beku (sama kayak build.yml) ──
+      # Dulu key = hashFiles(**/gradle-wrapper.properties, **/pubspec.yaml)
+      # jalan SEBELUM project siap → hash kosong → key konstan "w2a-" →
+      # exact-match terus → cache GAK PERNAH ke-update. Sekarang rolling
+      # per run_id + restore prefix: tiap run restore cache terbaru.
       - name: Cache Gradle + Pub
         uses: actions/cache@v4
         with:
@@ -154,9 +181,9 @@ jobs:
             ~/.gradle/wrapper
             ~/.pub-cache
             .dart_tool
-          key: w2a-${{ hashFiles('**/gradle-wrapper.properties', '**/pubspec.yaml') }}
+          key: w2a-v2-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
-            w2a-
+            w2a-v2-${{ runner.os }}-
 
       - name: Install ImageMagick
         run: sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick
@@ -263,7 +290,12 @@ jobs:
           cd "$PROJ_NAME"
           # Versi di-PIN persis biar build CI deterministik (udah divalidasi
           # pake flutter analyze 3.47.2 — 0 issue).
-          flutter pub add flutter_inappwebview:6.1.5 url_launcher:6.3.2
+          # ── v5.2: + package_info_plus (baca versionCode sendiri) &
+          #    path_provider (folder cache buat download APK update) ──
+          # ^8 / ^2.1 = pin MAJOR doang (solver pilih minor yg kompatibel) —
+          # API-nya stabil lintas minor: PackageInfo.fromPlatform &
+          # getTemporaryDirectory gak pernah berubah.
+          flutter pub add flutter_inappwebview:6.1.5 url_launcher:6.3.2 'package_info_plus:^8.0.0' 'path_provider:^2.1.0'
 
           # ── HTML mode: siapin assets + daftarin ke pubspec ──
           # v5.0: ZIP situs offline = copy SELURUH isi site (css/js/img),
@@ -393,8 +425,11 @@ jobs:
           import 'dart:io';
 
           import 'package:flutter/material.dart';
-          import 'package:flutter/services.dart' show SystemNavigator;
+          // v5.2: MethodChannel = jalur ke native buat install APK (OTA update)
+          import 'package:flutter/services.dart' show SystemNavigator, MethodChannel;
           import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+          import 'package:package_info_plus/package_info_plus.dart';
+          import 'package:path_provider/path_provider.dart';
           import 'package:url_launcher/url_launcher.dart';
 
           void main() {
@@ -411,6 +446,16 @@ jobs:
           // kTabsJson : JSON [{label,url}] (max 3) — '[]' = 1 tab (tanpa nav bawah)
           const String kAnnounceUrl = '__ANNOUNCE_URL__';
           const String kTabsJson = '__TABS_JSON__';
+
+          // ── 🔄 v5.2: OTA UPDATE TANPA UNINSTALL ──
+          // kUpdateUrl = raw URL updates/<pkg>.json di repo ('' = fitur off).
+          // Isi manifest (ditulis bot tiap build sukses):
+          //   {"versionCode": <run number naik terus>, "versionName": "1.0.N",
+          //    "apk": "<url release apk-<pkg>/app.apk>", "notes": "..."}
+          // App bandingin versionCode → banner update → download → install
+          // in-app. Signature dijaga sama (stable keystore di workflow) →
+          // Android nganggep update, data aman, GAK PERLU UNINSTALL.
+          const String kUpdateUrl = '__UPDATE_URL__';
 
           class WebViewApp extends StatelessWidget {
             const WebViewApp({super.key});
@@ -476,6 +521,17 @@ jobs:
             String _announceMsg = '';
             String _announceLink = '';
 
+            // ── 🔄 v5.2: OTA update state ──
+            static const MethodChannel _updateChannel =
+                MethodChannel('dzr.cloudbuilder/update');
+            Timer? _updateTimer;
+            bool _updateVisible = false;
+            int _updateRemoteCode = 0;
+            String _updateApkUrl = '';
+            bool _updateDownloading = false;
+            double _updateProgress = 0;
+            String? _updateApkPath;
+
             // ── Settings max-compatibility (intinya: perlakuin webview kayak Chrome) ──
             final InAppWebViewSettings _settings = InAppWebViewSettings(
               javaScriptEnabled: true,
@@ -529,6 +585,10 @@ jobs:
               // ── 📢 v5.1: tarik pengumuman pas start + tiap 8 jam selagi app buka ──
               _fetchAnnouncement();
               _announceTimer = Timer.periodic(const Duration(hours: 8), (_) => _fetchAnnouncement());
+              // ── 🔄 v5.2: cek update pas start (delay 5 dtk biar UI lancar)
+              //    + tiap 6 jam selagi app kebuka ──
+              Future.delayed(const Duration(seconds: 5), _checkUpdate);
+              _updateTimer = Timer.periodic(const Duration(hours: 6), (_) => _checkUpdate());
               // Splash hilang maksimal 6 detik, biar halaman lambat gak keliatan "mati"
               Future.delayed(const Duration(seconds: 6), () {
                 if (mounted && _showSplash) {
@@ -541,6 +601,7 @@ jobs:
             void dispose() {
               _slowTimer?.cancel();
               _announceTimer?.cancel();
+              _updateTimer?.cancel();
               super.dispose();
             }
 
@@ -615,6 +676,112 @@ jobs:
                 // Offline / file belum ada / JSON rusak — diemin aja.
               } finally {
                 hc?.close();
+              }
+            }
+
+            // ── 🔄 v5.2: cek update OTA (raw repo updates/<pkg>.json).
+            // versionCode = GitHub run number (naik tiap rebuild). Kalo lebih
+            // besar dari versionCode app ini → banner update muncul.
+            // Gagal/offline/manifest belum ada = senyap, gak ganggu user.
+            Future<void> _checkUpdate() async {
+              if (kUpdateUrl.isEmpty) return;
+              HttpClient? hc;
+              try {
+                hc = HttpClient();
+                hc.connectionTimeout = const Duration(seconds: 10);
+                final req = await hc.getUrl(Uri.parse(kUpdateUrl));
+                final resp = await req.close();
+                if (resp.statusCode != 200) return;
+                final body = await resp.transform(utf8.decoder).join();
+                final data = jsonDecode(body);
+                final remote = int.tryParse("${data['versionCode'] ?? ''}") ?? 0;
+                final rawApk = data['apk'];
+                final apkUrl = (rawApk is String) ? rawApk : '';
+                if (remote <= 0 || !apkUrl.startsWith('http')) return;
+                final info = await PackageInfo.fromPlatform();
+                final local = int.tryParse(info.buildNumber) ?? 0;
+                if (remote > local && mounted) {
+                  setState(() {
+                    _updateVisible = true;
+                    _updateRemoteCode = remote;
+                    _updateApkUrl = apkUrl;
+                  });
+                }
+              } catch (_) {
+                // Offline / manifest belum ada / JSON rusak — diemin aja.
+              } finally {
+                hc?.close();
+              }
+            }
+
+            // ── 🔄 v5.2: download APK update ke cache → buka installer sistem.
+            // Signature APK dijamin sama (stable keystore) → Android nganggep
+            // UPDATE di atas app lama: data & setting AMAN, GAK PERLU UNINSTALL.
+            Future<void> _startUpdate() async {
+              if (_updateDownloading) return;
+              // Udah pernah ke-download sesi ini → langsung buka installer lagi
+              if (_updateApkPath != null) {
+                await _installUpdateApk();
+                return;
+              }
+              setState(() => _updateDownloading = true);
+              HttpClient? hc;
+              try {
+                hc = HttpClient();
+                hc.connectionTimeout = const Duration(seconds: 15);
+                final req = await hc.getUrl(Uri.parse(_updateApkUrl));
+                final resp = await req.close();
+                if (resp.statusCode != 200) {
+                  throw Exception('HTTP ${resp.statusCode}');
+                }
+                final total = resp.contentLength ?? -1;
+                final dir = await getTemporaryDirectory();
+                final f = File('${dir.path}/update_v${_updateRemoteCode}.apk');
+                final sink = f.openWrite();
+                var got = 0;
+                await for (final chunk in resp) {
+                  got += chunk.length;
+                  sink.add(chunk);
+                  if (total > 0 && mounted) {
+                    setState(() => _updateProgress = got / total);
+                  }
+                }
+                await sink.close();
+                _updateApkPath = f.path;
+                if (mounted) setState(() => _updateDownloading = false);
+                await _installUpdateApk();
+              } catch (_) {
+                _updateApkPath = null;
+                if (mounted) setState(() => _updateDownloading = false);
+                // Fallback: buka link di browser (install manual tetep bisa).
+                await _openExternal(WebUri(_updateApkUrl));
+              } finally {
+                hc?.close();
+              }
+            }
+
+            // Panggil native (MainActivity) buat nampilin installer sistem.
+            // "ok" = installer kebuka | "settings" = user belum izinkan
+            // install aplikasi tak dikenal → dibukain halaman izinnya.
+            Future<void> _installUpdateApk() async {
+              final p = _updateApkPath;
+              if (p == null) return;
+              try {
+                final res = await _updateChannel.invokeMethod('installApk', {'path': p});
+                if (res == 'settings' && mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text(
+                          'Aktifin "Install aplikasi tak dikenal" buat app ini, lalu pencet banner update lagi ya'),
+                    ),
+                  );
+                  try {
+                    await _updateChannel.invokeMethod('openInstallPermSettings');
+                  } catch (_) {}
+                }
+              } catch (_) {
+                // Channel gagal → fallback: buka link di browser.
+                await _openExternal(WebUri(_updateApkUrl));
               }
             }
 
@@ -799,40 +966,104 @@ jobs:
                             ),
                           ),
 
-                        // ── 📢 v5.1: banner pengumuman owner — tap = buka link (kalo ada) ──
-                        if (_announceVisible)
+                        // ── 📢 v5.1: banner pengumuman owner + 🔄 v5.2: banner OTA update ──
+                        if (_announceVisible || _updateVisible)
                           Positioned(
                             top: 0,
                             left: 0,
                             right: 0,
-                            child: Material(
-                              color: Colors.deepOrange,
-                              child: InkWell(
-                                onTap: _announceLink.isEmpty
-                                    ? null
-                                    : () => _openExternal(WebUri(_announceLink)),
-                                child: Padding(
-                                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                                  child: Row(
-                                    children: [
-                                      const Icon(Icons.campaign, color: Colors.white, size: 20),
-                                      const SizedBox(width: 8),
-                                      Expanded(
-                                        child: Text(
-                                          _announceMsg,
-                                          maxLines: 3,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: const TextStyle(color: Colors.white, fontSize: 13),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (_announceVisible)
+                                  Material(
+                                    color: Colors.deepOrange,
+                                    child: InkWell(
+                                      onTap: _announceLink.isEmpty
+                                          ? null
+                                          : () => _openExternal(WebUri(_announceLink)),
+                                      child: Padding(
+                                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                        child: Row(
+                                          children: [
+                                            const Icon(Icons.campaign, color: Colors.white, size: 20),
+                                            const SizedBox(width: 8),
+                                            Expanded(
+                                              child: Text(
+                                                _announceMsg,
+                                                maxLines: 3,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: const TextStyle(color: Colors.white, fontSize: 13),
+                                              ),
+                                            ),
+                                            GestureDetector(
+                                              onTap: () => setState(() => _announceVisible = false),
+                                              child: const Icon(Icons.close, color: Colors.white70, size: 18),
+                                            ),
+                                          ],
                                         ),
                                       ),
-                                      GestureDetector(
-                                        onTap: () => setState(() => _announceVisible = false),
-                                        child: const Icon(Icons.close, color: Colors.white70, size: 18),
-                                      ),
-                                    ],
+                                    ),
                                   ),
-                                ),
-                              ),
+                                if (_updateVisible)
+                                  Material(
+                                    color: Colors.green.shade700,
+                                    child: InkWell(
+                                      onTap: _updateDownloading ? null : _startUpdate,
+                                      child: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Padding(
+                                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                            child: Row(
+                                              children: [
+                                                const Icon(Icons.system_update_alt, color: Colors.white, size: 20),
+                                                const SizedBox(width: 8),
+                                                Expanded(
+                                                  child: Text(
+                                                    _updateDownloading
+                                                        ? 'Mengunduh update... ${(_updateProgress * 100).toStringAsFixed(0)}%'
+                                                        : 'Update baru tersedia — ketuk buat install (gak perlu uninstall!)',
+                                                    maxLines: 2,
+                                                    overflow: TextOverflow.ellipsis,
+                                                    style: const TextStyle(
+                                                      color: Colors.white,
+                                                      fontSize: 13,
+                                                      fontWeight: FontWeight.w600,
+                                                    ),
+                                                  ),
+                                                ),
+                                                if (!_updateDownloading)
+                                                  const Padding(
+                                                    padding: EdgeInsets.only(left: 8),
+                                                    child: Text(
+                                                      'UPDATE',
+                                                      style: TextStyle(
+                                                        color: Colors.white,
+                                                        fontSize: 12,
+                                                        fontWeight: FontWeight.bold,
+                                                        letterSpacing: 1,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                GestureDetector(
+                                                  onTap: () => setState(() => _updateVisible = false),
+                                                  child: const Icon(Icons.close, color: Colors.white70, size: 18),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                          if (_updateDownloading)
+                                            const LinearProgressIndicator(
+                                              minHeight: 2,
+                                              backgroundColor: Colors.white24,
+                                              valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                            ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                              ],
                             ),
                           ),
 
@@ -973,6 +1204,18 @@ jobs:
                                    + '/main/announcements/global.json')
               announce_url_safe = announce_url_safe.replace('\\', '\\\\').replace("'", "\\'")
 
+          # ── 🔄 v5.2: URL manifest OTA update — updates/<pkg>.json di repo.
+          # Bot nulis file ini tiap build sukses (versionCode = run number).
+          pkg_raw = os.environ.get('INPUT_PACKAGE_NAME', '') or ''
+          pkg_clean = re.sub(r'[^A-Za-z0-9.]', '', pkg_raw).strip('.')
+          if not pkg_clean:
+              pkg_clean = 'com.deruzuan.webapp'
+          update_url_safe = ''
+          if slug.strip():
+              update_url_safe = ('https://raw.githubusercontent.com/' + slug.strip()
+                                 + '/main/updates/' + pkg_clean + '.json')
+              update_url_safe = update_url_safe.replace('\\', '\\\\').replace("'", "\\'")
+
           with open('lib/main.dart', 'r', encoding='utf-8') as f:
               src = f.read()
 
@@ -991,12 +1234,14 @@ jobs:
                   return tabs_safe
               if tok == '__ANNOUNCE_URL__':
                   return announce_url_safe
+              if tok == '__UPDATE_URL__':
+                  return update_url_safe
               return tok
 
-          src = re.sub(r'__(?:APP_NAME|WEB_URL|SHOW_SPLASH|DARK_THEME|TABS_JSON|ANNOUNCE_URL)__', repl, src)
+          src = re.sub(r'__(?:APP_NAME|WEB_URL|SHOW_SPLASH|DARK_THEME|TABS_JSON|ANNOUNCE_URL|UPDATE_URL)__', repl, src)
 
           # Safety net: gak boleh ada token tersisa di main.dart
-          leftover = re.findall(r'__(?:APP_NAME|WEB_URL|SHOW_SPLASH|DARK_THEME|TABS_JSON|ANNOUNCE_URL)__', src)
+          leftover = re.findall(r'__(?:APP_NAME|WEB_URL|SHOW_SPLASH|DARK_THEME|TABS_JSON|ANNOUNCE_URL|UPDATE_URL)__', src)
           if leftover:
               raise SystemExit('ERROR: token tersisa di main.dart: %s' % leftover)
 
@@ -1037,6 +1282,7 @@ jobs:
 
           print('Token applied. Mode:', mode, '| splash:', splash, '| dark:', dark)
           print('v5.1:', 'tabs=' + tabs_safe if tabs_safe != '[]' else 'tabs=off', '| announce=' + ('on' if announce_url_safe else 'off'))
+          print('v5.2:', 'ota=' + ('on' if update_url_safe else 'off'), '| pkg=' + pkg_clean)
           if mode == 'url':
               print('URL set to:', web_url)
 
@@ -1059,7 +1305,124 @@ jobs:
               QRY='<queries><intent><action android:name="android.intent.action.VIEW" /><data android:scheme="https" /></intent><intent><action android:name="android.intent.action.VIEW" /><data android:scheme="http" /></intent><intent><action android:name="android.intent.action.VIEW" /><data android:scheme="tel" /></intent><intent><action android:name="android.intent.action.VIEW" /><data android:scheme="mailto" /></intent></queries>'
               sed -i "s|<application|$QRY\n    <application|" "$MANIFEST"
             fi
+            # ── 🔄 v5.2: izin + provider buat OTA UPDATE (install APK dari app) ──
+            # REQUEST_INSTALL_PACKAGES = boleh memicu installer sistem.
+            if ! grep -q "REQUEST_INSTALL_PACKAGES" "$MANIFEST"; then
+              sed -i 's|<application|<uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />\n    <application|' "$MANIFEST"
+            fi
+            # FileProvider = nyalain app kasih file APK ke installer dgn aman
+            # (content:// URI — wajib di Android 7+).
+            if ! grep -q "androidx.core.content.FileProvider" "$MANIFEST"; then
+              PRV='<provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.fileProvider" android:exported="false" android:grantUriPermissions="true"><meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" /></provider>'
+              sed -i "s|</application>|    $PRV\n    </application>|" "$MANIFEST"
+            fi
           fi
+
+          # ── 🔄 v5.2: MainActivity + file_paths.xml (ota in-app update) ──
+          # ⚠️ Heredoc: body & terminator PYEOF2 wajib di base indent (kolom 0).
+          python3 << 'PYEOF2'
+          import glob, os
+
+          # 1) Timpa MainActivity.kt — tambah channel "dzr.cloudbuilder/update"
+          #    (installApk + openInstallPermSettings) buat OTA update.
+          cands = glob.glob('android/app/src/main/kotlin/**/MainActivity.kt', recursive=True)
+          if cands:
+              mp = cands[0]
+              parts = mp.replace('\\', '/').split('/')
+              ki = parts.index('kotlin')
+              app_pkg = '.'.join(parts[ki + 1:-1])
+              kotlin = '''package __APP_PKG__
+
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.provider.Settings
+          import androidx.core.content.FileProvider
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+          import java.io.File
+
+          /// v5.2 DZR CloudBuilder — channel OTA update.
+          /// installApk(path) -> buka installer sistem. Karena workflow jaga
+          /// signature APK tetap sama (stable keystore), Android menganggap ini
+          /// UPDATE di atas app lama: data & setting aman, TANPA uninstall.
+          class MainActivity : FlutterActivity() {
+              private val channelName = "dzr.cloudbuilder/update"
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
+                      .setMethodCallHandler { call, result ->
+                          when (call.method) {
+                              "installApk" -> result.success(installApk(call.argument<String>("path") ?: ""))
+                              "openInstallPermSettings" -> result.success(openInstallPermSettings())
+                              else -> result.notImplemented()
+                          }
+                      }
+              }
+
+              private fun canInstall(): Boolean =
+                  Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+                      packageManager.canRequestPackageInstalls()
+
+              private fun installApk(path: String): String {
+                  return try {
+                      val f = File(path)
+                      if (!f.exists()) return "error:file_not_found"
+                      if (!canInstall()) return "settings"
+                      val uri = FileProvider.getUriForFile(
+                          this, packageName + ".fileProvider", f
+                      )
+                      val i = Intent(Intent.ACTION_VIEW)
+                      i.setDataAndType(uri, "application/vnd.android.package-archive")
+                      i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      startActivity(i)
+                      "ok"
+                  } catch (e: Exception) {
+                      "error:" + (e.message ?: "unknown")
+                  }
+              }
+
+              private fun openInstallPermSettings(): Boolean {
+                  return try {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          startActivity(
+                              Intent(
+                                  Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                  Uri.parse("package:" + packageName)
+                              )
+                          )
+                      }
+                      true
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+          }
+          '''
+              # CATATAN: gak perlu strip indent manual — YAML block scalar
+              # udah ngelepas 10 spasi base, jadi python nerima konten string
+              # persis dgn indent Kotlin yang bener (class=0, member=4, dst).
+              kotlin = kotlin.replace('__APP_PKG__', app_pkg)
+              open(mp, 'w', encoding='utf-8').write(kotlin)
+              print('MainActivity patched:', app_pkg)
+          else:
+              print('WARNING: MainActivity.kt gak ketemu — OTA install channel off')
+
+          # 2) res/xml/file_paths.xml — path yang boleh dibagi FileProvider
+          os.makedirs('android/app/src/main/res/xml', exist_ok=True)
+          with open('android/app/src/main/res/xml/file_paths.xml', 'w', encoding='utf-8') as f:
+              f.write('<?xml version="1.0" encoding="utf-8"?>\n'
+                      '<paths>\n'
+                      '    <cache-path name="cache" path="." />\n'
+                      '    <files-path name="files" path="." />\n'
+                      '    <external-cache-path name="ext_cache" path="." />\n'
+                      '</paths>\n')
+          print('file_paths.xml OK')
+
+          PYEOF2
 
           # ── Icon processing ──
           # icon_url HARUS direct download URL (browser_download_url asset GitHub),
@@ -1152,7 +1515,11 @@ jobs:
           echo "AGP9 proguard safety patch: OK"
 
           # ── Build ──
-          BUILD_ARGS="--release --no-tree-shake-icons"
+          # v5.2: --build-number = GITHUB_RUN_NUMBER → versionCode NAIK tiap
+          # build (run number monoton). Ini syarat WAJIB update-over-install:
+          # Android nolak install versionCode lebih rendah/sama dari lama.
+          # --build-name cuma kosmetik (tampil di info versi app).
+          BUILD_ARGS="--release --no-tree-shake-icons --build-number=${GITHUB_RUN_NUMBER:-1} --build-name=1.0.${GITHUB_RUN_NUMBER:-1}"
           if [ "$INPUT_SMALL_APK" = "true" ]; then
             # APK hemat: cuma compile buat arm64-v8a (HP modern sejak ~2015) —
             # ukuran ~40% lebih kecil dibanding universal.
@@ -1168,6 +1535,100 @@ jobs:
             exit 1
           fi
           echo "APK: $APK_PATH ($(du -sh "$APK_PATH" | cut -f1))"
+
+      # ─── 🔐 v5.2: STABLE SIGNING + OTA RELEASE (update tanpa uninstall) ────
+      # 1. Keystore release disimpan di repo (signing/dzr-release.jks):
+      #    build pertama bikin + commit, build berikutnya pake yang sama →
+      #    signature SEMUA build identik → Android mau install di atas app
+      #    lama (update) TANPA uninstall.
+      # 2. APK di zipalign + re-sign pakai apksigner (gak usah utak-atik
+      #    gradle Flutter — anti-rusak lintas versi Flutter/AGP).
+      # 3. APK hasil sign di-upload ke release `apk-<pkg>` asset `app.apk`
+      #    (rolling) — kanal download buat OTA in-app update.
+      # Semua best-effort NON-FATAL: gagal di sini gak buang hasil build.
+      - name: Stable signing + OTA release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          KS_PASS: dzr-stable-2026
+        run: |
+          APK=$(find . -name "*.apk" -path "*flutter-apk*" 2>/dev/null | head -1 || find . -name "*.apk" -path "*outputs/apk*" 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            echo "WARNING: APK gak ketemu buat re-sign (skip, non-fatal)"
+            exit 0
+          fi
+          echo "APK target: $APK"
+
+          REPO_API="https://api.github.com/repos/${GH_REPO}"
+          AUTHH="Authorization: Bearer ${GH_TOKEN}"
+          APPH="Accept: application/vnd.github+json"
+          KS=/tmp/dzr-release.jks
+
+          fetch_ks() {
+            local HTTP
+            HTTP=$(curl -sL -w "%{http_code}" -H "$AUTHH" -H "$APPH" \
+              -o /tmp/ks_meta.json "${REPO_API}/contents/signing/dzr-release.jks?ref=main")
+            if [ "$HTTP" = "200" ]; then
+              python3 -c "import json,base64;open('/tmp/dzr-release.jks.fromrepo','wb').write(base64.b64decode(json.load(open('/tmp/ks_meta.json'))['content']))" 2>/dev/null \
+                && mv /tmp/dzr-release.jks.fromrepo "$KS"
+            fi
+            echo "$HTTP"
+          }
+
+          KS_OK=false
+          [ -s "$KS" ] || fetch_ks > /dev/null
+          if [ -s "$KS" ] && keytool -list -keystore "$KS" -storepass "$KS_PASS" -alias dzr >/dev/null 2>&1; then
+            KS_OK=true
+            echo "Keystore stabil: DIPAKE dari repo (signature sama kayak build kemarin)"
+          fi
+          if [ "$KS_OK" = false ]; then
+            echo "Keystore belum ada / gak valid — generate BARU..."
+            rm -f "$KS"
+            keytool -genkeypair -v -keystore "$KS" -alias dzr -keyalg RSA -keysize 2048 \
+              -validity 10950 -storepass "$KS_PASS" -keypass "$KS_PASS" \
+              -dname "CN=DZR CloudBuilder, OU=Deruzuan, O=DZR, L=Jakarta, C=ID" >/dev/null 2>&1
+            # Commit ke repo → build berikutnya pake keystore yang SAMA
+            PAYLOAD=$(python3 -c "import base64,json;print(json.dumps({'message':'chore: stable signing keystore (auto-generate)','content':base64.b64encode(open('/tmp/dzr-release.jks','rb').read()).decode(),'branch':'main'}))")
+            PUT_HTTP=$(curl -sL -o /tmp/ks_put.json -w "%{http_code}" -X PUT \
+              -H "$AUTHH" -H "$APPH" -d "$PAYLOAD" "${REPO_API}/contents/signing/dzr-release.jks")
+            if [ "$PUT_HTTP" != "200" ] && [ "$PUT_HTTP" != "201" ]; then
+              echo "Commit keystore gagal (HTTP $PUT_HTTP) — race guard: pake yang di repo..."
+              fetch_ks > /dev/null || true
+            fi
+          fi
+
+          if [ -s "$KS" ] && ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* >/dev/null 2>&1; then
+            BT=$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* | sort -V | tail -1)
+            if [ -x "$BT/zipalign" ] && [ -x "$BT/apksigner" ]; then
+              cp "$APK" /tmp/pre_sign.apk
+              "$BT/zipalign" -f -p 4 /tmp/pre_sign.apk /tmp/aligned.apk
+              "$BT/apksigner" sign --ks "$KS" --ks-key-alias dzr \
+                --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \
+                --out "$APK" /tmp/aligned.apk
+              "$BT/apksigner" verify "$APK" \
+                && echo "✅ APK ke-sign keystore stabil — update tanpa uninstall AKTIF" \
+                || echo "WARNING: verify gagal (non-fatal, APK tetep ke-upload)"
+            else
+              echo "WARNING: zipalign/apksigner gak ada di $BT (skip re-sign)"
+            fi
+          else
+            echo "WARNING: keystore/build-tools gak siap (skip re-sign, non-fatal)"
+          fi
+
+          # ── Kanal OTA: release apk-<pkg> asset app.apk (rolling) ──
+          PKG="$(echo "${INPUT_PACKAGE_NAME:-}" | sed 's/[^a-zA-Z0-9.]//g' | sed 's/^\.*//' | sed 's/\.*$//')"
+          [ -z "$PKG" ] && PKG="com.deruzuan.webapp"
+          cp "$APK" /tmp/app.apk
+          if gh release view "apk-$PKG" >/dev/null 2>&1; then
+            gh release upload "apk-$PKG" /tmp/app.apk --clobber \
+              && echo "🔄 Kanal OTA updated: apk-$PKG → app.apk" \
+              || echo "WARNING: gh upload gagal (non-fatal)"
+          else
+            gh release create "apk-$PKG" /tmp/app.apk \
+              --title "OTA $PKG" --notes "Build terbaru — kanal auto-update" \
+              && echo "🔄 Kanal OTA dibuat: apk-$PKG" \
+              || echo "WARNING: gh create gagal (non-fatal)"
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
