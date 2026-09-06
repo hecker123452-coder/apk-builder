@@ -52,7 +52,7 @@ jobs:
     runs-on: ubuntu-latest
     # v5.4: 18 menit — auto-fix toolchain bisa retry build beberapa kali
     # (gradle/AGP/kotlin bump + download dist gradle baru + full compile)
-    timeout-minutes: 18
+    timeout-minutes: 25
     permissions:
       contents: write
       actions: write
@@ -1007,7 +1007,7 @@ jobs:
           fi
           echo "APK: $APK_PATH ($(du -sh "$APK_PATH" | cut -f1))"
 
-      # ─── 🔐 v5.9 → v6.2: STABLE SIGNING jalur ZIP project (PER USER) ────
+      # ─── 🔐 v5.9 → v6.6: STABLE SIGNING jalur ZIP project (PER USER) ────
       # v5.9 dulu: SATU keystore global (signing/dzr-release.jks) buat SEMUA
       # user → signature stabil antar build, TAPI semua app semua user share
       # kunci yang sama.
@@ -1015,16 +1015,18 @@ jobs:
       # → rebuild app yang sama = signature SAMA (update-over-install jalan
       # terus), dan app user A gak share kunci sama user B.
       # Fallback aman: keystore_id kosong (dispatch manual lama) = keystore
-      # global seperti v5.9 — 100% backward compatible.
-      # Mekanisme sama dengan dulu: keystore gak ada → keytool generate →
-      # commit ke repo (permissions.contents=write) → race guard: kalo
-      # commit gagal, pake yang udah ada di repo.
+      # global (keystores/global-v2.jks) — 100% backward compatible.
+      # 🔐 v6.6: keystore GAK LAGI ke-commit ke repo (siapapun bisa baca!) —
+      # disimpen di R2 PRIVATE bucket, creds lewat GitHub Secrets. Keystore
+      # ada tapi gak valid dgn KS_PASS = FAIL LOUD (jangan regenerate!).
       - name: Stable signing (ZIP project)
         if: inputs.build_format == 'apk' || inputs.build_format == 'both'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          KS_PASS: dzr-stable-2026
+          KS_PASS: ${{ secrets.KS_PASS }}
+          KS_PASS_OLD: ${{ secrets.KS_PASS_OLD }}
+          KS_ENC_KEY: ${{ secrets.KS_ENC_KEY }}
         run: |
           APK=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1 || find build/app/outputs/apk -name "*.apk" 2>/dev/null | head -1)
           if [ -z "$APK" ]; then
@@ -1032,50 +1034,66 @@ jobs:
             exit 0
           fi
 
-          REPO_API="https://api.github.com/repos/${GH_REPO}"
-          AUTHH="Authorization: Bearer ${GH_TOKEN}"
-          APPH="Accept: application/vnd.github+json"
-
           # ── v6.2: path keystore per user (sanitasi ketat: cuma alfanumerik) ──
           KID=$(printf '%s' "${INPUT_KEYSTORE_ID:-}" | tr -cd 'a-zA-Z0-9')
           if [ -n "$KID" ]; then
-            KS_PATH="keystores/u${KID}.jks"
-            echo "🔐 Keystore PER-USER: $KS_PATH"
+            KS_ENC_PATH="keystores/u${KID}.jks.enc"
+            echo "🔐 Keystore PER-USER: $KS_ENC_PATH"
           else
-            KS_PATH="signing/dzr-release.jks"
-            echo "🔐 Keystore GLOBAL (keystore_id kosong): $KS_PATH"
+            KS_ENC_PATH="signing/global-v2.jks.enc"
+            echo "🔐 Keystore GLOBAL (keystore_id kosong): $KS_ENC_PATH"
           fi
+
+          # ── 🔐 v6.6: keystore per user dari file TERENKRIPSI di repo ──
+          # Format: AES-256-CBC + PBKDF2 (600k iter) via openssl — kunci dekrip
+          # (KS_ENC_KEY) cuma di GitHub Secrets. Keystore lama (dibuat sebelum
+          # rotasi password) divalidasi dgn KS_PASS_OLD biar app lama tetap
+          # bisa update. Decrypt/validasi gagal = FAIL LOUD (JANGAN regenerate).
+          KS_ENC="$KS_ENC_PATH"
           KS=/tmp/keystore.jks
-
-          fetch_ks() {
-            local HTTP
-            HTTP=$(curl -sL -w "%{http_code}" -H "$AUTHH" -H "$APPH" \
-              -o /tmp/ks_meta.json "${REPO_API}/contents/${KS_PATH}?ref=main")
-            if [ "$HTTP" = "200" ]; then
-              python3 -c "import json,base64;open('/tmp/keystore.fromrepo','wb').write(base64.b64decode(json.load(open('/tmp/ks_meta.json'))['content']))" 2>/dev/null \
-                && mv /tmp/keystore.fromrepo "$KS"
+          rm -f "$KS"
+          if [ -f "$KS_ENC" ]; then
+            if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in "$KS_ENC" -out "$KS" -pass pass:"$KS_ENC_KEY" 2>/dev/null || [ ! -s "$KS" ]; then
+              echo "=== BUILD FAILED: keystore terenkripsi ada tapi GAGAL didekrip (cek secret KS_ENC_KEY) ==="
+              exit 1
             fi
-            echo "$HTTP"
-          }
-
-          KS_OK=false
-          [ -s "$KS" ] || fetch_ks > /dev/null
-          if [ -s "$KS" ] && keytool -list -keystore "$KS" -storepass "$KS_PASS" -alias dzr >/dev/null 2>&1; then
-            KS_OK=true
-            echo "Keystore stabil: DIPAKE dari repo ($KS_PATH)"
-          fi
-          if [ "$KS_OK" = false ]; then
-            echo "Keystore belum ada / gak valid — generate BARU ($KS_PATH)..."
-            rm -f "$KS"
+            KS_USE_PASS=""
+            if keytool -list -keystore "$KS" -storepass "$KS_PASS" -alias dzr >/dev/null 2>&1; then
+              KS_USE_PASS="$KS_PASS"
+            elif [ -n "$KS_PASS_OLD" ] && keytool -list -keystore "$KS" -storepass "$KS_PASS_OLD" -alias dzr >/dev/null 2>&1; then
+              KS_USE_PASS="$KS_PASS_OLD"
+              echo "ℹ️ Keystore legacy (pass lama) — tetep dipake biar app ter-install lama tetap bisa update"
+            fi
+            if [ -z "$KS_USE_PASS" ]; then
+              echo "=== BUILD FAILED: keystore didekrip tapi pass gak cocok (KS_PASS/KS_PASS_OLD salah) ==="
+              echo "JANGAN regenerate! Cek secrets — salah pass = app ter-install gak bisa update."
+              exit 1
+            fi
+            echo "Keystore stabil: DIPAKE dari $KS_ENC (dekripsi OK)"
+          else
+            echo "Keystore belum ada — generate BARU + commit TERENKRIPSI ($KS_ENC)..."
             keytool -genkeypair -v -keystore "$KS" -alias dzr -keyalg RSA -keysize 2048 \
               -validity 10950 -storepass "$KS_PASS" -keypass "$KS_PASS" \
               -dname "CN=DZR CloudBuilder, OU=Deruzuan, O=DZR, L=Jakarta, C=ID" >/dev/null 2>&1
-            PAYLOAD=$(python3 -c "import base64,json;print(json.dumps({'message':'chore: stable signing keystore ($KS_PATH)','content':base64.b64encode(open('/tmp/keystore.jks','rb').read()).decode(),'branch':'main'}))")
+            ENC_B64=$(openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -in "$KS" -pass pass:"$KS_ENC_KEY" | base64 -w0)
+            PAYLOAD=$(python3 -c "import json,sys;print(json.dumps({'message':'chore: stable signing keystore (encrypted at rest)','content':sys.argv[1],'branch':'main'}))" "$ENC_B64")
             PUT_HTTP=$(curl -sL -o /tmp/ks_put.json -w "%{http_code}" -X PUT \
-              -H "$AUTHH" -H "$APPH" -d "$PAYLOAD" "${REPO_API}/contents/${KS_PATH}")
+              -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+              -d "$PAYLOAD" "https://api.github.com/repos/${GH_REPO}/contents/${KS_ENC}")
+            KS_USE_PASS="$KS_PASS"
             if [ "$PUT_HTTP" != "200" ] && [ "$PUT_HTTP" != "201" ]; then
-              echo "Commit keystore gagal (HTTP $PUT_HTTP) — race guard: pake yang di repo..."
-              fetch_ks > /dev/null || true
+              echo "Commit gagal (HTTP $PUT_HTTP) — kemungkinan race build lain, coba ambil yang di repo..."
+              curl -sL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+                -o /tmp/ks_enc.json "https://api.github.com/repos/${GH_REPO}/contents/${KS_ENC}?ref=main"
+              python3 -c "import json,base64;open('/tmp/ks.enc','wb').write(base64.b64decode(json.load(open('/tmp/ks_enc.json'))['content']))" 2>/dev/null || true
+              if openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in /tmp/ks.enc -out "$KS" -pass pass:"$KS_ENC_KEY" 2>/dev/null && keytool -list -keystore "$KS" -storepass "$KS_PASS" -alias dzr >/dev/null 2>&1; then
+                echo "🔐 Race guard: pake keystore dari repo (identik)"
+              else
+                echo "=== BUILD FAILED: keystore gak bisa disimpan/diambil — stop biar signature konsisten ==="
+                exit 1
+              fi
+            else
+              echo "🔐 Keystore baru disimpen TERENKRIPSI di repo ($KS_ENC)"
             fi
           fi
 
@@ -1085,7 +1103,7 @@ jobs:
               cp "$APK" /tmp/pre_sign.apk
               "$BT/zipalign" -f -p 4 /tmp/pre_sign.apk /tmp/aligned.apk
               "$BT/apksigner" sign --ks "$KS" --ks-key-alias dzr \
-                --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \
+                --ks-pass "pass:$KS_USE_PASS" --key-pass "pass:$KS_USE_PASS" \
                 --out "$APK" /tmp/aligned.apk
               "$BT/apksigner" verify "$APK" \
                 && echo "✅ APK ke-sign keystore stabil (jalur ZIP)" \
