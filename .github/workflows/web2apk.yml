@@ -1765,9 +1765,17 @@ jobs:
           # merusak rantai update app ter-install!).
           KS_ENC="signing/global-v2.jks.enc"
           KS=/tmp/dzr-release.jks
-          rm -f "$KS"
-          if [ -f "$KS_ENC" ]; then
-            if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in "$KS_ENC" -out "$KS" -pass pass:"$KS_ENC_KEY" 2>/dev/null || [ ! -s "$KS" ]; then
+          rm -f "$KS" /tmp/ks.enc
+          # ⚠️ Gak ada actions/checkout di workflow ini → keberadaan .enc dicek
+          # via GitHub API (file keystore GAK PERNAH ada di disk runner!)
+          ENC_HTTP=$(curl -sL -o /tmp/ks_enc.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GH_REPO}/contents/${KS_ENC}?ref=main")
+          if [ "$ENC_HTTP" = "200" ]; then
+            python3 -c "import json,base64;open('/tmp/ks.enc','wb').write(base64.b64decode(json.load(open('/tmp/ks_enc.json'))['content']))" 2>/dev/null || true
+          fi
+          if [ "$ENC_HTTP" = "200" ] && [ -s /tmp/ks.enc ]; then
+            if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in /tmp/ks.enc -out "$KS" -pass pass:"$KS_ENC_KEY" 2>/dev/null || [ ! -s "$KS" ]; then
               echo "=== BUILD FAILED: keystore terenkripsi ada tapi GAGAL didekrip (cek secret KS_ENC_KEY) ==="
               exit 1
             fi
@@ -1788,13 +1796,26 @@ jobs:
             PUT_HTTP=$(curl -sL -o /tmp/ks_put.json -w "%{http_code}" -X PUT \
               -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
               -d "$PAYLOAD" "https://api.github.com/repos/${GH_REPO}/contents/${KS_ENC}")
-            if [ "$PUT_HTTP" != "200" ] && [ "$PUT_HTTP" != "201" ]; then
-              echo "=== BUILD FAILED: commit keystore terenkripsi gagal (HTTP $PUT_HTTP) ==="
-              echo "Gak boleh lanjut — sign pake kunci yang gak tersimpan = build berikutnya gak bisa update."
-              exit 1
-            fi
             KS_USE_PASS="$KS_PASS"
-            echo "🔐 Keystore baru disimpen TERENKRIPSI di repo ($KS_ENC)"
+            if [ "$PUT_HTTP" != "200" ] && [ "$PUT_HTTP" != "201" ]; then
+              echo "Commit gagal (HTTP $PUT_HTTP) — kemungkinan race build lain, coba ambil yang di repo..."
+              ENC_HTTP=$(curl -sL -o /tmp/ks_enc.json -w "%{http_code}" \
+                -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${GH_REPO}/contents/${KS_ENC}?ref=main")
+              if [ "$ENC_HTTP" = "200" ]; then
+                python3 -c "import json,base64;open('/tmp/ks.enc','wb').write(base64.b64decode(json.load(open('/tmp/ks_enc.json'))['content']))" 2>/dev/null || true
+              fi
+              if [ "$ENC_HTTP" = "200" ] && [ -s /tmp/ks.enc ] \
+                && openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in /tmp/ks.enc -out "$KS" -pass pass:"$KS_ENC_KEY" 2>/dev/null \
+                && [ -s "$KS" ] && keytool -list -keystore "$KS" -storepass "$KS_PASS" -alias dzr >/dev/null 2>&1; then
+                echo "🔐 Race guard: pake keystore dari repo (identik)"
+              else
+                echo "=== BUILD FAILED: keystore gak bisa disimpan/diambil — stop biar signature konsisten ==="
+                exit 1
+              fi
+            else
+              echo "🔐 Keystore baru disimpen TERENKRIPSI di repo ($KS_ENC)"
+            fi
           fi
 
           if [ -s "$KS" ] && ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* >/dev/null 2>&1; then
