@@ -154,7 +154,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     permissions:
       contents: write
       actions: write
@@ -558,6 +558,7 @@ jobs:
             double _updateProgress = 0;
             String? _updateApkPath;
             String _updateVerName = '';      // "1.0.N" dari manifest (dialog/banner)
+            String _updateNotes = '';        // 📝 v6.6 "apa yang baru" dari manifest (dialog update)
             String _updateProgressTxt = '';  // teks progres: "Mengunduh 8.1 MB (42%)"
             int _updateDialogShownFor = 0;   // dialog per versi cuma sekali per sesi
             bool _updatePermPrompted = false; // lagi nunggu user kasih izin install?
@@ -756,6 +757,8 @@ jobs:
                 final verName = (rawName is String && rawName.isNotEmpty)
                     ? rawName
                     : '1.0.$remote';
+                final rawNotes = data['notes'];
+                final updNotes = (rawNotes is String) ? rawNotes.trim() : '';
                 _lastUpdateOk = DateTime.now();
                 final info = await PackageInfo.fromPlatform();
                 final local = int.tryParse(info.buildNumber) ?? 0;
@@ -765,6 +768,7 @@ jobs:
                     _updateRemoteCode = remote;
                     _updateApkUrl = apkUrl;
                     _updateVerName = verName;
+                    _updateNotes = updNotes;
                   });
                   // 🚀 v5.3: bukan cuma banner — user LANGSUNG disuruh update
                   _maybeShowUpdateDialog();
@@ -806,7 +810,8 @@ jobs:
                     '• Gak perlu uninstall\n'
                     '• Data & login kamu aman\n'
                     '• Ketuk Update Sekarang — app download sendiri terus '
-                    'bukain installer',
+                    'bukain installer'
+                    '${_updateNotes.isEmpty ? "" : "\n\n📝 Apa yang baru:\n$_updateNotes"}',
                     style: TextStyle(
                         height: 1.5,
                         color: _dark ? Colors.grey.shade200 : Colors.black87),
@@ -1721,21 +1726,29 @@ jobs:
           fi
           echo "APK: $APK_PATH ($(du -sh "$APK_PATH" | cut -f1))"
 
-      # ─── 🔐 v5.2: STABLE SIGNING + OTA RELEASE (update tanpa uninstall) ────
-      # 1. Keystore release disimpan di repo (signing/dzr-release.jks):
-      #    build pertama bikin + commit, build berikutnya pake yang sama →
+      # ─── 🔐 v5.2 → v6.6: STABLE SIGNING + OTA RELEASE (update tanpa uninstall) ────
+      # 1. Keystore release disimpan TERENKRIPSI di repo (signing/global-v2.jks.enc,
+      #    AES-256-CBC + PBKDF2 via openssl) — kunci dekrip di GitHub Secrets.
+      #    GAK ADA lagi file rahasia plaintext di repo (dulu signing/dzr-release.jks
+      #    ke-commit = siapapun bisa baca!). Build pertama bikin + commit
+      #    terenkripsi, build berikutnya dekrip + pake yang sama →
       #    signature SEMUA build identik → Android mau install di atas app
       #    lama (update) TANPA uninstall.
       # 2. APK di zipalign + re-sign pakai apksigner (gak usah utak-atik
       #    gradle Flutter — anti-rusak lintas versi Flutter/AGP).
       # 3. APK hasil sign di-upload ke release `apk-<pkg>` asset `app.apk`
       #    (rolling) — kanal download buat OTA in-app update.
-      # Semua best-effort NON-FATAL: gagal di sini gak buang hasil build.
+      # Gagal ambil/simpan keystore = FAIL LOUD (exit 1) — jangan pernah
+      # sign pake kunci beda-beda tiap build, itu merusak rantai update.
       - name: Stable signing + OTA release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          KS_PASS: dzr-stable-2026
+          # ── 🔐 v6.6: keystore + kunci via GitHub Secrets (GAK ada lagi file
+          #    rahasia plaintext di repo) — keystore disimpen TERENKRIPSI.
+          KS_PASS: ${{ secrets.KS_PASS }}
+          KS_PASS_OLD: ${{ secrets.KS_PASS_OLD }}
+          KS_ENC_KEY: ${{ secrets.KS_ENC_KEY }}
         run: |
           APK=$(find . -name "*.apk" -path "*flutter-apk*" 2>/dev/null | head -1 || find . -name "*.apk" -path "*outputs/apk*" 2>/dev/null | head -1)
           if [ -z "$APK" ]; then
@@ -1744,42 +1757,44 @@ jobs:
           fi
           echo "APK target: $APK"
 
-          REPO_API="https://api.github.com/repos/${GH_REPO}"
-          AUTHH="Authorization: Bearer ${GH_TOKEN}"
-          APPH="Accept: application/vnd.github+json"
+          # ── 🔐 v6.6: keystore dari file TERENKRIPSI di repo ──
+          # Format: AES-256-CBC + PBKDF2 (600k iter, salt acak) via openssl.
+          # Kunci dekripsi (KS_ENC_KEY) cuma ada di GitHub Secrets → ciphertext
+          # di repo publik gak bisa dibuka siapapun. Gak tergantung R2.
+          # Aturan: decrypt/validasi gagal = FAIL LOUD (JANGAN regenerate —
+          # merusak rantai update app ter-install!).
+          KS_ENC="signing/global-v2.jks.enc"
           KS=/tmp/dzr-release.jks
-
-          fetch_ks() {
-            local HTTP
-            HTTP=$(curl -sL -w "%{http_code}" -H "$AUTHH" -H "$APPH" \
-              -o /tmp/ks_meta.json "${REPO_API}/contents/signing/dzr-release.jks?ref=main")
-            if [ "$HTTP" = "200" ]; then
-              python3 -c "import json,base64;open('/tmp/dzr-release.jks.fromrepo','wb').write(base64.b64decode(json.load(open('/tmp/ks_meta.json'))['content']))" 2>/dev/null \
-                && mv /tmp/dzr-release.jks.fromrepo "$KS"
+          rm -f "$KS"
+          if [ -f "$KS_ENC" ]; then
+            if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in "$KS_ENC" -out "$KS" -pass pass:"$KS_ENC_KEY" 2>/dev/null || [ ! -s "$KS" ]; then
+              echo "=== BUILD FAILED: keystore terenkripsi ada tapi GAGAL didekrip (cek secret KS_ENC_KEY) ==="
+              exit 1
             fi
-            echo "$HTTP"
-          }
-
-          KS_OK=false
-          [ -s "$KS" ] || fetch_ks > /dev/null
-          if [ -s "$KS" ] && keytool -list -keystore "$KS" -storepass "$KS_PASS" -alias dzr >/dev/null 2>&1; then
-            KS_OK=true
-            echo "Keystore stabil: DIPAKE dari repo (signature sama kayak build kemarin)"
-          fi
-          if [ "$KS_OK" = false ]; then
-            echo "Keystore belum ada / gak valid — generate BARU..."
-            rm -f "$KS"
+            if ! keytool -list -keystore "$KS" -storepass "$KS_PASS" -alias dzr >/dev/null 2>&1; then
+              echo "=== BUILD FAILED: keystore didekrip tapi KS_PASS gak cocok ==="
+              echo "JANGAN regenerate! Cek secret KS_PASS — salah pass = semua app ter-install gak bisa update."
+              exit 1
+            fi
+            KS_USE_PASS="$KS_PASS"
+            echo "🔐 Keystore stabil: DIPAKE dari $KS_ENC (dekripsi OK) — signature sama kayak build sebelumnya"
+          else
+            echo "🔐 Keystore belum ada — generate BARU + commit TERENKRIPSI ($KS_ENC)..."
             keytool -genkeypair -v -keystore "$KS" -alias dzr -keyalg RSA -keysize 2048 \
               -validity 10950 -storepass "$KS_PASS" -keypass "$KS_PASS" \
               -dname "CN=DZR CloudBuilder, OU=Deruzuan, O=DZR, L=Jakarta, C=ID" >/dev/null 2>&1
-            # Commit ke repo → build berikutnya pake keystore yang SAMA
-            PAYLOAD=$(python3 -c "import base64,json;print(json.dumps({'message':'chore: stable signing keystore (auto-generate)','content':base64.b64encode(open('/tmp/dzr-release.jks','rb').read()).decode(),'branch':'main'}))")
+            ENC_B64=$(openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -in "$KS" -pass pass:"$KS_ENC_KEY" | base64 -w0)
+            PAYLOAD=$(python3 -c "import json,sys;print(json.dumps({'message':'chore: stable signing keystore (encrypted at rest)','content':sys.argv[1],'branch':'main'}))" "$ENC_B64")
             PUT_HTTP=$(curl -sL -o /tmp/ks_put.json -w "%{http_code}" -X PUT \
-              -H "$AUTHH" -H "$APPH" -d "$PAYLOAD" "${REPO_API}/contents/signing/dzr-release.jks")
+              -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+              -d "$PAYLOAD" "https://api.github.com/repos/${GH_REPO}/contents/${KS_ENC}")
             if [ "$PUT_HTTP" != "200" ] && [ "$PUT_HTTP" != "201" ]; then
-              echo "Commit keystore gagal (HTTP $PUT_HTTP) — race guard: pake yang di repo..."
-              fetch_ks > /dev/null || true
+              echo "=== BUILD FAILED: commit keystore terenkripsi gagal (HTTP $PUT_HTTP) ==="
+              echo "Gak boleh lanjut — sign pake kunci yang gak tersimpan = build berikutnya gak bisa update."
+              exit 1
             fi
+            KS_USE_PASS="$KS_PASS"
+            echo "🔐 Keystore baru disimpen TERENKRIPSI di repo ($KS_ENC)"
           fi
 
           if [ -s "$KS" ] && ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* >/dev/null 2>&1; then
@@ -1788,7 +1803,7 @@ jobs:
               cp "$APK" /tmp/pre_sign.apk
               "$BT/zipalign" -f -p 4 /tmp/pre_sign.apk /tmp/aligned.apk
               "$BT/apksigner" sign --ks "$KS" --ks-key-alias dzr \
-                --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \
+                --ks-pass "pass:$KS_USE_PASS" --key-pass "pass:$KS_USE_PASS" \
                 --out "$APK" /tmp/aligned.apk
               "$BT/apksigner" verify "$APK" \
                 && echo "✅ APK ke-sign keystore stabil — update tanpa uninstall AKTIF" \
