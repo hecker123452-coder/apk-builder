@@ -1,9 +1,19 @@
 name: Web2APK
 
 # ============================================================================
-# DZR CloudBuilder — Web2APK Workflow v5.6 (🚀 DELTA UPDATE ALA PLAY STORE
-#                            + NOTIF PROGRESS & "UPDATE SELESAI")
+# DZR CloudBuilder — Web2APK Workflow v5.7 (🚀 DELTA UPDATE ALA PLAY STORE
+#                            + NOTIF UPDATE + REBRAND VERSI 3.0)
 # ============================================================================
+# FITUR LOG v5.7 (request owner: "saat update apk jangan dikasih link apk
+#                 sama donlot nya ... kalo selesai tulisan berhasil
+#                 mengupdate aja ... dari v7 ganti ke v3 aja semua"):
+#   1. SCHEMA VERSI 3.0       : versionName app & APK ber-versi naik ke
+#      3.0.N (dulu 1.0.N). versionCode TETAP = run number (rantai update
+#      aman — Android cek versionCode, bukan versionName). Rollback URL
+#      bot jadi DINAMIS (nemuin asset app-*.apk by code, kompatibel 1.0.N lama).
+#   (bot side v3.0: rebuild APK sama = cukup pesan "Berhasil Mengupdate"
+#   tanpa file/link/QR di chat — OTA yang ngurus. Build baru tetep dikasih.)
+#
 # FITUR LOG v5.6 (request owner: "pas mau di update cuma nambah 4mb atau kb
 #                 jangan kayak di suruh ulang dari 44 lagi kelamaan biar
 #                 kayak di PlayStore ... nanti muncul notif perbarui nya
@@ -523,7 +533,7 @@ jobs:
           // kUpdateUrl = raw URL updates/<pkg>.json di repo ('' = fitur off).
           // Isi manifest v2 (ditulis bot v7.x tiap build sukses — semua field
           // baru OPSIONAL, manifest lama tetep kebaca):
-          //   {"versionCode": <run number naik terus>, "versionName": "1.0.N",
+          //   {"versionCode": <run number naik terus>, "versionName": "3.0.N",
           //    "apk": "<url release apk-<pkg>/app.apk>", "notes": "...",
           //    "sha256": "<hex64 — kosong = skip verifikasi>",
           //    "minVersionCode": 0,   // >0 & app lebih lama = update WAJIB
@@ -614,7 +624,7 @@ jobs:
             bool _updateDownloading = false;
             double _updateProgress = 0;
             String? _updateApkPath;
-            String _updateVerName = '';      // "1.0.N" dari manifest (dialog/banner)
+            String _updateVerName = '';      // "3.0.N" dari manifest (dialog/banner)
             String _updateNotes = '';        // 📝 v6.6 "apa yang baru" dari manifest (dialog update)
             String _updateProgressTxt = '';  // teks progres: "Mengunduh 8.1 MB (42%)"
             int _updateDialogShownFor = 0;   // dialog per versi cuma sekali per sesi
@@ -827,7 +837,7 @@ jobs:
                 final rawName = data['versionName'];
                 final verName = (rawName is String && rawName.isNotEmpty)
                     ? rawName
-                    : '1.0.$remote';
+                    : '3.0.$remote';
                 final rawNotes = data['notes'];
                 final updNotes = (rawNotes is String) ? rawNotes.trim() : '';
                 // ── 🔄 v5.5: field manifest v2 (semua opsional = kompatibel) ──
@@ -2420,7 +2430,7 @@ jobs:
           # build (run number monoton). Ini syarat WAJIB update-over-install:
           # Android nolak install versionCode lebih rendah/sama dari lama.
           # --build-name cuma kosmetik (tampil di info versi app).
-          BUILD_ARGS="--release --no-tree-shake-icons --build-number=${GITHUB_RUN_NUMBER:-1} --build-name=1.0.${GITHUB_RUN_NUMBER:-1}"
+          BUILD_ARGS="--release --no-tree-shake-icons --build-number=${GITHUB_RUN_NUMBER:-1} --build-name=3.0.${GITHUB_RUN_NUMBER:-1}"
           if [ "$INPUT_SMALL_APK" = "true" ]; then
             # APK hemat: cuma compile buat arm64-v8a (HP modern sejak ~2015) —
             # ukuran ~40% lebih kecil dibanding universal.
@@ -2632,18 +2642,18 @@ jobs:
             echo "WARNING: bsdiff gak ke-install — delta skip (non-fatal, update penuh tetap jalan)"
           fi
 
-          printf '{"package":"%s","versionCode":%s,"versionName":"1.0.%s","sha256":"%s","builtAt":"%s"%s}\n' \
+          printf '{"package":"%s","versionCode":%s,"versionName":"3.0.%s","sha256":"%s","builtAt":"%s"%s}\n' \
             "$PKG" "$RUN_NO" "$RUN_NO" "$APK_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$DELTA_JSON" > /tmp/build-info.json
-          echo "🔧 build-info.json: v1.0.$RUN_NO sha256=$APK_SHA ${DELTA_JSON:+(delta ✓)}"
-          cp "$APK" "/tmp/app-1.0.$RUN_NO.apk"
+          echo "🔧 build-info.json: v3.0.$RUN_NO sha256=$APK_SHA ${DELTA_JSON:+(delta ✓)}"
+          cp "$APK" "/tmp/app-3.0.$RUN_NO.apk"
           if gh release view "apk-$PKG" >/dev/null 2>&1; then
             gh release upload "apk-$PKG" /tmp/app.apk --clobber \
               && echo "🔄 Kanal OTA updated: apk-$PKG → app.apk" \
               || echo "WARNING: gh upload gagal (non-fatal)"
             # APK ber-versi (rollback) — clobber = rerun dengan run number sama
             # bakal nge-overwrite miliknya sendiri (idempotent, gak numpuk)
-            gh release upload "apk-$PKG" "/tmp/app-1.0.$RUN_NO.apk" --clobber \
-              && echo "🗂️ APK ber-versi: app-1.0.$RUN_NO.apk (buat riwayat/rollback)" \
+            gh release upload "apk-$PKG" "/tmp/app-3.0.$RUN_NO.apk" --clobber \
+              && echo "🗂️ APK ber-versi: app-3.0.$RUN_NO.apk (buat riwayat/rollback)" \
               || echo "WARNING: upload APK ber-versi gagal (non-fatal)"
             # 🚀 v5.6: delta patch — kalo kebentuk & worth-it
             if [ -s /tmp/delta.patch ]; then
@@ -2665,7 +2675,7 @@ jobs:
               done
             fi
           else
-            gh release create "apk-$PKG" /tmp/app.apk "/tmp/app-1.0.$RUN_NO.apk" /tmp/build-info.json \
+            gh release create "apk-$PKG" /tmp/app.apk "/tmp/app-3.0.$RUN_NO.apk" /tmp/build-info.json \
               --title "OTA $PKG" --notes "Build terbaru — kanal auto-update" \
               && echo "🔄 Kanal OTA dibuat: apk-$PKG (+ APK ber-versi + build-info)" \
               || echo "WARNING: gh create gagal (non-fatal)"
