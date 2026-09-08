@@ -1,9 +1,35 @@
 name: Web2APK
 
 # ============================================================================
-# DZR CloudBuilder — Web2APK Workflow v5.5 (🔄 OTA SUPERSET: SHA-256 VERIFIKA
-#                            + FORCE UPDATE + AUTO-UPDATE + RIWAYAT VERSI)
+# DZR CloudBuilder — Web2APK Workflow v5.6 (🚀 DELTA UPDATE ALA PLAY STORE
+#                            + NOTIF PROGRESS & "UPDATE SELESAI")
 # ============================================================================
+# FITUR LOG v5.6 (request owner: "pas mau di update cuma nambah 4mb atau kb
+#                 jangan kayak di suruh ulang dari 44 lagi kelamaan biar
+#                 kayak di PlayStore ... nanti muncul notif perbarui nya
+#                 udah selesai" — sinkron dgn bot v7.1):
+#   1. DELTA PATCH (bsdiff)   : build baru bandingin APK lama (versi terakhir
+#      yang ke-install user) vs APK baru → patch KECIL (biasanya 10-30%
+#      ukuran penuh; bagian Flutter engine/lib yang sama = copy murah).
+#      Patch di-upload sebagai asset delta-<old>-<new>.patch + info masuk
+#      build-info.json (delta:{base,url,sha256,size}) → manifest. App yang
+#      versionCode-nya PAS dgn base → cukup unduh patch → dipasang
+#      on-device (bspatch streaming di Kotlin) → APK baru UTUH, byte-identik
+#      dgn APK resmi (bsdiff lossless) → hash cocok → install. Gak cocok /
+#      gagal di step mana pun = fallback OTOMATIS unduh penuh (aman selalu).
+#   2. FORMAT DZRDELTA        : output bsdiff dibingkai ulang (magic DZRDELTA
+#      + 3 blok bzip2 berbatas pasti + newSize) biar app bisa decode
+#      streaming hemat memori (commons-compress 1.21, dependency murni).
+#   3. NOTIF SISTEM           : download = notifikasi progress (persen+MB,
+#      tetep keliatan walau app di-background) → selesai unduh = notif
+#      "Pembaruan siap — ketuk buat install" → install sukses = notif
+#      "Update selesai" (receiver MY_PACKAGE_REPLACED, ketuk = buka app).
+#      Izin POST_NOTIFICATIONS diminta otomatis (Android 13+).
+#   4. CLEANUP DELTA LAMA     : asset delta-*.patch versi lama dibuang
+#      otomatis (cuma jaga patch transisi terbaru) — release gak bengkak.
+#   Fitur v5.5 tetep: build-info.json, SHA-256 manifest, APK ber-versi
+#   (riwayat/rollback), force update, auto-update.
+#
 # FITUR LOG v5.5 (request owner: "1 2 3 4 5 boleh deh gas semua" — 5 fitur
 #                 update sekaligus, sinkron dgn bot v7.0):
 #   1. BUILD-INFO.JSON        : workflow nulis {versionCode, versionName,
@@ -495,13 +521,19 @@ jobs:
 
           // ── 🔄 v5.2: OTA UPDATE TANPA UNINSTALL ──
           // kUpdateUrl = raw URL updates/<pkg>.json di repo ('' = fitur off).
-          // Isi manifest v2 (ditulis bot v7.0 tiap build sukses — semua field
+          // Isi manifest v2 (ditulis bot v7.x tiap build sukses — semua field
           // baru OPSIONAL, manifest lama tetep kebaca):
           //   {"versionCode": <run number naik terus>, "versionName": "1.0.N",
           //    "apk": "<url release apk-<pkg>/app.apk>", "notes": "...",
           //    "sha256": "<hex64 — kosong = skip verifikasi>",
           //    "minVersionCode": 0,   // >0 & app lebih lama = update WAJIB
-          //    "auto": false}         // true = langsung download tanpa dialog
+          //    "auto": false,         // true = langsung download tanpa dialog
+          //    "size": 46000000,      // 🚀 v5.6: ukuran APK (byte, opsional)
+          //    "delta": {"base": 11, "url": "...delta-11-12.patch",
+          //              "sha256": "...", "size": 1200000}}
+          //    // 🚀 v5.6: patch delta ala Play Store — cuma aktif kalo
+          //    // versionCode app PAS sama dgn delta.base; gagal = fallback
+          //    // otomatis unduh APK penuh. Lihat _tryDeltaUpdate.
           // App bandingin versionCode → banner update → download → verifikasi
           // SHA-256 → install in-app. Signature dijaga sama (stable keystore di
           // workflow) → Android nganggep update, data aman, GAK PERLU UNINSTALL.
@@ -596,6 +628,11 @@ jobs:
             bool _updateForce = false;       // minVersionCode > local → dialog GAK bisa di-skip
             bool _updateAuto = false;        // manifest auto:true → langsung download tanpa dialog
             int _updateAutoStartedFor = 0;   // auto mode: versi yang udah dicoba (anti loop)
+
+            // ── 🚀 v5.6: delta update (ala Play Store) + notif sistem ──
+            Map<String, dynamic>? _updateDelta; // {base,url,sha256,size} dari manifest (null = gak ada)
+            int _localCode = 0;              // versionCode app ini (cache buat cek delta.base)
+            int _lastNotifPct = -999;        // throttle notif progress (min 3% antar update)
 
             // ── Settings max-compatibility (intinya: perlakuin webview kayak Chrome) ──
             final InAppWebViewSettings _settings = InAppWebViewSettings(
@@ -799,6 +836,20 @@ jobs:
                     ? rawSha.toLowerCase() : '';
                 final rawMin = int.tryParse("${data['minVersionCode'] ?? ''}") ?? 0;
                 final updAuto = data['auto'] == true;
+                // ── 🚀 v5.6: field delta (opsional — update ala Play Store) ──
+                final rawDelta = data['delta'];
+                Map<String, dynamic>? delta;
+                if (rawDelta is Map) {
+                  final db = int.tryParse('${rawDelta['base'] ?? ''}') ?? 0;
+                  final du = (rawDelta['url'] is String)
+                      ? rawDelta['url'] as String : '';
+                  final ds = (rawDelta['sha256'] is String)
+                      ? (rawDelta['sha256'] as String).toLowerCase() : '';
+                  final dz = int.tryParse('${rawDelta['size'] ?? ''}') ?? 0;
+                  if (db > 0 && du.startsWith('http')) {
+                    delta = {'base': db, 'url': du, 'sha256': ds, 'size': dz};
+                  }
+                }
                 _lastUpdateOk = DateTime.now();
                 final info = await PackageInfo.fromPlatform();
                 final local = int.tryParse(info.buildNumber) ?? 0;
@@ -810,6 +861,8 @@ jobs:
                     _updateVerName = verName;
                     _updateNotes = updNotes;
                     _updateSha256 = updSha;
+                    _updateDelta = delta;   // 🚀 v5.6
+                    _localCode = local;     // 🚀 v5.6 (buat cek delta.base)
                     // 🔒 FORCE: developer pasang versi minimum & app ini di
                     // bawahnya → update wajib (gak bisa nolak).
                     _updateForce = rawMin > 0 && local < rawMin;
@@ -934,10 +987,36 @@ jobs:
                 _updateProgress = 0;
                 _updateProgressTxt = 'Nyambung...';
               });
+              // ── 🔔 v5.6: izin notifikasi (Android 13+) — fire & forget.
+              //    Notif progress bikin update tetep keliatan walau user
+              //    mindahin app ke background (ala Play Store).
+              try { await _updateChannel.invokeMethod('ensureNotifPerm'); } catch (_) {}
+              // ── 🚀 v5.6: DELTA UPDATE dulu (ala Play Store) — kalo manifest
+              //    nyediain patch & versionCode app PAS sama dgn base-nya,
+              //    cukup unduh PATCH KECIL (biasanya 10-30% ukuran penuh) +
+              //    pasang on-device → APK baru utuh. Gagal di step mana pun
+              //    (_tryDeltaUpdate balikin null) = jatuh ke unduh penuh di
+              //    bawah — AMAN SELALU, gak ada skenario stuck.
+              try {
+                final patched = await _tryDeltaUpdate();
+                if (patched != null) {
+                  _updateApkPath = patched;
+                  if (mounted) setState(() => _updateDownloading = false);
+                  await _notifDismiss();
+                  await _notifDone(
+                      'Pembaruan siap di-install',
+                      '✅ v$_updateVerName selesai diunduh (hemat kuota!) — '
+                          'ketuk buat install',
+                      patched);
+                  await _installUpdateApk();
+                  return;
+                }
+              } catch (_) { /* fallback unduh penuh */ }
               HttpClient? hc;
               try {
                 hc = HttpClient();
                 hc.connectionTimeout = const Duration(seconds: 15);
+                _notifProgress(-1, 'Mengunduh pembaruan v$_updateVerName...');
                 // ── 🔄 v5.5: download + verifikasi, maksimal 2 percobaan ──
                 // Hash gak cocok (download korup / putus di tengah) = otomatis
                 // download ulang 1x. Masih gagal juga = error jelas, installer
@@ -964,6 +1043,12 @@ jobs:
                 }
                 _updateApkPath = savedPath;
                 if (mounted) setState(() => _updateDownloading = false);
+                // 🔔 v5.6: progress notif diganti notif "siap install"
+                await _notifDismiss();
+                await _notifDone(
+                    'Pembaruan siap di-install',
+                    '✅ v$_updateVerName selesai diunduh — ketuk buat install',
+                    savedPath);
                 await _installUpdateApk();
               } catch (_) {
                 _updateApkPath = null;
@@ -1015,17 +1100,24 @@ jobs:
                 got += chunk.length;
                 sink.add(chunk);
                 if (mounted) {
-                  setState(() {
-                    var pct = '';
-                    var part = '';
-                    if (total > 0) {
-                      _updateProgress = got / total;
-                      pct = ' — ${(_updateProgress * 100).toStringAsFixed(0)}%';
-                      part = totalTxt;
-                    }
-                    final mb = ((got / 1048576) * 10).round() / 10;
-                    _updateProgressTxt = 'Mengunduh $mb MB$part$pct';
-                  });
+                  var pct = '';
+                  var part = '';
+                  if (total > 0) {
+                    _updateProgress = got / total;
+                    pct = ' — ${(_updateProgress * 100).toStringAsFixed(0)}%';
+                    part = totalTxt;
+                  }
+                  final mb = ((got / 1048576) * 10).round() / 10;
+                  final txt = 'Mengunduh $mb MB$part$pct';
+                  setState(() => _updateProgressTxt = txt);
+                  // 🔔 v5.6: notif progress sistem — throttle min 3% antar
+                  // update biar gak spam (in-app banner tetap real-time).
+                  final pct100 =
+                      total > 0 ? ((got / total) * 100).floor() : -1;
+                  if (pct100 < 0 || pct100 - _lastNotifPct >= 3) {
+                    _lastNotifPct = pct100;
+                    _notifProgress(pct100, txt);
+                  }
                 }
               }
               await sink.close();
@@ -1054,6 +1146,164 @@ jobs:
                 }
               }
               return f.path;
+            }
+
+            // ── 🚀 v5.6: DELTA UPDATE (ala Play Store) ──
+            // Ide: APK baru itu 90%+ isinya SAMA dgn APK yang lagi ke-install
+            // (engine Flutter, lib, resource). Jadi cukup UNDUH PATCH KECIL
+            // (beda-nya doang), terus patch di-aplikasiin ON-DEVICE ke APK
+            // lama (bspatch di Kotlin, streaming hemat memori) → hasilnya
+            // APK baru UTUH yang byte-identik dgn APK resmi (bsdiff itu
+            // lossless) → SHA-256 cocok → install. K hemat kuota & waktu.
+            // Syarat: manifest.delta.base == versionCode app ini (patch cuma
+            // cocok dgn satu versi dasar). Gagal di step mana pun = balikin
+            // null → caller fallback unduh APK penuh. AMAN SELALU.
+            Future<String?> _tryDeltaUpdate() async {
+              final d = _updateDelta;
+              if (d == null) return null;
+              final base = (d['base'] is int) ? d['base'] as int : 0;
+              final url = (d['url'] is String) ? d['url'] as String : '';
+              final dsha = (d['sha256'] is String) ? d['sha256'] as String : '';
+              // Patch cuma valid buat 1 versi dasar — versi kita harus PAS.
+              if (base <= 0 || base != _localCode || !url.startsWith('http')) {
+                return null;
+              }
+              // APK lama = file APK yang lagi ke-install (sourceDir — kebaca
+              // sama app sendiri, gak butuh root). Ini dasar patch-nya.
+              String src = '';
+              try {
+                src = await _updateChannel.invokeMethod('apkSourceDir') ?? '';
+              } catch (_) {}
+              if (src.isEmpty || !File(src).existsSync()) return null;
+              if (mounted) {
+                setState(() => _updateProgressTxt =
+                    'Mode hemat: unduh patch kecil dulu...');
+              }
+              _notifProgress(-1, 'Mengunduh pembaruan (delta)...');
+              HttpClient? hc;
+              try {
+                hc = HttpClient();
+                hc.connectionTimeout = const Duration(seconds: 15);
+                final patchPath = await _downloadPatch(hc, url, dsha);
+                if (patchPath == null) return null;
+                if (mounted) {
+                  setState(() => _updateProgressTxt = 'Memasang pembaruan...');
+                }
+                _notifProgress(-1, 'Memasang pembaruan...');
+                final dir = await getTemporaryDirectory();
+                final outPath = '${dir.path}/update_v$_updateRemoteCode.apk';
+                try {
+                  final old = File(outPath);
+                  if (old.existsSync()) await old.delete();
+                } catch (_) {}
+                // bspatch streaming di native (Kotlin) — balikin "ok" cuma
+                // kalo ukuran hasil PAS dgn APK resmi.
+                final res = await _updateChannel.invokeMethod('applyDeltaPatch',
+                    {'old': src, 'patch': patchPath, 'out': outPath});
+                if (res != 'ok') return null;
+                final outFile = File(outPath);
+                if (!outFile.existsSync() || outFile.lengthSync() < 4) {
+                  return null;
+                }
+                // Verifikasi hasil patch = verifikasi yang SAMA kenceng dgn
+                // unduh penuh: magic byte PK + SHA-256 harus cocok manifest.
+                final raf = await outFile.open(mode: FileMode.read);
+                final head = await raf.read(2);
+                await raf.close();
+                if (head.length < 2 || head[0] != 0x50 || head[1] != 0x4B) {
+                  try { await outFile.delete(); } catch (_) {}
+                  return null;
+                }
+                if (_updateSha256.length == 64) {
+                  var hex = '';
+                  try {
+                    hex = (await sha256.bind(outFile.openRead()).first).toString();
+                  } catch (_) {}
+                  if (hex != _updateSha256) {
+                    try { await outFile.delete(); } catch (_) {}
+                    return null;
+                  }
+                }
+                return outPath;
+              } catch (_) {
+                return null;   // kapan pun gagal → caller pakai unduh penuh
+              } finally {
+                hc?.close();
+              }
+            }
+
+            /// Unduh file patch delta (+ verifikasi SHA-256 patch kalau
+            /// manifest ngasih) → path file, atau null kalo gak valid.
+            Future<String?> _downloadPatch(
+                HttpClient hc, String url, String wantSha) async {
+              try {
+                final req = await hc.getUrl(Uri.parse(url));
+                final resp = await req.close();
+                if (resp.statusCode != 200) return null;
+                final ctype =
+                    (resp.headers.value('content-type') ?? '').toLowerCase();
+                if (ctype.contains('text/html')) return null;
+                final total = resp.contentLength ?? -1;
+                final dir = await getTemporaryDirectory();
+                final f = File(
+                    '${dir.path}/delta_v${_updateDelta?['base'] ?? 0}_v$_updateRemoteCode.patch');
+                final sink = f.openWrite();
+                var got = 0;
+                await for (final chunk in resp) {
+                  got += chunk.length;
+                  sink.add(chunk);
+                  if (total > 0 && mounted) {
+                    final pct = got / total;
+                    final mb =
+                        ((got / 1048576) * 10).round() / 10;
+                    final totalMb =
+                        ((total / 1048576) * 10).round() / 10;
+                    setState(() => _updateProgressTxt =
+                        'Delta: $mb/$totalMb MB — ${(pct * 100).toStringAsFixed(0)}%');
+                    final pct100 = (pct * 100).floor();
+                    if (pct100 - _lastNotifPct >= 3) {
+                      _lastNotifPct = pct100;
+                      _notifProgress(pct100, _updateProgressTxt);
+                    }
+                  }
+                }
+                await sink.close();
+                if (wantSha.length == 64) {
+                  var hex = '';
+                  try {
+                    hex = (await sha256.bind(f.openRead()).first).toString();
+                  } catch (_) {}
+                  if (hex != wantSha) {
+                    try { await f.delete(); } catch (_) {}
+                    return null;
+                  }
+                }
+                return f.path;
+              } catch (_) {
+                return null;
+              }
+            }
+
+            // ── 🔔 v5.6: notifikasi sistem (progress + "selesai") ──
+            // Semua lewat channel native (MainActivity). Gagal = diemin aja —
+            // notif itu bonus, banner in-app tetap sumber utama.
+            Future<void> _notifProgress(int pct, String text) async {
+              try {
+                await _updateChannel
+                    .invokeMethod('notifProgress', {'pct': pct, 'text': text});
+              } catch (_) {}
+            }
+
+            Future<void> _notifDone(
+                String title, String text, String path) async {
+              try {
+                await _updateChannel.invokeMethod(
+                    'notifDone', {'title': title, 'text': text, 'path': path});
+              } catch (_) {}
+            }
+
+            Future<void> _notifDismiss() async {
+              try { await _updateChannel.invokeMethod('notifDismiss'); } catch (_) {}
             }
 
             // Panggil native (MainActivity) buat nampilin installer sistem.
@@ -1625,10 +1875,13 @@ jobs:
           # ── 🔄 v5.2: MainActivity + file_paths.xml (ota in-app update) ──
           # ⚠️ Heredoc: body & terminator PYEOF2 wajib di base indent (kolom 0).
           python3 << 'PYEOF2'
-          import glob, os
+          import glob, os, re
 
-          # 1) Timpa MainActivity.kt — tambah channel "dzr.cloudbuilder/update"
-          #    (installApk + openInstallPermSettings) buat OTA update.
+          # 1) Timpa MainActivity.kt — channel "dzr.cloudbuilder/update".
+          #    v5.2: installApk + openInstallPermSettings (OTA update)
+          #    v5.6: + apkSourceDir & applyDeltaPatch (bspatch delta ala
+          #          Play Store) + notifProgress/notifDone/notifDismiss/
+          #          ensureNotifPerm (notifikasi sistem ala Play Store)
           cands = glob.glob('android/app/src/main/kotlin/**/MainActivity.kt', recursive=True)
           if cands:
               mp = cands[0]
@@ -1637,20 +1890,35 @@ jobs:
               app_pkg = '.'.join(parts[ki + 1:-1])
               kotlin = '''package __APP_PKG__
 
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
           import android.content.Intent
+          import android.content.pm.PackageManager
           import android.net.Uri
           import android.os.Build
           import android.provider.Settings
+          import androidx.core.app.NotificationCompat
           import androidx.core.content.FileProvider
           import io.flutter.embedding.android.FlutterActivity
           import io.flutter.embedding.engine.FlutterEngine
           import io.flutter.plugin.common.MethodChannel
+          import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream
+          import java.io.ByteArrayInputStream
           import java.io.File
+          import java.io.FileOutputStream
+          import java.io.InputStream
+          import java.io.RandomAccessFile
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
 
-          /// v5.2 DZR CloudBuilder — channel OTA update.
+          /// v5.2-v5.6 DZR CloudBuilder — channel OTA update.
           /// installApk(path) -> buka installer sistem. Karena workflow jaga
           /// signature APK tetap sama (stable keystore), Android menganggap ini
           /// UPDATE di atas app lama: data & setting aman, TANPA uninstall.
+          /// v5.6 DELTA (ala Play Store): applyDeltaPatch = bspatch streaming
+          /// (APK lama + patch kecil -> APK baru utuh, byte-identik dgn APK
+          /// resmi) + notifProgress/notifDone (notif sistem update).
           class MainActivity : FlutterActivity() {
               private val channelName = "dzr.cloudbuilder/update"
 
@@ -1661,6 +1929,20 @@ jobs:
                           when (call.method) {
                               "installApk" -> result.success(installApk(call.argument<String>("path") ?: ""))
                               "openInstallPermSettings" -> result.success(openInstallPermSettings())
+                              "apkSourceDir" -> result.success(apkSourceDir())
+                              "applyDeltaPatch" -> result.success(applyDeltaPatch(
+                                  call.argument<String>("old") ?: "",
+                                  call.argument<String>("patch") ?: "",
+                                  call.argument<String>("out") ?: ""))
+                              "notifProgress" -> result.success(notifProgress(
+                                  call.argument<Int>("pct") ?: -1,
+                                  call.argument<String>("text") ?: ""))
+                              "notifDone" -> result.success(notifDone(
+                                  call.argument<String>("title") ?: "",
+                                  call.argument<String>("text") ?: "",
+                                  call.argument<String>("path") ?: ""))
+                              "notifDismiss" -> result.success(notifDismiss())
+                              "ensureNotifPerm" -> result.success(ensureNotifPerm())
                               else -> result.notImplemented()
                           }
                       }
@@ -1675,18 +1957,23 @@ jobs:
                       val f = File(path)
                       if (!f.exists()) return "error:file_not_found"
                       if (!canInstall()) return "settings"
-                      val uri = FileProvider.getUriForFile(
-                          this, packageName + ".fileProvider", f
-                      )
-                      val i = Intent(Intent.ACTION_VIEW)
-                      i.setDataAndType(uri, "application/vnd.android.package-archive")
-                      i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                      startActivity(i)
+                      startActivity(installIntent(f))
                       "ok"
                   } catch (e: Exception) {
                       "error:" + (e.message ?: "unknown")
                   }
+              }
+
+              /// Intent installer sistem (dipake installApk & notif "siap install").
+              private fun installIntent(f: File): Intent {
+                  val uri = FileProvider.getUriForFile(
+                      this, packageName + ".fileProvider", f
+                  )
+                  val i = Intent(Intent.ACTION_VIEW)
+                  i.setDataAndType(uri, "application/vnd.android.package-archive")
+                  i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  return i
               }
 
               private fun openInstallPermSettings(): Boolean {
@@ -1704,6 +1991,206 @@ jobs:
                       false
                   }
               }
+
+              /// Path APK yang lagi ke-install (dasar patch delta — file ini
+              /// kebaca sama app sendiri, gak butuh root).
+              private fun apkSourceDir(): String =
+                  applicationInfo?.sourceDir ?: ""
+
+              // ─── 🚀 v5.6: BSPATCH (delta ala Play Store) — streaming, hemat memori ───
+              // Format patch DZRDELTA (workflow bingkai ulang output bsdiff):
+              //   [8B "DZRDELTA"][4B ver=1 LE][4B ctrlLen LE][4B diffLen LE]
+              //   [4B extraLen LE][8B newSize LE][ctrl.bz2][diff.bz2][extra.bz2]
+              // Isi blok = bsdiff standar: triple kontrol add/copy/seek
+              // BIG-endian signed 64-bit; new = old+diff (mod 256) utk 'add'
+              // byte, lalu salin 'copy' byte dari blok extra, lalu oldPos
+              // geser 'seek'. Old APK dibaca RandomAccessFile (gak di-load
+              // utuh), patch di-decode streaming → peak memori ~1MB.
+              private fun applyDeltaPatch(oldPath: String, patchPath: String, outPath: String): String {
+                  var old: RandomAccessFile? = null
+                  var out: FileOutputStream? = null
+                  try {
+                      val pf = File(patchPath)
+                      if (!pf.exists() || pf.length() < 32L) return "error:bad_patch"
+                      val pb = pf.readBytes()
+                      val magic = byteArrayOf(0x44, 0x5A, 0x52, 0x44, 0x45, 0x4C, 0x54, 0x41)
+                      for (i in 0 until 8) {
+                          if (pb[i] != magic[i]) return "error:bad_magic"
+                      }
+                      val bb = ByteBuffer.wrap(pb, 8, 24).order(ByteOrder.LITTLE_ENDIAN)
+                      if (bb.int != 1) return "error:bad_version"
+                      val ctrlLen = bb.int
+                      val diffLen = bb.int
+                      val extraLen = bb.int
+                      val newSize = bb.long
+                      if (ctrlLen < 0 || diffLen < 0 || extraLen < 0) return "error:bad_len"
+                      if (32L + ctrlLen + diffLen + extraLen > pb.size.toLong()) return "error:bad_len"
+                      val off = 32
+                      val ctrl = BZip2CompressorInputStream(ByteArrayInputStream(pb, off, ctrlLen))
+                      val diff = BZip2CompressorInputStream(ByteArrayInputStream(pb, off + ctrlLen, diffLen))
+                      val extra = BZip2CompressorInputStream(ByteArrayInputStream(pb, off + ctrlLen + diffLen, extraLen))
+                      old = RandomAccessFile(oldPath, "r")
+                      out = FileOutputStream(File(outPath))
+                      var newPos = 0L
+                      var oldPos = 0L
+                      val hdr = ByteArray(24)
+                      val bufD = ByteArray(65536)
+                      val bufO = ByteArray(65536)
+                      while (true) {
+                          if (!readFully(ctrl, hdr, 24)) break
+                          val add = beLong(hdr, 0)
+                          val copy = beLong(hdr, 8)
+                          val seek = beLong(hdr, 16)
+                          if (add < 0 || copy < 0) return "error:bad_ctrl"
+                          if (oldPos + add + copy > old.length()) return "error:old_too_short"
+                          var rem = add
+                          while (rem > 0L) {
+                              val n = if (rem > 65536L) 65536 else rem.toInt()
+                              if (!readFully(diff, bufD, n)) return "error:patch_truncated"
+                              old.seek(oldPos)
+                              old.readFully(bufO, 0, n)
+                              for (i in 0 until n) bufO[i] = (bufO[i] + bufD[i]).toByte()
+                              out.write(bufO, 0, n)
+                              oldPos += n
+                              newPos += n
+                              rem -= n
+                          }
+                          rem = copy
+                          while (rem > 0L) {
+                              val n = if (rem > 65536L) 65536 else rem.toInt()
+                              if (!readFully(extra, bufD, n)) return "error:patch_truncated"
+                              out.write(bufD, 0, n)
+                              newPos += n
+                              rem -= n
+                          }
+                          oldPos += seek
+                      }
+                      out.flush()
+                      old.close(); old = null
+                      out.close(); out = null
+                      ctrl.close(); diff.close(); extra.close()
+                      val outLen = File(outPath).length()
+                      if (newSize <= 0L) return "error:bad_newsize"
+                      return if (outLen == newSize) "ok" else "error:size_mismatch"
+                  } catch (e: Exception) {
+                      return "error:" + (e.message ?: "unknown")
+                  } finally {
+                      try { old?.close() } catch (e: Exception) {}
+                      try { out?.close() } catch (e: Exception) {}
+                  }
+              }
+
+              private fun readFully(inp: InputStream, buf: ByteArray, len: Int): Boolean {
+                  var off = 0
+                  while (off < len) {
+                      val n = inp.read(buf, off, len - off)
+                      if (n < 0) return false
+                      off += n
+                  }
+                  return true
+              }
+
+              /// Decode 8 byte BIG-endian → signed Long (bit pattern two's
+              /// complement — persis format triple kontrol bsdiff).
+              private fun beLong(b: ByteArray, o: Int): Long {
+                  var v = 0L
+                  for (i in 0 until 8) v = (v shl 8) or (b[o + i].toLong() and 0xFF)
+                  return v
+              }
+
+              // ─── 🔔 v5.6: NOTIFIKASI SISTEM (progress + "update selesai") ───
+              private fun notifChannels() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                      if (nm.getNotificationChannel("dzr_update") == null) {
+                          val ch = NotificationChannel(
+                              "dzr_update", "Pembaruan Aplikasi",
+                              NotificationManager.IMPORTANCE_LOW
+                          )
+                          ch.setShowBadge(false)
+                          nm.createNotificationChannel(ch)
+                      }
+                      if (nm.getNotificationChannel("dzr_update_done") == null) {
+                          nm.createNotificationChannel(
+                              NotificationChannel(
+                                  "dzr_update_done", "Pembaruan Selesai",
+                                  NotificationManager.IMPORTANCE_DEFAULT
+                              )
+                          )
+                      }
+                  }
+              }
+
+              private fun canShowNotif(): Boolean =
+                  Build.VERSION.SDK_INT < 33 ||
+                      checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+                          PackageManager.PERMISSION_GRANTED
+
+              /// Minta izin notifikasi (Android 13+) — fire & forget dari Dart.
+              private fun ensureNotifPerm(): Boolean {
+                  return try {
+                      if (Build.VERSION.SDK_INT >= 33 && !canShowNotif()) {
+                          requestPermissions(
+                              arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 9001
+                          )
+                      }
+                      true
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+
+              /// Notif progress download/patch (ongoing + silent). pct < 0 = spinner.
+              private fun notifProgress(pct: Int, text: String): Boolean {
+                  return try {
+                      notifChannels()
+                      if (!canShowNotif()) return false
+                      val b = NotificationCompat.Builder(this, "dzr_update")
+                          .setSmallIcon(android.R.drawable.stat_sys_download)
+                          .setContentTitle("Lagi update aplikasi...")
+                          .setContentText(text)
+                          .setOngoing(true)
+                          .setOnlyAlertOnce(true)
+                          .setProgress(100, if (pct < 0) 0 else pct, pct < 0)
+                      (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+                          .notify(4201, b.build())
+                      true
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+
+              /// Notif "selesai diunduh — ketuk buat install" (ala Play Store).
+              private fun notifDone(title: String, text: String, path: String): Boolean {
+                  return try {
+                      notifChannels()
+                      if (!canShowNotif()) return false
+                      val b = NotificationCompat.Builder(this, "dzr_update")
+                          .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                          .setContentTitle(title)
+                          .setContentText(text)
+                          .setAutoCancel(true)
+                      if (path.isNotEmpty() && File(path).exists()) {
+                          b.setContentIntent(PendingIntent.getActivity(
+                              this, 4203, installIntent(File(path)),
+                              PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
+                      }
+                      (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+                          .notify(4202, b.build())
+                      true
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+
+              private fun notifDismiss(): Boolean {
+                  return try {
+                      (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).cancel(4201)
+                      true
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
           }
           '''
               # CATATAN: gak perlu strip indent manual — YAML block scalar
@@ -1712,10 +2199,120 @@ jobs:
               kotlin = kotlin.replace('__APP_PKG__', app_pkg)
               open(mp, 'w', encoding='utf-8').write(kotlin)
               print('MainActivity patched:', app_pkg)
-          else:
-              print('WARNING: MainActivity.kt gak ketemu — OTA install channel off')
 
-          # 2) res/xml/file_paths.xml — path yang boleh dibagi FileProvider
+              # 2) 🔔 UpdateDoneReceiver.kt — notif "Update selesai" ala Play
+              #    Store. Sistem kirim MY_PACKAGE_REPLACED pas app ke-install
+              #    versi baru (update beneran selesai) — app gak perlu jalan.
+              #    Broadcast ini PROTECTED (cuma sistem bisa kirim) → aman.
+              rcp = mp.replace('MainActivity.kt', 'UpdateDoneReceiver.kt')
+              recv = '''package __APP_PKG__
+
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Build
+          import androidx.core.app.NotificationCompat
+
+          class UpdateDoneReceiver : BroadcastReceiver() {
+              override fun onReceive(ctx: Context, intent: Intent) {
+                  if (intent.action != Intent.ACTION_MY_PACKAGE_REPLACED) return
+                  try {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                          if (nm.getNotificationChannel("dzr_update_done") == null) {
+                              nm.createNotificationChannel(
+                                  NotificationChannel(
+                                      "dzr_update_done", "Pembaruan Selesai",
+                                      NotificationManager.IMPORTANCE_DEFAULT
+                                  )
+                              )
+                          }
+                      }
+                      var vname = ""
+                      try {
+                          vname = ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: ""
+                      } catch (e: Exception) {}
+                      val b = NotificationCompat.Builder(ctx, "dzr_update_done")
+                          .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                          .setContentTitle("Update selesai ✅")
+                          .setContentText("Aplikasi sekarang v$vname — ketuk buat buka")
+                          .setAutoCancel(true)
+                      val launch = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)
+                      if (launch != null) {
+                          b.setContentIntent(
+                              PendingIntent.getActivity(
+                                  ctx, 4204, launch,
+                                  PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                              )
+                          )
+                      }
+                      (ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+                          .notify(4205, b.build())
+                  } catch (e: Exception) {}
+              }
+          }
+          '''
+              recv = recv.replace('__APP_PKG__', app_pkg)
+              open(rcp, 'w', encoding='utf-8').write(recv)
+              print('UpdateDoneReceiver patched:', app_pkg)
+          else:
+              print('WARNING: MainActivity.kt gak ketemu — OTA install channel off, delta OFF')
+
+          # 3) 🔔 AndroidManifest: izin notifikasi (Android 13+) + daftarin
+          #    receiver "update selesai" (full class name = butuh app_pkg).
+          mfile = 'android/app/src/main/AndroidManifest.xml'
+          if os.path.exists(mfile) and cands:
+              man = open(mfile, encoding='utf-8').read()
+              changed = False
+              if 'android.permission.POST_NOTIFICATIONS' not in man:
+                  man = man.replace(
+                      '<application',
+                      '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n    <application',
+                      1)
+                  changed = True
+              if 'UpdateDoneReceiver' not in man:
+                  rcv = ('<receiver android:name="' + app_pkg + '.UpdateDoneReceiver"'
+                         ' android:exported="true">'
+                         '<intent-filter>'
+                         '<action android:name="android.intent.action.MY_PACKAGE_REPLACED" />'
+                         '</intent-filter></receiver>')
+                  man = man.replace('</application>', '    ' + rcv + '\n    </application>', 1)
+                  changed = True
+              if changed:
+                  open(mfile, 'w', encoding='utf-8').write(man)
+                  print('Manifest notif patch: OK')
+
+          # 4) 🚀 commons-compress 1.21 (BZip2) — dependency bspatch delta.
+          #    Murni Java library, gak nambah permisi, ~600KB. Patch ke blok
+          #    `dependencies {` kalau ada, kalo gak append blok baru (Gradle
+          #    nerima banyak blok dependencies).
+          patched_dep = False
+          for grad, line in (('android/app/build.gradle',
+                              "implementation 'org.apache.commons:commons-compress:1.21'"),
+                             ('android/app/build.gradle.kts',
+                              'implementation("org.apache.commons:commons-compress:1.21")')):
+              if patched_dep or not os.path.exists(grad):
+                  continue
+              g = open(grad, encoding='utf-8').read()
+              if 'commons-compress' in g:
+                  patched_dep = True
+                  print('commons-compress: udah ada di ' + grad)
+                  break
+              m2 = re.search(r'^dependencies\s*\{', g, re.M)
+              if m2:
+                  g = g[:m2.end()] + '\n    ' + line + g[m2.end():]
+              else:
+                  g = g + '\ndependencies {\n    ' + line + '\n}\n'
+              open(grad, 'w', encoding='utf-8').write(g)
+              patched_dep = True
+              print('commons-compress dep: OK (' + grad + ')')
+          if not patched_dep:
+              print('WARNING: build.gradle gak ketemu — delta patch OFF (update penuh tetap jalan)')
+
+          # 5) res/xml/file_paths.xml — path yang boleh dibagi FileProvider
           os.makedirs('android/app/src/main/res/xml', exist_ok=True)
           with open('android/app/src/main/res/xml/file_paths.xml', 'w', encoding='utf-8') as f:
               f.write('<?xml version="1.0" encoding="utf-8"?>\n'
@@ -1952,16 +2549,92 @@ jobs:
 
           # ── Kanal OTA: release apk-<pkg> asset app.apk (rolling) ──
           # 🔄 v5.5: + APK ber-versi (app-1.0.N.apk buat riwayat/rollback)
-          #          + build-info.json (versionCode/sha256 → bot v7.0 manifest v2)
+          #          + build-info.json (versionCode/sha256 → bot manifest v2)
+          # 🚀 v5.6: + delta patch ala Play Store (asset delta-<old>-<new>.patch
+          #          + field delta di build-info.json)
           PKG="$(echo "${INPUT_PACKAGE_NAME:-}" | sed 's/[^a-zA-Z0-9.]//g' | sed 's/^\.*//' | sed 's/\.*$//')"
           [ -z "$PKG" ] && PKG="com.deruzuan.webapp"
           cp "$APK" /tmp/app.apk
           # SHA-256 APK signed (sumber kebenaran hash buat verifikasi app)
           APK_SHA="$(sha256sum /tmp/app.apk | cut -d' ' -f1)"
           RUN_NO="${GITHUB_RUN_NUMBER:-1}"
-          printf '{"package":"%s","versionCode":%s,"versionName":"1.0.%s","sha256":"%s","builtAt":"%s"}\n' \
-            "$PKG" "$RUN_NO" "$RUN_NO" "$APK_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /tmp/build-info.json
-          echo "🔧 build-info.json: v1.0.$RUN_NO sha256=$APK_SHA"
+
+          # ── 🚀 v5.6: DELTA PATCH (ala Play Store) ──
+          # Bandingin APK versi terakhir yang ke-install user vs APK baru →
+          # patch KECIL. App yang versionCode-nya PAS dgn base cukup unduh
+          # patch (biasanya 10-30% ukuran penuh; bagian engine/lib yang sama
+          # = copy murah) + pasang on-device (bspatch) → APK baru UTUH,
+          # byte-identik dgn APK resmi (bsdiff lossless) → SHA-256 cocok.
+          # WAJIB jalan SEBELUM app.apk lama ke-clobber! Gagal di step mana
+          # pun = NON-FATAL (delta gak di-upload, app unduh penuh, aman).
+          DELTA_JSON=""
+          OLD_VC=""
+          if sudo apt-get install -y --no-install-recommends bsdiff >/dev/null 2>&1; then
+            BTD="$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* 2>/dev/null | sort -V | tail -1)"
+            rm -f /tmp/old.apk /tmp/bsdiff.raw /tmp/delta.patch /tmp/delta-info.json
+            # APK lama: versi ber-versi terakhir (code < run ini) → paling akurat
+            OLD_URL=$(gh api "repos/${GH_REPO}/releases/tags/apk-$PKG" --jq '.assets[] | select((.name|test("^app-[0-9]+\\.[0-9]+\\.[0-9]+\\.apk$"))) | .browser_download_url + " " + .name' 2>/dev/null | awk -v run="$RUN_NO" '{n=$2; sub(/^app-[0-9]+\.[0-9]+\./,"",n); sub(/\.apk$/,"",n); if ((n+0)<(run+0) && (n+0)>best) {best=n+0; u=$1}} END {if (best>0) print u}')
+            if [ -z "$OLD_URL" ]; then
+              # fallback: app.apk rolling (= build sukses terakhir) — karena
+              # belum di-clobber, isi-nya masih APK versi sebelumnya
+              OLD_URL="https://github.com/${GH_REPO}/releases/download/apk-$PKG/app.apk"
+            fi
+            echo "⬇️  Download APK lama buat delta: $OLD_URL"
+            curl -sL --retry 2 --max-time 300 -o /tmp/old.apk "$OLD_URL" || true
+            if [ -s /tmp/old.apk ] && [ -n "$BTD" ] && [ -x "$BTD/aapt" ]; then
+              OLD_VC=$("$BTD/aapt" dump badging /tmp/old.apk 2>/dev/null | head -1 | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p")
+            fi
+            if [ -s /tmp/old.apk ] && [ -n "$OLD_VC" ] && [ "$OLD_VC" -gt 0 ] && [ "$OLD_VC" -lt "$RUN_NO" ] 2>/dev/null; then
+              echo "🔀 Bikin delta patch: v$OLD_VC → v$RUN_NO (bsdiff, bisa 1-3 menit)..."
+              if bsdiff /tmp/old.apk /tmp/app.apk /tmp/bsdiff.raw; then
+                # Bingkai ulang → format DZRDELTA (3 blok bzip2 berbatas
+                # pasti + newSize) — app decode streaming hemat memori.
+                # ⚠️ Heredoc: konten & terminator wajib di base indent.
+                python3 << 'PYEOF3'
+          import struct, bz2, hashlib, json
+          src = open('/tmp/bsdiff.raw', 'rb').read()
+          assert src[:8] == b'BSDIFF40', 'bukan output bsdiff'
+          ctrl_len, diff_len, extra_len, newsize = struct.unpack('>QQQq', src[8:40])
+          body = src[40:]
+          d1 = bz2.BZ2Decompressor(); c = d1.decompress(body); r1 = d1.unused_data
+          d2 = bz2.BZ2Decompressor(); df = d2.decompress(r1); r2 = d2.unused_data
+          d3 = bz2.BZ2Decompressor(); ex = d3.decompress(r2); r3 = d3.unused_data
+          assert len(c) == ctrl_len and len(df) == diff_len and len(ex) == extra_len, 'ukuran blok bsdiff gak cocok'
+          l1 = len(body) - len(r1)
+          l2 = len(r1) - len(r2)
+          l3 = len(r2) - len(r3)
+          out = b'DZRDELTA' + struct.pack('<I', 1) + struct.pack('<III', l1, l2, l3) + struct.pack('<q', newsize) + body[:l1] + body[l1:l1+l2] + body[l1+l2:l1+l2+l3]
+          open('/tmp/delta.patch', 'wb').write(out)
+          sha = hashlib.sha256(out).hexdigest()
+          json.dump({'size': len(out), 'sha256': sha, 'newSize': newsize}, open('/tmp/delta-info.json', 'w'))
+          print('DZR frame: ctrl=%d diff=%d extra=%d newSize=%d' % (l1, l2, l3, newsize))
+          PYEOF3
+              else
+                echo "WARNING: bsdiff gagal — delta skip (non-fatal)"
+              fi
+            else
+              echo "ℹ️ APK lama gak ketemu/gak valid — delta skip (build pertama kanal ini normal)"
+            fi
+            if [ -s /tmp/delta.patch ] && [ -s /tmp/delta-info.json ] && [ -n "$OLD_VC" ]; then
+              DELTA_SIZE=$(stat -c%s /tmp/delta.patch)
+              APK_SIZE=$(stat -c%s /tmp/app.apk)
+              # cuma worth-it kalo patch jauh lebih kecil dari unduh penuh (< 75%)
+              if [ "$DELTA_SIZE" -lt $((APK_SIZE * 75 / 100)) ]; then
+                DELTA_SHA=$(python3 -c "import json;print(json.load(open('/tmp/delta-info.json'))['sha256'])")
+                DELTA_JSON=",\"size\":$APK_SIZE,\"delta\":{\"base\":$OLD_VC,\"url\":\"https://github.com/${GH_REPO}/releases/download/apk-$PKG/delta-${OLD_VC}-${RUN_NO}.patch\",\"sha256\":\"$DELTA_SHA\",\"size\":$DELTA_SIZE}"
+                echo "🚀 Delta worth-it: $DELTA_SIZE byte = $((DELTA_SIZE * 100 / APK_SIZE))% dari ukuran penuh"
+              else
+                echo "ℹ️ Delta gak worth-it ($DELTA_SIZE vs $APK_SIZE byte) — skip, user unduh penuh"
+                rm -f /tmp/delta.patch /tmp/delta-info.json
+              fi
+            fi
+          else
+            echo "WARNING: bsdiff gak ke-install — delta skip (non-fatal, update penuh tetap jalan)"
+          fi
+
+          printf '{"package":"%s","versionCode":%s,"versionName":"1.0.%s","sha256":"%s","builtAt":"%s"%s}\n' \
+            "$PKG" "$RUN_NO" "$RUN_NO" "$APK_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$DELTA_JSON" > /tmp/build-info.json
+          echo "🔧 build-info.json: v1.0.$RUN_NO sha256=$APK_SHA ${DELTA_JSON:+(delta ✓)}"
           cp "$APK" "/tmp/app-1.0.$RUN_NO.apk"
           if gh release view "apk-$PKG" >/dev/null 2>&1; then
             gh release upload "apk-$PKG" /tmp/app.apk --clobber \
@@ -1972,9 +2645,25 @@ jobs:
             gh release upload "apk-$PKG" "/tmp/app-1.0.$RUN_NO.apk" --clobber \
               && echo "🗂️ APK ber-versi: app-1.0.$RUN_NO.apk (buat riwayat/rollback)" \
               || echo "WARNING: upload APK ber-versi gagal (non-fatal)"
+            # 🚀 v5.6: delta patch — kalo kebentuk & worth-it
+            if [ -s /tmp/delta.patch ]; then
+              gh release upload "apk-$PKG" /tmp/delta.patch --clobber \
+                && echo "🚀 Delta asset: delta-${OLD_VC}-${RUN_NO}.patch (update hemat kuota AKTIF)" \
+                || echo "WARNING: upload delta gagal (non-fatal — app bakal unduh penuh)"
+            fi
             gh release upload "apk-$PKG" /tmp/build-info.json --clobber \
-              && echo "🔧 build-info.json ter-upload (bot v7.0 pake ini)" \
+              && echo "🔧 build-info.json ter-upload (bot pake ini buat manifest OTA)" \
               || echo "WARNING: upload build-info gagal (non-fatal)"
+            # 🧹 v5.6: buang delta patch lama (cuma jaga transisi terbaru)
+            if [ -n "$OLD_VC" ]; then
+              gh api "repos/${GH_REPO}/releases/tags/apk-$PKG" --jq '.assets[] | select((.name|test("^delta-[0-9]+-[0-9]+\\.patch$"))) | [.id, .name] | @tsv' 2>/dev/null | \
+              while IFS=$'\t' read -r aid aname; do
+                if [ "$aname" != "delta-${OLD_VC}-${RUN_NO}.patch" ]; then
+                  gh api -X DELETE "repos/${GH_REPO}/releases/assets/$aid" >/dev/null 2>&1 || true
+                  echo "🧹 Delta lama dibuang: $aname"
+                fi
+              done
+            fi
           else
             gh release create "apk-$PKG" /tmp/app.apk "/tmp/app-1.0.$RUN_NO.apk" /tmp/build-info.json \
               --title "OTA $PKG" --notes "Build terbaru — kanal auto-update" \
