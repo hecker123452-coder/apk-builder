@@ -1,9 +1,29 @@
 name: Web2APK
 
 # ============================================================================
-# DZR CloudBuilder — Web2APK Workflow v5.3 (🚀 AUTO-UPDATE FULL AUTO: DIALOG
-#                            LANGSUNG + AUTO-RESUME INSTALL, TANPA TUTORIAL)
+# DZR CloudBuilder — Web2APK Workflow v5.5 (🔄 OTA SUPERSET: SHA-256 VERIFIKA
+#                            + FORCE UPDATE + AUTO-UPDATE + RIWAYAT VERSI)
 # ============================================================================
+# FITUR LOG v5.5 (request owner: "1 2 3 4 5 boleh deh gas semua" — 5 fitur
+#                 update sekaligus, sinkron dgn bot v7.0):
+#   1. BUILD-INFO.JSON        : workflow nulis {versionCode, versionName,
+#      sha256, builtAt} sebagai asset release `apk-<pkg>` → bot (v7.0) tarik
+#      file ini buat manifest v2 + monitor auto-heal. Kecil (200 byte),
+#      hemat — bot GAK perlu download APK utuh cuma buat baca hash.
+#   2. SHA-256 DI MANIFEST    : hash APK signed masuk manifest
+#      updates/<pkg>.json → app verifikasi file download SEBELUM install.
+#      Hash gak cocok = otomatis download ulang 1x, masih gagal = error jelas
+#      (bukan "App not installed" misterius). Manifest tanpa sha256 (workflow
+#      lama) = app skip verifikasi → backward compatible.
+#   3. APK BER-VERSI          : build sukses nyimpen app-1.0.N.apk di release
+#      (selain app.apk rolling) → riwayat versi + rollback dari bot. Retensi
+#      3 terakhir (bot v7.0 yang buang sisanya).
+#   4. FORCE + AUTO-UPDATE    : manifest field baru minVersionCode (dialog
+#      update tanpa tombol [Nanti]) & auto (langsung download tanpa dialog).
+#      Diatur dari bot (⚙️ Kelola APK), app baca otomatis.
+#   Fitur v5.3 tetep: dialog update langsung, auto-resume install, retry awal,
+#   anti APK corrupt (magic byte), progress persen+MB, keystore stabil.
+#
 # FIX LOG v5.3 (request owner: "pas user pakek trus ada yang versi terbaru
 #                langsung di suruh update trus nanti update selesai jangan
 #                pakek tutor update gak berfungsi gak kayak di apk2 lain"):
@@ -320,7 +340,7 @@ jobs:
           # ^8 / ^2.1 = pin MAJOR doang (solver pilih minor yg kompatibel) —
           # API-nya stabil lintas minor: PackageInfo.fromPlatform &
           # getTemporaryDirectory gak pernah berubah.
-          flutter pub add flutter_inappwebview:6.1.5 url_launcher:6.3.2 'package_info_plus:^8.0.0' 'path_provider:^2.1.0'
+          flutter pub add flutter_inappwebview:6.1.5 url_launcher:6.3.2 'package_info_plus:^8.0.0' 'path_provider:^2.1.0' 'crypto:^3.0.3'
 
           # ── HTML mode: siapin assets + daftarin ke pubspec ──
           # v5.0: ZIP situs offline = copy SELURUH isi site (css/js/img),
@@ -456,6 +476,7 @@ jobs:
           import 'package:package_info_plus/package_info_plus.dart';
           import 'package:path_provider/path_provider.dart';
           import 'package:url_launcher/url_launcher.dart';
+          import 'package:crypto/crypto.dart';   // 🔄 v5.5: verifikasi SHA-256 APK update
 
           void main() {
             runApp(const WebViewApp());
@@ -474,12 +495,16 @@ jobs:
 
           // ── 🔄 v5.2: OTA UPDATE TANPA UNINSTALL ──
           // kUpdateUrl = raw URL updates/<pkg>.json di repo ('' = fitur off).
-          // Isi manifest (ditulis bot tiap build sukses):
+          // Isi manifest v2 (ditulis bot v7.0 tiap build sukses — semua field
+          // baru OPSIONAL, manifest lama tetep kebaca):
           //   {"versionCode": <run number naik terus>, "versionName": "1.0.N",
-          //    "apk": "<url release apk-<pkg>/app.apk>", "notes": "..."}
-          // App bandingin versionCode → banner update → download → install
-          // in-app. Signature dijaga sama (stable keystore di workflow) →
-          // Android nganggep update, data aman, GAK PERLU UNINSTALL.
+          //    "apk": "<url release apk-<pkg>/app.apk>", "notes": "...",
+          //    "sha256": "<hex64 — kosong = skip verifikasi>",
+          //    "minVersionCode": 0,   // >0 & app lebih lama = update WAJIB
+          //    "auto": false}         // true = langsung download tanpa dialog
+          // App bandingin versionCode → banner update → download → verifikasi
+          // SHA-256 → install in-app. Signature dijaga sama (stable keystore di
+          // workflow) → Android nganggep update, data aman, GAK PERLU UNINSTALL.
           const String kUpdateUrl = '__UPDATE_URL__';
 
           class WebViewApp extends StatelessWidget {
@@ -565,6 +590,12 @@ jobs:
             bool _updateRetrying = false;    // guard auto-resume install
             bool _checkingUpdate = false;    // guard biar cek gak tumpang tindih
             DateTime? _lastUpdateOk;         // cek sukses terakhir (throttle resume)
+
+            // ── 🔄 v5.5: OTA superset state (sinkron bot v7.0) ──
+            String _updateSha256 = '';       // hash APK dari manifest (kosong = skip verifikasi)
+            bool _updateForce = false;       // minVersionCode > local → dialog GAK bisa di-skip
+            bool _updateAuto = false;        // manifest auto:true → langsung download tanpa dialog
+            int _updateAutoStartedFor = 0;   // auto mode: versi yang udah dicoba (anti loop)
 
             // ── Settings max-compatibility (intinya: perlakuin webview kayak Chrome) ──
             final InAppWebViewSettings _settings = InAppWebViewSettings(
@@ -762,6 +793,12 @@ jobs:
                     : '1.0.$remote';
                 final rawNotes = data['notes'];
                 final updNotes = (rawNotes is String) ? rawNotes.trim() : '';
+                // ── 🔄 v5.5: field manifest v2 (semua opsional = kompatibel) ──
+                final rawSha = data['sha256'];
+                final updSha = (rawSha is String && rawSha.length == 64)
+                    ? rawSha.toLowerCase() : '';
+                final rawMin = int.tryParse("${data['minVersionCode'] ?? ''}") ?? 0;
+                final updAuto = data['auto'] == true;
                 _lastUpdateOk = DateTime.now();
                 final info = await PackageInfo.fromPlatform();
                 final local = int.tryParse(info.buildNumber) ?? 0;
@@ -772,9 +809,26 @@ jobs:
                     _updateApkUrl = apkUrl;
                     _updateVerName = verName;
                     _updateNotes = updNotes;
+                    _updateSha256 = updSha;
+                    // 🔒 FORCE: developer pasang versi minimum & app ini di
+                    // bawahnya → update wajib (gak bisa nolak).
+                    _updateForce = rawMin > 0 && local < rawMin;
+                    // 🤖 AUTO kalah sama FORCE (yang wajib, tetap dialog).
+                    _updateAuto = updAuto && !_updateForce;
                   });
-                  // 🚀 v5.3: bukan cuma banner — user LANGSUNG disuruh update
-                  _maybeShowUpdateDialog();
+                  if (_updateAuto) {
+                    // 🤖 v5.5 AUTO: user udah set auto-update → tanpa dialog,
+                    // langsung download (progress keliatan di banner hijau).
+                    // Satu percobaan per versi per sesi (anti loop kalau
+                    // install ditolak terus-menerus).
+                    if (_updateAutoStartedFor < remote) {
+                      _updateAutoStartedFor = remote;
+                      await _startUpdate();
+                    }
+                  } else {
+                    // 🚀 v5.3: bukan cuma banner — user LANGSUNG disuruh update
+                    _maybeShowUpdateDialog();
+                  }
                 }
               } catch (_) {
                 // Offline / manifest belum ada / JSON rusak — diemin aja.
@@ -789,11 +843,13 @@ jobs:
             //    Sekali per versi per sesi biar gak nge-spam user.
             void _maybeShowUpdateDialog() {
               if (!mounted || !_updateVisible || _updateDownloading) return;
-              if (_updateDialogShownFor >= _updateRemoteCode) return;
-              _updateDialogShownFor = _updateRemoteCode;
+              // 🔒 v5.5 FORCE: dialog GAK diinget per versi → kalau ditutup
+              // (back button), cek berikutnya muncul LAGI. Gak ada jalan kabur.
+              if (!_updateForce && _updateDialogShownFor >= _updateRemoteCode) return;
+              if (!_updateForce) _updateDialogShownFor = _updateRemoteCode;
               showDialog<void>(
                 context: context,
-                barrierDismissible: true,
+                barrierDismissible: !_updateForce,
                 builder: (ctx) => AlertDialog(
                   backgroundColor: _dark ? const Color(0xFF1E1E1E) : null,
                   title: Row(
@@ -820,10 +876,13 @@ jobs:
                         color: _dark ? Colors.grey.shade200 : Colors.black87),
                   ),
                   actions: [
-                    TextButton(
-                      onPressed: () => Navigator.of(ctx).pop(),
-                      child: const Text('Nanti'),
-                    ),
+                    // 🔒 v5.5 FORCE: tanpa tombol [Nanti] — satu-satunya jalan
+                    // keluar adalah update-nya sendiri.
+                    if (!_updateForce)
+                      TextButton(
+                        onPressed: () => Navigator.of(ctx).pop(),
+                        child: const Text('Nanti'),
+                      ),
                     FilledButton.icon(
                       onPressed: () {
                         Navigator.of(ctx).pop();
@@ -879,52 +938,31 @@ jobs:
               try {
                 hc = HttpClient();
                 hc.connectionTimeout = const Duration(seconds: 15);
-                final req = await hc.getUrl(Uri.parse(_updateApkUrl));
-                final resp = await req.close();
-                if (resp.statusCode != 200) {
-                  throw Exception('HTTP ${resp.statusCode}');
-                }
-                // Guard v5.3: GitHub kadang bales HTML (error page) — jangan
-                // disimpen jadi .apk terus install gagal misterius.
-                final ctype =
-                    (resp.headers.value('content-type') ?? '').toLowerCase();
-                if (ctype.contains('text/html')) {
-                  throw Exception('respons HTML, bukan APK');
-                }
-                final total = resp.contentLength ?? -1;
-                final totalTxt =
-                    total > 0 ? ' dari ${((total / 1048576) * 10).round() / 10} MB' : '';
-                final dir = await getTemporaryDirectory();
-                final f = File('${dir.path}/update_v${_updateRemoteCode}.apk');
-                final sink = f.openWrite();
-                var got = 0;
-                await for (final chunk in resp) {
-                  got += chunk.length;
-                  sink.add(chunk);
-                  if (mounted) {
-                    setState(() {
-                      var pct = '';
-                      var part = '';
-                      if (total > 0) {
-                        _updateProgress = got / total;
-                        pct = ' — ${(_updateProgress * 100).toStringAsFixed(0)}%';
-                        part = totalTxt;
-                      }
-                      final mb = ((got / 1048576) * 10).round() / 10;
-                      _updateProgressTxt = 'Mengunduh $mb MB$part$pct';
-                    });
+                // ── 🔄 v5.5: download + verifikasi, maksimal 2 percobaan ──
+                // Hash gak cocok (download korup / putus di tengah) = otomatis
+                // download ulang 1x. Masih gagal juga = error jelas, installer
+                // GAK dibukain file rusak (bukan "App not installed" misterius).
+                String? savedPath;
+                for (int attempt = 1; attempt <= 2 && savedPath == null; attempt++) {
+                  if (attempt == 2 && mounted) {
+                    setState(() => _updateProgressTxt = 'File gak valid — download ulang...');
                   }
+                  savedPath = await _downloadAndVerifyApk(hc);
                 }
-                await sink.close();
-                // Magic byte check v5.3: APK valid selalu mulai "PK" (zip).
-                final raf = await f.open(mode: FileMode.read);
-                final head = await raf.read(2);
-                await raf.close();
-                if (head.length < 2 || head[0] != 0x50 || head[1] != 0x4B) {
-                  try { await f.delete(); } catch (_) {}
-                  throw Exception('file download rusak');
+                if (savedPath == null) {
+                  // 2x hash mismatch → stop, jangan buka installer
+                  if (mounted) {
+                    setState(() => _updateDownloading = false);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                          content: Text('File update gak valid (hash beda) — '
+                              'server lagi bermasalah mungkin. Coba lagi '
+                              'beberapa menit lagi ya')),
+                    );
+                  }
+                  return;
                 }
-                _updateApkPath = f.path;
+                _updateApkPath = savedPath;
                 if (mounted) setState(() => _updateDownloading = false);
                 await _installUpdateApk();
               } catch (_) {
@@ -943,6 +981,79 @@ jobs:
               } finally {
                 hc?.close();
               }
+            }
+
+            /// ── 🔄 v5.5: download APK + validasi berlapis ──
+            /// 1. HTTP 200 (bukan error page)
+            /// 2. Content-type bukan HTML (guard v5.3)
+            /// 3. Magic byte "PK" (zip/APK valid — guard v5.3)
+            /// 4. SHA-256 sesuai manifest (BARU — streamed, hemat memori)
+            /// Balikin path file kalau SEMUA lolos, null kalau hash beda
+            /// (biar caller nge-retry 1x), lempar exception kalau jaringan
+            /// / HTTP gagal total.
+            Future<String?> _downloadAndVerifyApk(HttpClient hc) async {
+              final req = await hc.getUrl(Uri.parse(_updateApkUrl));
+              final resp = await req.close();
+              if (resp.statusCode != 200) {
+                throw Exception('HTTP ${resp.statusCode}');
+              }
+              // Guard v5.3: GitHub kadang bales HTML (error page) — jangan
+              // disimpen jadi .apk terus install gagal misterius.
+              final ctype =
+                  (resp.headers.value('content-type') ?? '').toLowerCase();
+              if (ctype.contains('text/html')) {
+                throw Exception('respons HTML, bukan APK');
+              }
+              final total = resp.contentLength ?? -1;
+              final totalTxt =
+                  total > 0 ? ' dari ${((total / 1048576) * 10).round() / 10} MB' : '';
+              final dir = await getTemporaryDirectory();
+              final f = File('${dir.path}/update_v${_updateRemoteCode}.apk');
+              final sink = f.openWrite();
+              var got = 0;
+              await for (final chunk in resp) {
+                got += chunk.length;
+                sink.add(chunk);
+                if (mounted) {
+                  setState(() {
+                    var pct = '';
+                    var part = '';
+                    if (total > 0) {
+                      _updateProgress = got / total;
+                      pct = ' — ${(_updateProgress * 100).toStringAsFixed(0)}%';
+                      part = totalTxt;
+                    }
+                    final mb = ((got / 1048576) * 10).round() / 10;
+                    _updateProgressTxt = 'Mengunduh $mb MB$part$pct';
+                  });
+                }
+              }
+              await sink.close();
+              // Magic byte check v5.3: APK valid selalu mulai "PK" (zip).
+              final raf = await f.open(mode: FileMode.read);
+              final head = await raf.read(2);
+              await raf.close();
+              if (head.length < 2 || head[0] != 0x50 || head[1] != 0x4B) {
+                try { await f.delete(); } catch (_) {}
+                throw Exception('file download rusak');
+              }
+              // ── 🔄 v5.5: verifikasi SHA-256 (kalau manifest ngasih hash) ──
+              // Streamed hash → APK 50MB+ gak di-read utuh ke memori.
+              // Manifest tanpa sha256 (workflow lama) = verifikasi di-skip.
+              if (_updateSha256.length == 64) {
+                var digestHex = '';
+                try {
+                  final digest = await sha256.bind(f.openRead()).first;
+                  digestHex = digest.toString();
+                } catch (_) {
+                  digestHex = '';
+                }
+                if (digestHex != _updateSha256) {
+                  try { await f.delete(); } catch (_) {}
+                  return null;   // hash beda → caller nge-retry 1x
+                }
+              }
+              return f.path;
             }
 
             // Panggil native (MainActivity) buat nampilin installer sistem.
@@ -1840,17 +1951,34 @@ jobs:
           fi
 
           # ── Kanal OTA: release apk-<pkg> asset app.apk (rolling) ──
+          # 🔄 v5.5: + APK ber-versi (app-1.0.N.apk buat riwayat/rollback)
+          #          + build-info.json (versionCode/sha256 → bot v7.0 manifest v2)
           PKG="$(echo "${INPUT_PACKAGE_NAME:-}" | sed 's/[^a-zA-Z0-9.]//g' | sed 's/^\.*//' | sed 's/\.*$//')"
           [ -z "$PKG" ] && PKG="com.deruzuan.webapp"
           cp "$APK" /tmp/app.apk
+          # SHA-256 APK signed (sumber kebenaran hash buat verifikasi app)
+          APK_SHA="$(sha256sum /tmp/app.apk | cut -d' ' -f1)"
+          RUN_NO="${GITHUB_RUN_NUMBER:-1}"
+          printf '{"package":"%s","versionCode":%s,"versionName":"1.0.%s","sha256":"%s","builtAt":"%s"}\n' \
+            "$PKG" "$RUN_NO" "$RUN_NO" "$APK_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /tmp/build-info.json
+          echo "🔧 build-info.json: v1.0.$RUN_NO sha256=$APK_SHA"
+          cp "$APK" "/tmp/app-1.0.$RUN_NO.apk"
           if gh release view "apk-$PKG" >/dev/null 2>&1; then
             gh release upload "apk-$PKG" /tmp/app.apk --clobber \
               && echo "🔄 Kanal OTA updated: apk-$PKG → app.apk" \
               || echo "WARNING: gh upload gagal (non-fatal)"
+            # APK ber-versi (rollback) — clobber = rerun dengan run number sama
+            # bakal nge-overwrite miliknya sendiri (idempotent, gak numpuk)
+            gh release upload "apk-$PKG" "/tmp/app-1.0.$RUN_NO.apk" --clobber \
+              && echo "🗂️ APK ber-versi: app-1.0.$RUN_NO.apk (buat riwayat/rollback)" \
+              || echo "WARNING: upload APK ber-versi gagal (non-fatal)"
+            gh release upload "apk-$PKG" /tmp/build-info.json --clobber \
+              && echo "🔧 build-info.json ter-upload (bot v7.0 pake ini)" \
+              || echo "WARNING: upload build-info gagal (non-fatal)"
           else
-            gh release create "apk-$PKG" /tmp/app.apk \
+            gh release create "apk-$PKG" /tmp/app.apk "/tmp/app-1.0.$RUN_NO.apk" /tmp/build-info.json \
               --title "OTA $PKG" --notes "Build terbaru — kanal auto-update" \
-              && echo "🔄 Kanal OTA dibuat: apk-$PKG" \
+              && echo "🔄 Kanal OTA dibuat: apk-$PKG (+ APK ber-versi + build-info)" \
               || echo "WARNING: gh create gagal (non-fatal)"
           fi
 
