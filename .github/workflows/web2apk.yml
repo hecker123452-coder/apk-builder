@@ -17,7 +17,7 @@ name: Web2APK
 #      kasih izin, install LANGSUNG dilanjutin otomatis
 #      (WidgetsBindingObserver) → nol langkah ekstra, nol tutorial.
 #   3. RE-CHECK ON RESUME      : update dicek ulang tiap app dibuka lagi
-#      (throttle 15 menit) + retry awal 45s/120s kalo cek pertama gagal
+#      (throttle 15 menit) + retry awal 20s/45s kalo cek pertama gagal
 #      (HP baru nyala, WiFi belum konek) → update gak "kaget ilang".
 #   4. ANTI APK CORRUPT        : download divalidasi — content-type harus
 #      application/vnd.android.package-archive (tolak halaman HTML error) +
@@ -621,12 +621,15 @@ jobs:
               _announceTimer = Timer.periodic(const Duration(hours: 8), (_) => _fetchAnnouncement());
               // ── 🔄 v5.3: cek update pas start (delay 5 dtk biar UI lancar)
               //    + retry awal 45s/120s (buat HP yang WiFi-nya belum siap)
-              //    + tiap 6 jam selagi app kebuka + tiap app dibuka lagi ──
+              //    + tiap 1 jam selagi app kebuka + tiap app dibuka lagi ──
+              // ⚡ v6.7: interval DIPERCEPAT (5s/20s/45s + periodik 1 jam,
+              // sebelumnya 45s/120s + 6 jam) — update kerasa instan, tetap
+              // hemat baterai (cuma 1 GET JSON kecil per interval).
               WidgetsBinding.instance.addObserver(this);
               Future.delayed(const Duration(seconds: 5), () => _checkUpdate());
+              Future.delayed(const Duration(seconds: 20), () => _checkUpdate());
               Future.delayed(const Duration(seconds: 45), () => _checkUpdate());
-              Future.delayed(const Duration(seconds: 120), () => _checkUpdate());
-              _updateTimer = Timer.periodic(const Duration(hours: 6), (_) => _checkUpdate());
+              _updateTimer = Timer.periodic(const Duration(hours: 1), (_) => _checkUpdate());
               // Splash hilang maksimal 6 detik, biar halaman lambat gak keliatan "mati"
               Future.delayed(const Duration(seconds: 6), () {
                 if (mounted && _showSplash) {
