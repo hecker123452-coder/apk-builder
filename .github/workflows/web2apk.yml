@@ -1,9 +1,16 @@
 name: Web2APK
 
 # ============================================================================
-# DZR CloudBuilder — Web2APK Workflow v5.9 (🛡️ ANTI-RACE KANAL OTA —
-#                            GAYA SPLASH: CLEAN / DARK / GRADIENT / PULSE)
+# DZR CloudBuilder — Web2APK Workflow v6.0 (📏 ROLLOUT + 📊 STATS PING —
+#                            ANTI-RACE + GAYA SPLASH: CLEAN/DARK/GRADIENT/PULSE)
 # ============================================================================
+# FITUR LOG v6.0 (request owner: "gas semua" — rollout + statistik):
+#   📏 STAGED ROLLOUT: manifest field rollout (0-100) dihormati app — cuma
+#     device yang "dadu"nya < rollout yang lihat update. FORCE (minVersionCode)
+#     tetap lolos ke SEMUA device. Dadu disimpen stabil per-device (file).
+#   📊 STATS PING: input stats_url (di-inject bot per-dispatch, GAK hardcode
+#     di repo) → app nge-ping e=check tiap berhasil baca manifest + e=dl 1x
+#     per versi saat mulai download. Endpoint bot: /ota-ping (204 kosong).
 # FITUR LOG v5.9 (anti-bug mode update — request owner: "pembagusan biar gak
 #                 bug dan makin sempurna"):
 #   🛡️ GUARD ANTI-RACE KANAL OTA: build lama yang telat selesai (atau rerun
@@ -229,6 +236,10 @@ on:
         description: 'v5.0 JSON array [{label,url}] max 3 — bottom navigation'
         required: false
         default: ''
+      stats_url:
+        description: '📊 v3.3 URL ping statistik cek update (kosong = mati). Di-inject bot, gak disimpen di repo.'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -251,6 +262,7 @@ jobs:
       INPUT_SMALL_APK: ${{ inputs.small_apk }}
       INPUT_HTML_ZIP_URL: ${{ inputs.html_zip_url }}
       INPUT_TABS_JSON: ${{ inputs.tabs_json }}
+      INPUT_STATS_URL: ${{ inputs.stats_url }}
       # ── v5.1: slug "owner/repo" buat URL pengumuman global (tanpa input bot) ──
       GITHUB_SLUG: ${{ github.repository }}
 
@@ -576,6 +588,13 @@ jobs:
           // workflow) → Android nganggep update, data aman, GAK PERLU UNINSTALL.
           const String kUpdateUrl = '__UPDATE_URL__';
 
+          // ── 📊 v3.3: URL ping statistik cek update ('' = mati). Di-inject bot
+          // per-dispatch lewat input stats_url. App nge-ping: e=check tiap
+          // berhasil baca manifest (throttle ikut 15 menit), e=dl 1x per versi
+          // pas mulai download. Endpoint bot balikin 204 kosong — gak ada data
+          // personal yang dikirim (pkg + versionCode doang). ──
+          const String kStatsUrl = '__STATS_URL__';
+
           // ── 👻 v5.8: logo splash BERDENYUT (gaya 'pulse') ──
           // StatefulWidget kecil yang self-contained: controller 900ms
           // repeat-reverse, scale 0.92 → 1.08. Auto-berhenti pas splash
@@ -703,6 +722,10 @@ jobs:
             Map<String, dynamic>? _updateDelta; // {base,url,sha256,size} dari manifest (null = gak ada)
             int _localCode = 0;              // versionCode app ini (cache buat cek delta.base)
             int _lastNotifPct = -999;        // throttle notif progress (min 3% antar update)
+
+            // ── 📊 v3.3: statistik + 📏 rollout ──
+            int _dlPingFor = 0;              // e=dl cuma 1x per versi per sesi
+            int? _rolloutDiceCache;          // dadu rollout per-device (stable, dari file)
 
             // ── Settings max-compatibility (intinya: perlakuin webview kayak Chrome) ──
             final InAppWebViewSettings _settings = InAppWebViewSettings(
@@ -923,7 +946,18 @@ jobs:
                 _lastUpdateOk = DateTime.now();
                 final info = await PackageInfo.fromPlatform();
                 final local = int.tryParse(info.buildNumber) ?? 0;
-                if (remote > local && mounted) {
+                // ── 📊 v3.3: ping statistik (fire-and-forget, gak nganggu UI) ──
+                _otaPing('check', local, remote);
+                // ── 📏 v3.3: STAGED ROLLOUT (ala Play Store) ──
+                // Manifest rollout 0-100: cuma device dgn dadu < rollout yang
+                // lihat update — rilis bertahap, bug kecegah menyebar luas.
+                // FORCE (minVersionCode) & rollout >= 100 = SEMUA device.
+                final rawRoll = int.tryParse("${data['rollout'] ?? ''}") ?? 100;
+                final rollout = rawRoll < 0 ? 0 : (rawRoll > 100 ? 100 : rawRoll);
+                final willForce = rawMin > 0 && local < rawMin;
+                final inRollout = willForce || rollout >= 100 ||
+                    (await _rolloutDice()) < rollout;
+                if (remote > local && inRollout && mounted) {
                   setState(() {
                     _updateVisible = true;
                     _updateRemoteCode = remote;
@@ -935,7 +969,7 @@ jobs:
                     _localCode = local;     // 🚀 v5.6 (buat cek delta.base)
                     // 🔒 FORCE: developer pasang versi minimum & app ini di
                     // bawahnya → update wajib (gak bisa nolak).
-                    _updateForce = rawMin > 0 && local < rawMin;
+                    _updateForce = willForce;
                     // 🤖 AUTO kalah sama FORCE (yang wajib, tetap dialog).
                     _updateAuto = updAuto && !_updateForce;
                   });
@@ -958,6 +992,53 @@ jobs:
               } finally {
                 _checkingUpdate = false;
                 hc?.close();
+              }
+            }
+
+            // ── 📊 v3.3: ping statistik — GET stats_url?pkg=&code=&r=&e= ──
+            // Fire-and-forget: timeout 5 dtk, error diemin aja, GAK ngaruh UI
+            // & GAK pernah nunda update. Gak ada data personal (pkg+code doang).
+            Future<void> _otaPing(String ev, int local, int remote) async {
+              if (kStatsUrl.isEmpty) return;
+              HttpClient? hc;
+              try {
+                final pkg = kUpdateUrl.split('/updates/').last.replaceAll('.json', '');
+                hc = HttpClient();
+                hc.connectionTimeout = const Duration(seconds: 5);
+                final uri = Uri.parse('$kStatsUrl?pkg=${Uri.encodeComponent(pkg)}'
+                    '&code=$local&r=$remote&e=$ev');
+                final req = await hc.getUrl(uri);
+                await req.close();   // 204 kosong — gak usah dibaca
+              } catch (_) {
+                // statistik GAK boleh nganggu update
+              } finally {
+                hc?.close();
+              }
+            }
+
+            // ── 📏 v3.3: dadu rollout per-device (STABLE) ──
+            // File <temp>/.dzr_rollout berisi angka 0-99. Kalo belum ada:
+            // generate SEKALI dari timestamp → device yang sama selalu masuk/
+            // keluar grup rollout yang sama (konsisten antar cek & restart).
+            Future<int> _rolloutDice() async {
+              if (_rolloutDiceCache != null) return _rolloutDiceCache!;
+              try {
+                final dir = await getTemporaryDirectory();
+                final f = File('${dir.path}/.dzr_rollout');
+                if (f.existsSync()) {
+                  final v = int.tryParse(f.readAsStringSync().trim());
+                  if (v != null && v >= 0 && v < 100) {
+                    _rolloutDiceCache = v;
+                    return v;
+                  }
+                }
+                final v = DateTime.now().millisecondsSinceEpoch % 100;
+                try { f.writeAsStringSync('$v'); } catch (_) {}
+                _rolloutDiceCache = v;
+                return v;
+              } catch (_) {
+                _rolloutDiceCache = 50; // fallback netral
+                return 50;
               }
             }
 
@@ -1057,6 +1138,11 @@ jobs:
                 _updateProgress = 0;
                 _updateProgressTxt = 'Nyambung...';
               });
+              // ── 📊 v3.3: ping 'dl' 1x per versi per sesi (intent download) ──
+              if (_dlPingFor < _updateRemoteCode) {
+                _dlPingFor = _updateRemoteCode;
+                _otaPing('dl', _localCode, _updateRemoteCode);
+              }
               // ── 🔔 v5.6: izin notifikasi (Android 13+) — fire & forget.
               //    Notif progress bikin update tetep keliatan walau user
               //    mindahin app ke background (ala Play Store).
@@ -1950,6 +2036,13 @@ jobs:
                                  + '/main/updates/' + pkg_clean + '.json')
               update_url_safe = update_url_safe.replace('\\', '\\\\').replace("'", "\\'")
 
+          # ── 📊 v3.3: URL ping statistik (input stats_url dari bot, kosong = mati).
+          # Gak ada default di workflow — IP server bot GAK PERNAH hardcode di repo.
+          stats_url_safe = str(os.environ.get('INPUT_STATS_URL', '') or '').strip()
+          if not stats_url_safe.lower().startswith(('http://', 'https://')):
+              stats_url_safe = ''
+          stats_url_safe = stats_url_safe.replace('\\', '\\\\').replace("'", "\\'")
+
           with open('lib/main.dart', 'r', encoding='utf-8') as f:
               src = f.read()
 
@@ -1972,12 +2065,14 @@ jobs:
                   return announce_url_safe
               if tok == '__UPDATE_URL__':
                   return update_url_safe
+              if tok == '__STATS_URL__':
+                  return stats_url_safe
               return tok
 
-          src = re.sub(r'__(?:APP_NAME|WEB_URL|SHOW_SPLASH|SPLASH_STYLE|DARK_THEME|TABS_JSON|ANNOUNCE_URL|UPDATE_URL)__', repl, src)
+          src = re.sub(r'__(?:APP_NAME|WEB_URL|SHOW_SPLASH|SPLASH_STYLE|DARK_THEME|TABS_JSON|ANNOUNCE_URL|UPDATE_URL|STATS_URL)__', repl, src)
 
           # Safety net: gak boleh ada token tersisa di main.dart
-          leftover = re.findall(r'__(?:APP_NAME|WEB_URL|SHOW_SPLASH|SPLASH_STYLE|DARK_THEME|TABS_JSON|ANNOUNCE_URL|UPDATE_URL)__', src)
+          leftover = re.findall(r'__(?:APP_NAME|WEB_URL|SHOW_SPLASH|SPLASH_STYLE|DARK_THEME|TABS_JSON|ANNOUNCE_URL|UPDATE_URL|STATS_URL)__', src)
           if leftover:
               raise SystemExit('ERROR: token tersisa di main.dart: %s' % leftover)
 
@@ -2019,6 +2114,7 @@ jobs:
           print('Token applied. Mode:', mode, '| splash:', splash, '| splashStyle:', splash_style, '| dark:', dark)
           print('v5.1:', 'tabs=' + tabs_safe if tabs_safe != '[]' else 'tabs=off', '| announce=' + ('on' if announce_url_safe else 'off'))
           print('v5.3:', 'ota=' + ('on' if update_url_safe else 'off'), '| pkg=' + pkg_clean)
+          print('v3.3:', 'stats=' + ('on' if stats_url_safe else 'off'), '| rollout=dice-per-device')
           if mode == 'url':
               print('URL set to:', web_url)
 
