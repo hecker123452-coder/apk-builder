@@ -181,6 +181,42 @@ jobs:
             fi
           fi
 
+      # ── 🤖 v3.3: ALIGN versionCode → RUN NUMBER (syarat kanal OTA) ──
+      # Semantik OTA bot: versionCode = GitHub run number (naik terus, rantai
+      # update-over-install aman). Project user biasanya versionCode statis (1)
+      # → update kedua bakal ditolak Android (INSTALL_FAILED_VERSION_DOWNGRADE).
+      # Patch best-effort di module build.gradle(.kts): ganti/inject
+      # versionCode+versionName. Hasil diverifikasi aapt di step kanal OTA —
+      # gak nempel = kanal di-skip (non-fatal, build tetap jalan).
+      - name: Align versionCode to run number (OTA)
+        if: inputs.build_format == 'apk' || inputs.build_format == 'both'
+        run: |
+          python3 << 'PYEOF'
+          import glob, os, re
+          run_no = int(os.environ.get('GITHUB_RUN_NUMBER', '1'))
+          patched, injected = [], []
+          for path in sorted(glob.glob('*/build.gradle') + glob.glob('*/build.gradle.kts')):
+              src = open(path, encoding='utf-8').read()
+              if 'defaultConfig' not in src:
+                  continue
+              orig = src
+              # ganti versionCode/versionName literal (groovy & kts: dengan/tanpa '=')
+              src = re.sub(r'(?m)^(\s*versionCode\s*=?\s*)\d+', lambda m: m.group(1) + str(run_no), src)
+              src = re.sub(r'(?m)^(\s*versionName\s*=?\s*)"[^"]*"', lambda m: m.group(1) + '"3.0.%d"' % run_no, src)
+              # module gak punya versionCode sama sekali → inject ke defaultConfig
+              if not re.search(r'(?m)^\s*versionCode\s*=?\s*\d+', src):
+                  def _inject(m):
+                      ind = m.group(1)
+                      return (m.group(0) + '\n' + ind + '    versionCode = ' + str(run_no)
+                              + '\n' + ind + '    versionName = "3.0.' + str(run_no) + '"')
+                  src = re.sub(r'(?m)^([ \t]*)defaultConfig\s*\{', _inject, src, count=1)
+                  injected.append(path)
+              if src != orig:
+                  open(path, 'w', encoding='utf-8').write(src)
+                  patched.append(path)
+          print('versionCode →', run_no, '| patched:', patched or 'GAK ADA', '| injected:', injected or '-')
+          PYEOF
+
       # ── 🔨 Build + retry sederhana (max 3x) ──
       # Gak ada auto-fix Dart/pub — project Gradle native jauh lebih simpel.
       # --stacktrace biar error keliatan jelas di log buat autodiag bot.
@@ -360,13 +396,146 @@ jobs:
             echo "WARNING: keystore/build-tools gak siap (skip re-sign, non-fatal)"
           fi
 
+      # ── 🤖 v3.3: KANAL OTA KOTLIN (paritas dgn Web2APK) ──
+      # Release apk-<pkg>: app.apk rolling + APK ber-versi + build-info.json
+      # + delta patch bsdiff (worth-it < 75%) + guard anti-race (CUR_VC).
+      # pkg/versionCode dibaca LANGSUNG DARI APK (aapt) — bukan dianggep.
+      # build-info.json ikut nyempil di apk_out/ → artifact → bot jadi tau
+      # package asli app user & nulis manifest updates/<pkg>.json.
+      # NON-FATAL: gagal di step mana pun = build tetap sukses & APK tetap
+      # ke-kirim bot ke user — cuma kanal OTA-nya gak ke-update.
+      - name: OTA channel (Kotlin native)
+        if: (inputs.build_format == 'apk' || inputs.build_format == 'both') && inputs.build_type == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          APK=$(ls -t apk_out/*.apk 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then echo "ℹ️ Gak ada APK — kanal OTA skip"; exit 0; fi
+          RUN_NO="${GITHUB_RUN_NUMBER:-1}"
+          BTD="$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$BTD" ] || [ ! -x "$BTD/aapt" ]; then echo "ℹ️ aapt gak ada — kanal OTA skip"; exit 0; fi
+          BADGE="$($BTD/aapt dump badging "$APK" 2>/dev/null | head -1)"
+          PKG="$(printf '%s' "$BADGE" | sed -n "s/.*package:name='\([^']*\)'.*/\1/p")"
+          VC="$(printf '%s' "$BADGE" | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p")"
+          if [ -z "$PKG" ] || [ "$VC" != "$RUN_NO" ]; then
+            echo "ℹ️ versionCode APK ($VC) ≠ run ($RUN_NO) — patch gradle gak nempel → kanal OTA skip (non-fatal)"
+            exit 0
+          fi
+          echo "🎯 Kanal OTA: apk-$PKG v$RUN_NO"
+          cp "$APK" /tmp/app.apk
+          cp "$APK" "/tmp/app-3.0.$RUN_NO.apk"
+          APK_SHA="$(sha256sum /tmp/app.apk | cut -d' ' -f1)"
+          APK_SIZE=$(stat -c%s /tmp/app.apk)
+
+          # ── 🚀 delta patch (pola identik Web2APK: bsdiff → bingkai DZRDELTA) ──
+          DELTA_JSON=""
+          OLD_VC=""
+          if sudo apt-get install -y --no-install-recommends bsdiff >/dev/null 2>&1; then
+            rm -f /tmp/old.apk /tmp/bsdiff.raw /tmp/delta.patch /tmp/delta-info.json
+            OLD_URL=$(gh api "repos/${GH_REPO}/releases/tags/apk-$PKG" --jq '.assets[] | select((.name|test("^app-[0-9]+\\.[0-9]+\\.[0-9]+\\.apk$"))) | .browser_download_url + " " + .name' 2>/dev/null | awk -v run="$RUN_NO" '{n=$2; sub(/^app-[0-9]+\.[0-9]+\./,"",n); sub(/\.apk$/,"",n); if ((n+0)<(run+0) && (n+0)>best) {best=n+0; u=$1}} END {if (best>0) print u}')
+            if [ -z "$OLD_URL" ]; then
+              OLD_URL="https://github.com/${GH_REPO}/releases/download/apk-$PKG/app.apk"
+            fi
+            echo "⬇️  Download APK lama buat delta: $OLD_URL"
+            curl -sL --retry 2 --max-time 300 -o /tmp/old.apk "$OLD_URL" || true
+            if [ -s /tmp/old.apk ]; then
+              OLD_VC="$($BTD/aapt dump badging /tmp/old.apk 2>/dev/null | head -1 | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p")"
+            fi
+            if [ -s /tmp/old.apk ] && [ -n "$OLD_VC" ] && [ "$OLD_VC" -gt 0 ] && [ "$OLD_VC" -lt "$RUN_NO" ] 2>/dev/null; then
+              echo "🔀 Bikin delta patch: v$OLD_VC → v$RUN_NO (bsdiff, bisa 1-3 menit)..."
+              if bsdiff /tmp/old.apk /tmp/app.apk /tmp/bsdiff.raw; then
+                python3 << 'PYEOF2'
+          import struct, bz2, hashlib, json
+          src = open('/tmp/bsdiff.raw', 'rb').read()
+          assert src[:8] == b'BSDIFF40', 'bukan output bsdiff'
+          ctrl_len, diff_len, extra_len, newsize = struct.unpack('>QQQq', src[8:40])
+          body = src[40:]
+          d1 = bz2.BZ2Decompressor(); c = d1.decompress(body); r1 = d1.unused_data
+          d2 = bz2.BZ2Decompressor(); df = d2.decompress(r1); r2 = d2.unused_data
+          d3 = bz2.BZ2Decompressor(); ex = d3.decompress(r2); r3 = d3.unused_data
+          assert len(c) == ctrl_len and len(df) == diff_len and len(ex) == extra_len, 'ukuran blok bsdiff gak cocok'
+          l1 = len(body) - len(r1); l2 = len(r1) - len(r2); l3 = len(r2) - len(r3)
+          out = b'DZRDELTA' + struct.pack('<I', 1) + struct.pack('<III', l1, l2, l3) + struct.pack('<q', newsize) + body[:l1] + body[l1:l1+l2] + body[l1+l2:l1+l2+l3]
+          open('/tmp/delta.patch', 'wb').write(out)
+          sha = hashlib.sha256(out).hexdigest()
+          json.dump({'size': len(out), 'sha256': sha, 'newSize': newsize}, open('/tmp/delta-info.json', 'w'))
+          print('DZR frame: ctrl=%d diff=%d extra=%d newSize=%d' % (l1, l2, l3, newsize))
+          PYEOF2
+              else
+                echo "WARNING: bsdiff gagal — delta skip (non-fatal)"
+              fi
+            else
+              echo "ℹ️ APK lama gak ketemu/gak valid — delta skip (build pertama kanal ini normal)"
+            fi
+            if [ -s /tmp/delta.patch ] && [ -s /tmp/delta-info.json ] && [ -n "$OLD_VC" ]; then
+              DELTA_SIZE=$(stat -c%s /tmp/delta.patch)
+              if [ "$DELTA_SIZE" -lt $((APK_SIZE * 75 / 100)) ]; then
+                DELTA_SHA=$(python3 -c "import json;print(json.load(open('/tmp/delta-info.json'))['sha256'])")
+                DELTA_JSON=",\"delta\":{\"base\":$OLD_VC,\"url\":\"https://github.com/${GH_REPO}/releases/download/apk-$PKG/delta-${OLD_VC}-${RUN_NO}.patch\",\"sha256\":\"$DELTA_SHA\",\"size\":$DELTA_SIZE}"
+                echo "🚀 Delta worth-it: $DELTA_SIZE byte = $((DELTA_SIZE * 100 / APK_SIZE))% dari penuh"
+              else
+                echo "ℹ️ Delta gak worth-it ($DELTA_SIZE byte) — skip, user unduh penuh"
+                rm -f /tmp/delta.patch /tmp/delta-info.json
+              fi
+            fi
+          else
+            echo "WARNING: bsdiff gak ke-install — delta skip (non-fatal, update penuh tetap jalan)"
+          fi
+
+          printf '{"package":"%s","versionCode":%s,"versionName":"3.0.%s","sha256":"%s","builtAt":"%s","size":%s%s}\n' \
+            "$PKG" "$RUN_NO" "$RUN_NO" "$APK_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$APK_SIZE" "$DELTA_JSON" > /tmp/build-info.json
+          cp /tmp/build-info.json apk_out/build-info.json
+          echo "🔧 build-info.json: v3.0.$RUN_NO sha256=$APK_SHA (nyempil di artifact buat bot)"
+
+          # ── 🛡️ guard anti-race (identik Web2APK v5.9) ──
+          CUR_VC=$(curl -sL --max-time 30 "https://github.com/${GH_REPO}/releases/download/apk-$PKG/build-info.json" 2>/dev/null | python3 -c "import json,sys;print(int(json.load(sys.stdin).get('versionCode',0)))" 2>/dev/null || echo 0)
+          OTA_FRESH=1
+          if [ "$CUR_VC" -ge "$RUN_NO" ] 2>/dev/null && [ "$CUR_VC" -gt 0 ]; then
+            OTA_FRESH=0
+            echo "⏭️ Kanal OTA udah di v$CUR_VC (>= run ini $RUN_NO) — build stale/rerun, kanal GAK disentuh"
+          fi
+          if [ "$OTA_FRESH" = "1" ] && gh release view "apk-$PKG" >/dev/null 2>&1; then
+            gh release upload "apk-$PKG" /tmp/app.apk --clobber \
+              && echo "🔄 Kanal OTA updated: apk-$PKG → app.apk" \
+              || echo "WARNING: gh upload gagal (non-fatal)"
+            gh release upload "apk-$PKG" "/tmp/app-3.0.$RUN_NO.apk" --clobber \
+              && echo "🗂️ APK ber-versi: app-3.0.$RUN_NO.apk (riwayat/rollback)" \
+              || echo "WARNING: upload APK ber-versi gagal (non-fatal)"
+            if [ -s /tmp/delta.patch ]; then
+              gh release upload "apk-$PKG" /tmp/delta.patch --clobber \
+                && echo "🚀 Delta asset: delta-${OLD_VC}-${RUN_NO}.patch" \
+                || echo "WARNING: upload delta gagal (non-fatal)"
+            fi
+            gh release upload "apk-$PKG" /tmp/build-info.json --clobber \
+              && echo "🔧 build-info.json ter-upload (bot pake ini buat manifest OTA)" \
+              || echo "WARNING: upload build-info gagal (non-fatal)"
+            if [ -n "$OLD_VC" ]; then
+              gh api "repos/${GH_REPO}/releases/tags/apk-$PKG" --jq '.assets[] | select((.name|test("^delta-[0-9]+-[0-9]+\\.patch$"))) | [.id, .name] | @tsv' 2>/dev/null | \
+              while IFS=$'\t' read -r aid aname; do
+                if [ "$aname" != "delta-${OLD_VC}-${RUN_NO}.patch" ]; then
+                  gh api -X DELETE "repos/${GH_REPO}/releases/assets/$aid" >/dev/null 2>&1 || true
+                  echo "🧹 Delta lama dibuang: $aname"
+                fi
+              done
+            fi
+          elif [ "$OTA_FRESH" = "1" ]; then
+            gh release create "apk-$PKG" /tmp/app.apk "/tmp/app-3.0.$RUN_NO.apk" /tmp/build-info.json \
+              --title "OTA $PKG" --notes "Build terbaru — kanal auto-update (Kotlin native)" \
+              && echo "🔄 Kanal OTA dibuat: apk-$PKG (+ APK ber-versi + build-info)" \
+              || echo "WARNING: gh create gagal (non-fatal)"
+          fi
+
       - name: Upload APK
         if: inputs.build_format == 'apk' || inputs.build_format == 'both'
         uses: actions/upload-artifact@v4
         with:
           name: apk-output
-          path: apk_out/*.apk
+          path: |
+            apk_out/*.apk
+            apk_out/build-info.json
           retention-days: 7
+          if-no-files-found: error
 
       - name: Upload AAB
         if: inputs.build_format == 'aab' || inputs.build_format == 'both'
