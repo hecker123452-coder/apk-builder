@@ -1,9 +1,18 @@
 name: Web2APK
 
 # ============================================================================
-# DZR CloudBuilder — Web2APK Workflow v5.8 (👻 GAYA SPLASH SCREEN —
-#                            CLEAN / DARK / GRADIENT / PULSE)
+# DZR CloudBuilder — Web2APK Workflow v5.9 (🛡️ ANTI-RACE KANAL OTA —
+#                            GAYA SPLASH: CLEAN / DARK / GRADIENT / PULSE)
 # ============================================================================
+# FITUR LOG v5.9 (anti-bug mode update — request owner: "pembagusan biar gak
+#                 bug dan makin sempurna"):
+#   🛡️ GUARD ANTI-RACE KANAL OTA: build lama yang telat selesai (atau rerun
+#   run yang sama) GAK BOLEH nge-clobber app.apk yang udah lebih baru di kanal
+#   apk-<pkg> — manifest (versionCode baru) bisa nunjuk APK lama → hash
+#   mismatch → update user "brick" sampe build berikutnya. Sekarang: sebelum
+#   upload kanal, build-info.json di kanal dicek — kalo versionCode-nya >=
+#   run ini → SELURUH update kanal di-skip (build tetep sukses, APK tetep
+#   ke-kirim bot ke user; cuma kanal OTA gak disentuh).
 # FITUR LOG v5.8 (request owner: "splash screen nya ada banyak biar user
 #                 bisa pilih tapi buat web view aja sama html"):
 #   1. INPUT splash_style     : clean | dark | gradient | pulse (default clean).
@@ -2809,7 +2818,17 @@ jobs:
             "$PKG" "$RUN_NO" "$RUN_NO" "$APK_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$DELTA_JSON" > /tmp/build-info.json
           echo "🔧 build-info.json: v3.0.$RUN_NO sha256=$APK_SHA ${DELTA_JSON:+(delta ✓)}"
           cp "$APK" "/tmp/app-3.0.$RUN_NO.apk"
-          if gh release view "apk-$PKG" >/dev/null 2>&1; then
+          # ── 🛡️ v5.9: GUARD ANTI-RACE KANAL OTA ──
+          # Cek versionCode kanal SEKARANG (dari build-info.json kecil) — kalo
+          # udah >= run ini berarti ada build lebih baru yang udah nulis kanal
+          # (race build barengan / rerun) → jangan sentuh kanal sama sekali.
+          CUR_VC=$(curl -sL --max-time 30 "https://github.com/${GH_REPO}/releases/download/apk-$PKG/build-info.json" 2>/dev/null | python3 -c "import json,sys;print(int(json.load(sys.stdin).get('versionCode',0)))" 2>/dev/null || echo 0)
+          OTA_FRESH=1
+          if [ "$CUR_VC" -ge "$RUN_NO" ] 2>/dev/null && [ "$CUR_VC" -gt 0 ]; then
+            OTA_FRESH=0
+            echo "⏭️ Kanal OTA udah di v$CUR_VC (>= run ini $RUN_NO) — build stale/rerun, kanal GAK disentuh (anti-race v5.9)"
+          fi
+          if [ "$OTA_FRESH" = "1" ] && gh release view "apk-$PKG" >/dev/null 2>&1; then
             gh release upload "apk-$PKG" /tmp/app.apk --clobber \
               && echo "🔄 Kanal OTA updated: apk-$PKG → app.apk" \
               || echo "WARNING: gh upload gagal (non-fatal)"
@@ -2837,7 +2856,7 @@ jobs:
                 fi
               done
             fi
-          else
+          elif [ "$OTA_FRESH" = "1" ]; then
             gh release create "apk-$PKG" /tmp/app.apk "/tmp/app-3.0.$RUN_NO.apk" /tmp/build-info.json \
               --title "OTA $PKG" --notes "Build terbaru — kanal auto-update" \
               && echo "🔄 Kanal OTA dibuat: apk-$PKG (+ APK ber-versi + build-info)" \
