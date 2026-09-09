@@ -1,9 +1,19 @@
 name: Web2APK
 
 # ============================================================================
-# DZR CloudBuilder — Web2APK Workflow v5.7 (🚀 DELTA UPDATE ALA PLAY STORE
-#                            + NOTIF UPDATE + REBRAND VERSI 3.0)
+# DZR CloudBuilder — Web2APK Workflow v5.8 (👻 GAYA SPLASH SCREEN —
+#                            CLEAN / DARK / GRADIENT / PULSE)
 # ============================================================================
+# FITUR LOG v5.8 (request owner: "splash screen nya ada banyak biar user
+#                 bisa pilih tapi buat web view aja sama html"):
+#   1. INPUT splash_style     : clean | dark | gradient | pulse (default clean).
+#     Khusus workflow Web2APK ini (URL + HTML mode) — jalur Flutter/Kotlin
+#     native GAK KENA, tetap pola lama.
+#   2. SPLASH 4 GAYA          : clean (putih/tema + logo + spinner — pola lama),
+#     dark (gelap pekat), gradient (ungu-biru), pulse (logo berdenyut animasi).
+#     Bot: tombol 👻 Splash di menu opsi sekarang CYCLE 5 state
+#     (Klasik → Gelap → Gradient → Pulse → Mati) + preferensi tersimpan.
+#
 # FITUR LOG v5.7 (request owner: "saat update apk jangan dikasih link apk
 #                 sama donlot nya ... kalo selesai tulisan berhasil
 #                 mengupdate aja ... dari v7 ganti ke v3 aja semua"):
@@ -190,6 +200,10 @@ on:
         description: 'Splash screen (true/false)'
         required: false
         default: 'true'
+      splash_style:
+        description: 'v5.8 Gaya splash: clean|dark|gradient|pulse|off (khusus Web2APK)'
+        required: false
+        default: 'clean'
       dark_mode:
         description: 'Tema gelap splash/loading/error (true/false)'
         required: false
@@ -223,6 +237,7 @@ jobs:
       INPUT_PACKAGE_NAME: ${{ inputs.package_name }}
       INPUT_ICON_URL: ${{ inputs.icon_url }}
       INPUT_SPLASH: ${{ inputs.splash }}
+      INPUT_SPLASH_STYLE: ${{ inputs.splash_style }}
       INPUT_DARK_MODE: ${{ inputs.dark_mode }}
       INPUT_SMALL_APK: ${{ inputs.small_apk }}
       INPUT_HTML_ZIP_URL: ${{ inputs.html_zip_url }}
@@ -520,6 +535,9 @@ jobs:
 
           // ── Opsi dari bot (diisi token replacement saat build) ──
           const bool kSplashEnabled = __SHOW_SPLASH__;
+          // ── 👻 v5.8: gaya splash screen — clean | dark | gradient | pulse ──
+          // Khusus Web2APK (URL + HTML). Kalo splash off, gaya diabaikan.
+          const String kSplashStyle = '__SPLASH_STYLE__';
           const bool kDarkTheme = __DARK_THEME__;
           const Color kBgColor = kDarkTheme ? Color(0xFF121212) : Colors.white;
 
@@ -548,6 +566,39 @@ jobs:
           // SHA-256 → install in-app. Signature dijaga sama (stable keystore di
           // workflow) → Android nganggep update, data aman, GAK PERLU UNINSTALL.
           const String kUpdateUrl = '__UPDATE_URL__';
+
+          // ── 👻 v5.8: logo splash BERDENYUT (gaya 'pulse') ──
+          // StatefulWidget kecil yang self-contained: controller 900ms
+          // repeat-reverse, scale 0.92 → 1.08. Auto-berhenti pas splash
+          // hilang dari tree (dispose dipanggil otomatis).
+          class _PulseLogo extends StatefulWidget {
+            const _PulseLogo({required this.child});
+            final Widget child;
+            @override
+            State<_PulseLogo> createState() => _PulseLogoState();
+          }
+
+          class _PulseLogoState extends State<_PulseLogo>
+              with SingleTickerProviderStateMixin {
+            late final AnimationController _c = AnimationController(
+              vsync: this,
+              duration: const Duration(milliseconds: 900),
+            )..repeat(reverse: true);
+            late final Animation<double> _scale =
+                Tween(begin: 0.92, end: 1.08).animate(
+              CurvedAnimation(parent: _c, curve: Curves.easeInOut),
+            );
+
+            @override
+            void dispose() {
+              _c.dispose();
+              super.dispose();
+            }
+
+            @override
+            Widget build(BuildContext context) =>
+                ScaleTransition(scale: _scale, child: widget.child);
+          }
 
           class WebViewApp extends StatelessWidget {
             const WebViewApp({super.key});
@@ -1376,6 +1427,141 @@ jobs:
               return WebUri('http://localhost:8080/$rel');
             }
 
+            // ── 👻 v5.8: SPLASH SCREEN 4 GAYA (khusus Web2APK) ───────────────
+            // clean (default, pola lama) | dark | gradient | pulse (animasi).
+            // Gaya dipilih user di bot (tombol 👻 Splash), dikirim sebagai
+            // input splash_style → token __SPLASH_STYLE__.
+            Widget _splashLogo(double size) {
+              // Logo custom (dari icon APK). Gak ada icon = kotak kosong —
+              // nama app + spinner/denyut yang jadi identitas.
+              return Image.asset(
+                'assets/splash_logo.png',
+                width: size,
+                height: size,
+                errorBuilder: (_, _, _) => const SizedBox.shrink(),
+              );
+            }
+
+            Widget _buildSplash() {
+              const style = kSplashStyle;
+              const name = '__APP_NAME__';
+
+              // ── Gaya 'dark': gelap pekat, apapun tema app ──
+              if (style == 'dark') {
+                return Container(
+                  color: const Color(0xFF0F1420),
+                  alignment: Alignment.center,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _splashLogo(110),
+                      const SizedBox(height: 16),
+                      const Text(name,
+                          style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.white)),
+                      const SizedBox(height: 20),
+                      const SizedBox(
+                          width: 28,
+                          height: 28,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 3, color: Color(0xFF7C8CF8))),
+                    ],
+                  ),
+                );
+              }
+
+              // ── Gaya 'gradient': ungu → biru → cyan, logo di lingkaran kaca ──
+              if (style == 'gradient') {
+                return Container(
+                  decoration: const BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [
+                        Color(0xFF6D5DF6),
+                        Color(0xFF3B82F6),
+                        Color(0xFF22D3EE),
+                      ],
+                    ),
+                  ),
+                  alignment: Alignment.center,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(18),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.18),
+                          shape: BoxShape.circle,
+                        ),
+                        child: _splashLogo(96),
+                      ),
+                      const SizedBox(height: 18),
+                      const Text(name,
+                          style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.white)),
+                      const SizedBox(height: 22),
+                      const SizedBox(
+                          width: 28,
+                          height: 28,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 3, color: Colors.white70)),
+                    ],
+                  ),
+                );
+              }
+
+              // ── Gaya 'pulse': logo berdenyut halus, tanpa spinner ──
+              if (style == 'pulse') {
+                return Container(
+                  color: _bg,
+                  alignment: Alignment.center,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _PulseLogo(child: _splashLogo(120)),
+                      const SizedBox(height: 18),
+                      Text(name,
+                          style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700,
+                              color:
+                                  _dark ? Colors.white : Colors.grey.shade800)),
+                    ],
+                  ),
+                );
+              }
+
+              // ── Gaya 'clean' (default): pola lama v4.6 ──
+              return Container(
+                color: _bg,
+                alignment: Alignment.center,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _splashLogo(110),
+                    const SizedBox(height: 16),
+                    Text(name,
+                        style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.w700,
+                            color:
+                                _dark ? Colors.white : Colors.grey.shade800)),
+                    const SizedBox(height: 20),
+                    const SizedBox(
+                      width: 28,
+                      height: 28,
+                      child: CircularProgressIndicator(strokeWidth: 3),
+                    ),
+                  ],
+                ),
+              );
+            }
+
             Widget _overlayCard({
               required IconData icon,
               required String title,
@@ -1631,40 +1817,8 @@ jobs:
                             ),
                           ),
 
-                        // ── Splash branded (logo icon user, max 6 detik) ──
-                        if (_showSplash && !_hasError)
-                          Container(
-                            color: _bg,
-                            alignment: Alignment.center,
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                // Logo custom (dari icon APK). Kalo gak ada → kosong,
-                                // spinner di bawah yang jadi indikator load.
-                                Image.asset(
-                                  'assets/splash_logo.png',
-                                  width: 110,
-                                  height: 110,
-                                  errorBuilder: (_, _, _) => const SizedBox.shrink(),
-                                ),
-                                const SizedBox(height: 16),
-                                Text(
-                                  '__APP_NAME__',
-                                  style: TextStyle(
-                                    fontSize: 18,
-                                    fontWeight: FontWeight.w700,
-                                    color: _dark ? Colors.white : Colors.grey.shade800,
-                                  ),
-                                ),
-                                const SizedBox(height: 20),
-                                const SizedBox(
-                                  width: 28,
-                                  height: 28,
-                                  child: CircularProgressIndicator(strokeWidth: 3),
-                                ),
-                              ],
-                            ),
-                          ),
+                        // ── Splash branded v5.8: 4 gaya (clean/dark/gradient/pulse) ──
+                        if (_showSplash && !_hasError) _buildSplash(),
 
                         // ── Kartu "lama banget" (backend lambat/down) ──
                         if (_isSlow && _isLoading && !_hasError)
@@ -1718,6 +1872,10 @@ jobs:
           web_url = os.environ.get('INPUT_WEB_URL', '') or ''
           mode = os.environ.get('W2A_MODE', 'url')
           splash = (os.environ.get('INPUT_SPLASH', 'true') or 'true').strip().lower()
+          # ── 👻 v5.8: gaya splash screen (khusus Web2APK: URL + HTML) ──
+          splash_style = (os.environ.get('INPUT_SPLASH_STYLE', 'clean') or 'clean').strip().lower()
+          if splash_style not in ('clean', 'dark', 'gradient', 'pulse', 'off'):
+              splash_style = 'clean'
           dark = (os.environ.get('INPUT_DARK_MODE', 'false') or 'false').strip().lower()
           # ── v5.0: tabs ──
           tabs_raw = os.environ.get('INPUT_TABS_JSON', '') or ''
@@ -1725,6 +1883,9 @@ jobs:
           slug = os.environ.get('GITHUB_SLUG', '') or ''
 
           # Normalisasi bool (true/1/yes/on = true, sisanya false)
+          # v5.8: splash_style 'off' = matiin splash total (menang atas input splash)
+          if splash_style == 'off':
+              splash = 'false'
           splash = 'true' if splash in ('1', 'true', 'yes', 'on') else 'false'
           dark = 'true' if dark in ('1', 'true', 'yes', 'on') else 'false'
 
@@ -1792,6 +1953,8 @@ jobs:
                   return 'assets/webapp/index.html' if mode == 'html' else web_url_safe
               if tok == '__SHOW_SPLASH__':
                   return splash
+              if tok == '__SPLASH_STYLE__':
+                  return splash_style
               if tok == '__DARK_THEME__':
                   return dark
               if tok == '__TABS_JSON__':
@@ -1802,10 +1965,10 @@ jobs:
                   return update_url_safe
               return tok
 
-          src = re.sub(r'__(?:APP_NAME|WEB_URL|SHOW_SPLASH|DARK_THEME|TABS_JSON|ANNOUNCE_URL|UPDATE_URL)__', repl, src)
+          src = re.sub(r'__(?:APP_NAME|WEB_URL|SHOW_SPLASH|SPLASH_STYLE|DARK_THEME|TABS_JSON|ANNOUNCE_URL|UPDATE_URL)__', repl, src)
 
           # Safety net: gak boleh ada token tersisa di main.dart
-          leftover = re.findall(r'__(?:APP_NAME|WEB_URL|SHOW_SPLASH|DARK_THEME|TABS_JSON|ANNOUNCE_URL|UPDATE_URL)__', src)
+          leftover = re.findall(r'__(?:APP_NAME|WEB_URL|SHOW_SPLASH|SPLASH_STYLE|DARK_THEME|TABS_JSON|ANNOUNCE_URL|UPDATE_URL)__', src)
           if leftover:
               raise SystemExit('ERROR: token tersisa di main.dart: %s' % leftover)
 
@@ -1844,7 +2007,7 @@ jobs:
                       f.write(pubspec)
               print('Assets registered:', need)
 
-          print('Token applied. Mode:', mode, '| splash:', splash, '| dark:', dark)
+          print('Token applied. Mode:', mode, '| splash:', splash, '| splashStyle:', splash_style, '| dark:', dark)
           print('v5.1:', 'tabs=' + tabs_safe if tabs_safe != '[]' else 'tabs=off', '| announce=' + ('on' if announce_url_safe else 'off'))
           print('v5.3:', 'ota=' + ('on' if update_url_safe else 'off'), '| pkg=' + pkg_clean)
           if mode == 'url':
