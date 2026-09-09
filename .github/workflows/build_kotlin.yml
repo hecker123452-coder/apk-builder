@@ -416,10 +416,12 @@ jobs:
           BTD="$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* 2>/dev/null | sort -V | tail -1)"
           if [ -z "$BTD" ] || [ ! -x "$BTD/aapt" ]; then echo "ℹ️ aapt gak ada — kanal OTA skip"; exit 0; fi
           BADGE="$($BTD/aapt dump badging "$APK" 2>/dev/null | head -1)"
-          PKG="$(printf '%s' "$BADGE" | sed -n "s/.*package:name='\([^']*\)'.*/\1/p")"
+          # ⚠️ aapt badging: "package: name='...'" — PAKAI SPASI. (bug v3.3.0:
+          # pattern "package:name=" tanpa spasi → PKG kosong → kanal selalu skip)
+          PKG="$(printf '%s' "$BADGE" | sed -n "s/.*package:[[:space:]]*name='\([^']*\)'.*/\1/p")"
           VC="$(printf '%s' "$BADGE" | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p")"
           if [ -z "$PKG" ] || [ "$VC" != "$RUN_NO" ]; then
-            echo "ℹ️ versionCode APK ($VC) ≠ run ($RUN_NO) — patch gradle gak nempel → kanal OTA skip (non-fatal)"
+            echo "ℹ️ PKG/VC gak cocok (PKG='$PKG' VC='$VC' vs run $RUN_NO) → kanal OTA skip (non-fatal)"
             exit 0
           fi
           echo "🎯 Kanal OTA: apk-$PKG v$RUN_NO"
