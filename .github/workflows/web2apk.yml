@@ -1,7 +1,8 @@
 name: Web2APK
 
 # ============================================================================
-# DZR CloudBuilder — Web2APK Workflow v6.0 (📏 ROLLOUT + 📊 STATS PING —
+# DZR CloudBuilder — Web2APK Workflow v6.1 (🚫 OTA OFF buat WebView/HTML +
+# ⚡ gradle tuning + 👻 8 gaya splash) — sebelumnya v6.0 (📏 ROLLOUT + 📊 STATS
 #                            ANTI-RACE + GAYA SPLASH: CLEAN/DARK/GRADIENT/PULSE)
 # ============================================================================
 # FITUR LOG v6.0 (request owner: "gas semua" — rollout + statistik):
@@ -217,7 +218,7 @@ on:
         required: false
         default: 'true'
       splash_style:
-        description: 'v5.8 Gaya splash: clean|dark|gradient|pulse|off (khusus Web2APK)'
+        description: 'v6.1 Gaya splash: clean|dark|gradient|pulse|neon|sunset|ocean|aurora|off (khusus Web2APK)'
         required: false
         default: 'clean'
       dark_mode:
@@ -240,6 +241,10 @@ on:
         description: '📊 v3.3 URL ping statistik cek update (kosong = mati). Di-inject bot, gak disimpen di repo.'
         required: false
         default: ''
+      ota_enabled:
+        description: '🔄 v6.1 OTA update buat app ini (1/0). WebView/HTML = 0 (request owner: update cuma buat Kotlin & Flutter) — updater app senyap total.'
+        required: false
+        default: '0'
 
 jobs:
   build:
@@ -263,6 +268,7 @@ jobs:
       INPUT_HTML_ZIP_URL: ${{ inputs.html_zip_url }}
       INPUT_TABS_JSON: ${{ inputs.tabs_json }}
       INPUT_STATS_URL: ${{ inputs.stats_url }}
+      INPUT_OTA_ENABLED: ${{ inputs.ota_enabled }}
       # ── v5.1: slug "owner/repo" buat URL pengumuman global (tanpa input bot) ──
       GITHUB_SLUG: ${{ github.repository }}
 
@@ -301,6 +307,21 @@ jobs:
           key: w2a-v2-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
             w2a-v2-${{ runner.os }}-
+
+      # ── ⚡ v6.1: TUNE GRADLE (request owner: "build makin cepet") ──
+      # gradle.properties global buat runner: parallel task + build cache +
+      # heap pas (runner 2-core/7GB). Aman buat semua project, dampak langsung
+      # ke fase :app (configure + compile + dex).
+      - name: Tune Gradle (speed)
+        run: |
+          mkdir -p ~/.gradle
+          cat > ~/.gradle/gradle.properties <<'GPROP'
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          org.gradle.configureondemand=true
+          org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8
+          GPROP
+          echo "⚡ gradle.properties tuning dipasang (parallel + caching + heap 3g)"
 
       - name: Install ImageMagick
         run: sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick
@@ -1631,6 +1652,247 @@ jobs:
                 );
               }
 
+              // ── Gaya 'neon' (v3.4): hitam pekat + ring neon cyan ingkil logo
+              // + glow pink di nama & spinner — ala cyber. Preview: assets/splash/neon.png
+              if (style == 'neon') {
+                return Container(
+                  color: const Color(0xFF0A0A12),
+                  alignment: Alignment.center,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          border: Border.all(color: const Color(0xFF22D3EE), width: 2),
+                          boxShadow: [
+                            BoxShadow(
+                                color: const Color(0xFF22D3EE).withValues(alpha: 0.55),
+                                blurRadius: 26,
+                                spreadRadius: 2),
+                          ],
+                        ),
+                        child: _splashLogo(96),
+                      ),
+                      const SizedBox(height: 18),
+                      Text(name,
+                          style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.white,
+                              shadows: [
+                                Shadow(
+                                    color: const Color(0xFFF472B6).withValues(alpha: 0.75),
+                                    blurRadius: 14),
+                              ])),
+                      const SizedBox(height: 22),
+                      const SizedBox(
+                          width: 28,
+                          height: 28,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 3, color: Color(0xFFF472B6))),
+                    ],
+                  ),
+                );
+              }
+
+              // ── Gaya 'sunset' (v3.4): senja jingga→pink→ungu, matahari lembut
+              // pojok kanan atas, logo di lingkaran kaca. Preview: sunset.png
+              if (style == 'sunset') {
+                return Container(
+                  decoration: const BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [
+                        Color(0xFFFF9A5A),
+                        Color(0xFFFF5E7E),
+                        Color(0xFF8A4DFF),
+                      ],
+                    ),
+                  ),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      Positioned(
+                        top: 64,
+                        right: 38,
+                        child: Container(
+                          width: 110,
+                          height: 110,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            gradient: RadialGradient(colors: [
+                              const Color(0xFFFFEEAA).withValues(alpha: 0.95),
+                              const Color(0xFFFFEEAA).withValues(alpha: 0.0),
+                            ]),
+                          ),
+                        ),
+                      ),
+                      Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(18),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.18),
+                                shape: BoxShape.circle,
+                              ),
+                              child: _splashLogo(96),
+                            ),
+                            const SizedBox(height: 18),
+                            const Text(name,
+                                style: TextStyle(
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.w700,
+                                    color: Colors.white)),
+                            const SizedBox(height: 22),
+                            const SizedBox(
+                                width: 28,
+                                height: 28,
+                                child: CircularProgressIndicator(
+                                    strokeWidth: 3, color: Colors.white70)),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }
+
+              // ── Gaya 'ocean' (v3.4): biru laut berlapis gelombang putih
+              // lembut di bawah — segar & tenang. Preview: ocean.png
+              if (style == 'ocean') {
+                return Container(
+                  decoration: const BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [
+                        Color(0xFF0EA5E9),
+                        Color(0xFF2563EB),
+                        Color(0xFF1E3A8A),
+                      ],
+                    ),
+                  ),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      Positioned(
+                        bottom: -120,
+                        left: -60,
+                        child: Container(
+                          width: 480,
+                          height: 260,
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.10),
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                      ),
+                      Positioned(
+                        bottom: -150,
+                        left: -90,
+                        child: Container(
+                          width: 560,
+                          height: 280,
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.08),
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                      ),
+                      Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(18),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.18),
+                                shape: BoxShape.circle,
+                              ),
+                              child: _splashLogo(96),
+                            ),
+                            const SizedBox(height: 18),
+                            const Text(name,
+                                style: TextStyle(
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.w700,
+                                    color: Colors.white)),
+                            const SizedBox(height: 22),
+                            const SizedBox(
+                                width: 28,
+                                height: 28,
+                                child: CircularProgressIndicator(
+                                    strokeWidth: 3, color: Colors.white)),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }
+
+              // ── Gaya 'aurora' (v3.4): langit malam + cahaya ungu/cyan/hijau
+              // (blobs radial lembut), logo di ring kaca — mystic. Preview: aurora.png
+              if (style == 'aurora') {
+                Widget blob(double size, Color c, double opacity) {
+                  return Container(
+                    width: size,
+                    height: size,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      gradient: RadialGradient(colors: [
+                        c.withValues(alpha: opacity),
+                        c.withValues(alpha: 0.0),
+                      ]),
+                    ),
+                  );
+                }
+                return Container(
+                  color: const Color(0xFF0B1020),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      Positioned(top: 70, left: -70, child: blob(260, const Color(0xFF8B5CF6), 0.55)),
+                      Positioned(top: 150, right: -80, child: blob(280, const Color(0xFF22D3EE), 0.45)),
+                      Positioned(bottom: 40, left: 40, child: blob(300, const Color(0xFF34D399), 0.38)),
+                      Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(18),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.12),
+                                shape: BoxShape.circle,
+                                border: Border.all(color: Colors.white.withValues(alpha: 0.16)),
+                              ),
+                              child: _splashLogo(96),
+                            ),
+                            const SizedBox(height: 18),
+                            const Text(name,
+                                style: TextStyle(
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.w700,
+                                    color: Colors.white)),
+                            const SizedBox(height: 22),
+                            const SizedBox(
+                                width: 28,
+                                height: 28,
+                                child: CircularProgressIndicator(
+                                    strokeWidth: 3, color: Color(0xFF34D399))),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }
+
               // ── Gaya 'clean' (default): pola lama v4.6 ──
               return Container(
                 color: _bg,
@@ -2024,17 +2286,24 @@ jobs:
                                    + '/main/announcements/global.json')
               announce_url_safe = announce_url_safe.replace('\\', '\\\\').replace("'", "\\'")
 
-          # ── 🔄 v5.2: URL manifest OTA update — updates/<pkg>.json di repo.
+          # ── 🔄 v5.2 → v6.1: URL manifest OTA update — updates/<pkg>.json di repo.
           # Bot nulis file ini tiap build sukses (versionCode = run number).
+          # 🚫 v6.1: INPUT_OTA_ENABLED != '1' → URL SENGAJA KOSONG → Dart
+          # _checkUpdate balik di guard `if (kUpdateUrl.isEmpty) return` —
+          # app WebView/HTML GAK PERNAH ngecek update (request owner: update
+          # cuma buat Kotlin & Flutter; konten web hidup sendiri).
           pkg_raw = os.environ.get('INPUT_PACKAGE_NAME', '') or ''
           pkg_clean = re.sub(r'[^A-Za-z0-9.]', '', pkg_raw).strip('.')
           if not pkg_clean:
               pkg_clean = 'com.deruzuan.webapp'
+          ota_on = str(os.environ.get('INPUT_OTA_ENABLED', '0') or '0').strip().lower() in ('1', 'true', 'yes')
           update_url_safe = ''
-          if slug.strip():
+          if ota_on and slug.strip():
               update_url_safe = ('https://raw.githubusercontent.com/' + slug.strip()
                                  + '/main/updates/' + pkg_clean + '.json')
               update_url_safe = update_url_safe.replace('\\', '\\\\').replace("'", "\\'")
+          if not ota_on:
+              print('OTA OFF (WebView/HTML): updater app ini dimatiin (kUpdateUrl kosong)')
 
           # ── 📊 v3.3: URL ping statistik (input stats_url dari bot, kosong = mati).
           # Gak ada default di workflow — IP server bot GAK PERNAH hardcode di repo.
