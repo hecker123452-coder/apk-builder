@@ -104,6 +104,20 @@ jobs:
           restore-keys: |
             gkotlin-v1-${{ runner.os }}-
 
+      # ── ⚡ v3.4: TUNE GRADLE (request owner: "build makin cepet") ──
+      # Parallel task + build cache + heap pas — dampak langsung ke fase
+      # configure/compile/dex Gradle. Aman buat semua project Kotlin.
+      - name: Tune Gradle (speed)
+        run: |
+          mkdir -p ~/.gradle
+          cat > ~/.gradle/gradle.properties <<'GPROP'
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          org.gradle.configureondemand=true
+          org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8
+          GPROP
+          echo "⚡ gradle.properties tuning dipasang (parallel + caching + heap 3g)"
+
       - name: Download + Extract + Locate Project
         run: |
           # ── Download (identik dgn build.yml) ──
@@ -410,7 +424,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          APK=$(ls -t apk_out/*.apk 2>/dev/null | head -1)
+          # pipefail-safe (v3.4): pipeline gagal tetap lanjut → skip, gak bikin build gagal
+          APK="$(ls -t apk_out/*.apk 2>/dev/null | head -1 || true)"
           if [ -z "$APK" ]; then echo "ℹ️ Gak ada APK — kanal OTA skip"; exit 0; fi
           RUN_NO="${GITHUB_RUN_NUMBER:-1}"
           BTD="$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* 2>/dev/null | sort -V | tail -1)"
