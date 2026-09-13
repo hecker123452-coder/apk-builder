@@ -23,6 +23,12 @@ dev_dependencies:
   # Generator icon launcher (mipmap semua densitas) dari assets/icon.png
   flutter_launcher_icons: ^0.14.1
 
+# 🐛 FIX build: lifecycle 2.0.26+ butuh compileSdk 36 — submodule file_picker
+# compile pakai default flutter (34) → CheckAarMetadata gagal. Pin ke 2.0.22
+# yang happy di SDK 34 (API-nya stabil, file_picker 8.x kompatibel).
+dependency_overrides:
+  flutter_plugin_android_lifecycle: 2.0.22
+
 flutter:
   uses-material-design: true
   assets:
