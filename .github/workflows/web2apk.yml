@@ -1,7 +1,7 @@
 name: Web2APK
 
 # ============================================================================
-# DZR CloudBuilder — Web2APK Workflow v6.1 (🚫 OTA OFF buat WebView/HTML +
+# DZR CloudBuilder — Web2APK Workflow v6.2 (🚫 OTA OFF buat WebView/HTML +
 # ⚡ gradle tuning + 👻 8 gaya splash) — sebelumnya v6.0 (📏 ROLLOUT + 📊 STATS
 #                            ANTI-RACE + GAYA SPLASH: CLEAN/DARK/GRADIENT/PULSE)
 # ============================================================================
@@ -527,7 +527,86 @@ jobs:
               echo "Download gagal (HTTP $HTTP_CODE atau file kosong), pake icon default Flutter"
             fi
           else
-            echo "Gak ada icon URL, pake icon default Flutter"
+            # ── 🎨 v6.2 AUTO-ICON PREMIUM: gak ada icon → generate gradient + inisial ──
+            # Dulu: "pake icon default Flutter" = logo F bawaan — keliatan murahan.
+            # Sekarang: PIL bikin icon 512x512 (gradient 2 warna di-hash dari nama
+            # app → konsisten antar rebuild, inisial putih tebal, gloss + ring) dan
+            # di-apply ke semua mipmap + jadi splash logo. Gagal → fallback default.
+            echo "Gak ada icon URL → AUTO-ICON PREMIUM (gradient + inisial nama app)..."
+            python3 -c "import PIL" 2>/dev/null || pip3 install --quiet pillow 2>/dev/null || true
+            python3 - "${INPUT_APP_NAME:-WebApp}" /tmp/app_icon_valid.png <<'PILGEN' 2>/dev/null || true
+          import sys
+          try:
+              from PIL import Image, ImageDraw, ImageFont
+          except Exception:
+              sys.exit(1)
+          name = (sys.argv[1] if len(sys.argv) > 1 else "WebApp").strip() or "WebApp"
+          out = sys.argv[2] if len(sys.argv) > 2 else "icon.png"
+          try:
+              h = 0
+              for ch in name.lower():
+                  h = (h * 31 + ord(ch)) & 0xFFFFFF
+              c1 = (40 + (h % 180), 40 + ((h >> 3) % 180), 90 + ((h >> 6) % 165))
+              c2 = ((c1[0] + 90) % 256, (c1[1] + 140) % 256, (c1[2] + 120) % 256)
+              S = 512
+              img = Image.new("RGB", (S, S), c1)
+              dr = ImageDraw.Draw(img)
+              for y in range(S):
+                  t = y / (S - 1)
+                  dr.line([(0, y), (S, y)], fill=(int(c1[0] + (c2[0] - c1[0]) * t), int(c1[1] + (c2[1] - c1[1]) * t), int(c1[2] + (c2[2] - c1[2]) * t)))
+              white = Image.new("RGB", (S, S), (255, 255, 255))
+              ov = Image.new("L", (S, S), 0)
+              ImageDraw.Draw(ov).ellipse([int(-S * 0.35), int(-S * 0.55), int(S * 1.35), int(S * 0.45)], fill=40)
+              img = Image.composite(white, img, ov)
+              try:
+                  ring = Image.new("L", (S, S), 0)
+                  ImageDraw.Draw(ring).rounded_rectangle([8, 8, S - 9, S - 9], radius=88, outline=110, width=6)
+                  img = Image.composite(white, img, ring)
+              except Exception:
+                  pass
+              dr = ImageDraw.Draw(img)
+              words = [w for w in name.replace("-", " ").replace("_", " ").replace(".", " ").split() if w]
+              ini = "".join(w[0] for w in words[:2]).upper() or "A"
+              font = None
+              for fpath in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf", "DejaVuSans-Bold.ttf"):
+                  try:
+                      font = ImageFont.truetype(fpath, 220)
+                      break
+                  except Exception:
+                      pass
+              if font is None:
+                  font = ImageFont.load_default()
+              bb = dr.textbbox((0, 0), ini, font=font)
+              dr.text(((S - (bb[2] - bb[0])) / 2 - bb[0], (S - (bb[3] - bb[1])) / 2 - bb[1]), ini, font=font, fill=(255, 255, 255))
+              img.save(out, "PNG")
+              print("AUTO-ICON: inisial " + ini + " -> " + out)
+          except Exception as e:
+              print("AUTO-ICON gagal: " + str(e))
+              sys.exit(1)
+          PILGEN
+            PNG_MAGIC=$(xxd -l 4 -p /tmp/app_icon_valid.png 2>/dev/null || echo "")
+            if [ "$PNG_MAGIC" = "89504e47" ]; then
+              echo "Auto-icon valid! Applying ke mipmap directories..."
+              for dir in android/app/src/main/res/mipmap-*; do
+                if [ -d "$dir" ]; then
+                  dirname=$(basename "$dir")
+                  case "$dirname" in
+                    mipmap-mdpi)    SIZE=48  ;;
+                    mipmap-hdpi)    SIZE=72  ;;
+                    mipmap-xhdpi)   SIZE=96  ;;
+                    mipmap-xxhdpi)  SIZE=144 ;;
+                    mipmap-xxxhdpi) SIZE=192 ;;
+                    *)              SIZE=96  ;;
+                  esac
+                  convert /tmp/app_icon_valid.png -resize ${SIZE}x${SIZE} -define png:compression-level=9 "$dir/ic_launcher.png" 2>/dev/null && \
+                  echo "  $dirname -> ${SIZE}x${SIZE} OK" || echo "  $dirname -> GAGAL, pake default"
+                fi
+              done
+              ICON_APPLIED=true
+              echo "Auto-icon premium terpasang!"
+            else
+              echo "Auto-icon gagal → pake icon default Flutter"
+            fi
           fi
 
           # ── Splash logo: icon jadi asset buat splash screen (v4.6) ──
@@ -2951,7 +3030,86 @@ jobs:
               echo "Download gagal (HTTP $HTTP_CODE atau file kosong), pake icon default Flutter"
             fi
           else
-            echo "Gak ada icon URL, pake icon default Flutter"
+            # ── 🎨 v6.2 AUTO-ICON PREMIUM: gak ada icon → generate gradient + inisial ──
+            # Dulu: "pake icon default Flutter" = logo F bawaan — keliatan murahan.
+            # Sekarang: PIL bikin icon 512x512 (gradient 2 warna di-hash dari nama
+            # app → konsisten antar rebuild, inisial putih tebal, gloss + ring) dan
+            # di-apply ke semua mipmap + jadi splash logo. Gagal → fallback default.
+            echo "Gak ada icon URL → AUTO-ICON PREMIUM (gradient + inisial nama app)..."
+            python3 -c "import PIL" 2>/dev/null || pip3 install --quiet pillow 2>/dev/null || true
+            python3 - "${INPUT_APP_NAME:-WebApp}" /tmp/app_icon_valid.png <<'PILGEN' 2>/dev/null || true
+          import sys
+          try:
+              from PIL import Image, ImageDraw, ImageFont
+          except Exception:
+              sys.exit(1)
+          name = (sys.argv[1] if len(sys.argv) > 1 else "WebApp").strip() or "WebApp"
+          out = sys.argv[2] if len(sys.argv) > 2 else "icon.png"
+          try:
+              h = 0
+              for ch in name.lower():
+                  h = (h * 31 + ord(ch)) & 0xFFFFFF
+              c1 = (40 + (h % 180), 40 + ((h >> 3) % 180), 90 + ((h >> 6) % 165))
+              c2 = ((c1[0] + 90) % 256, (c1[1] + 140) % 256, (c1[2] + 120) % 256)
+              S = 512
+              img = Image.new("RGB", (S, S), c1)
+              dr = ImageDraw.Draw(img)
+              for y in range(S):
+                  t = y / (S - 1)
+                  dr.line([(0, y), (S, y)], fill=(int(c1[0] + (c2[0] - c1[0]) * t), int(c1[1] + (c2[1] - c1[1]) * t), int(c1[2] + (c2[2] - c1[2]) * t)))
+              white = Image.new("RGB", (S, S), (255, 255, 255))
+              ov = Image.new("L", (S, S), 0)
+              ImageDraw.Draw(ov).ellipse([int(-S * 0.35), int(-S * 0.55), int(S * 1.35), int(S * 0.45)], fill=40)
+              img = Image.composite(white, img, ov)
+              try:
+                  ring = Image.new("L", (S, S), 0)
+                  ImageDraw.Draw(ring).rounded_rectangle([8, 8, S - 9, S - 9], radius=88, outline=110, width=6)
+                  img = Image.composite(white, img, ring)
+              except Exception:
+                  pass
+              dr = ImageDraw.Draw(img)
+              words = [w for w in name.replace("-", " ").replace("_", " ").replace(".", " ").split() if w]
+              ini = "".join(w[0] for w in words[:2]).upper() or "A"
+              font = None
+              for fpath in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf", "DejaVuSans-Bold.ttf"):
+                  try:
+                      font = ImageFont.truetype(fpath, 220)
+                      break
+                  except Exception:
+                      pass
+              if font is None:
+                  font = ImageFont.load_default()
+              bb = dr.textbbox((0, 0), ini, font=font)
+              dr.text(((S - (bb[2] - bb[0])) / 2 - bb[0], (S - (bb[3] - bb[1])) / 2 - bb[1]), ini, font=font, fill=(255, 255, 255))
+              img.save(out, "PNG")
+              print("AUTO-ICON: inisial " + ini + " -> " + out)
+          except Exception as e:
+              print("AUTO-ICON gagal: " + str(e))
+              sys.exit(1)
+          PILGEN
+            PNG_MAGIC=$(xxd -l 4 -p /tmp/app_icon_valid.png 2>/dev/null || echo "")
+            if [ "$PNG_MAGIC" = "89504e47" ]; then
+              echo "Auto-icon valid! Applying ke mipmap directories..."
+              for dir in android/app/src/main/res/mipmap-*; do
+                if [ -d "$dir" ]; then
+                  dirname=$(basename "$dir")
+                  case "$dirname" in
+                    mipmap-mdpi)    SIZE=48  ;;
+                    mipmap-hdpi)    SIZE=72  ;;
+                    mipmap-xhdpi)   SIZE=96  ;;
+                    mipmap-xxhdpi)  SIZE=144 ;;
+                    mipmap-xxxhdpi) SIZE=192 ;;
+                    *)              SIZE=96  ;;
+                  esac
+                  convert /tmp/app_icon_valid.png -resize ${SIZE}x${SIZE} -define png:compression-level=9 "$dir/ic_launcher.png" 2>/dev/null && \
+                  echo "  $dirname -> ${SIZE}x${SIZE} OK" || echo "  $dirname -> GAGAL, pake default"
+                fi
+              done
+              ICON_APPLIED=true
+              echo "Auto-icon premium terpasang!"
+            else
+              echo "Auto-icon gagal → pake icon default Flutter"
+            fi
           fi
 
           # ── ⚙️ v4.8 AGP9 safety net: patch plugin pub-cache yang masih pake
