@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'; // Clipboard (paste key)
 
 import '../core/api.dart';
 import '../core/theme.dart';
