@@ -82,12 +82,12 @@ jobs:
               src = src.replace("<application", "    <uses-permission android:name=\"android.permission.INTERNET\"/>\n    <application", 1)
           src = src.replace('android:label="dzr_builder"', 'android:label="DZR Builder"')
           open(p, "w").write(src)
-          g = "android/app/build.gradle"
+          g = "android/app/build.gradle.kts" if __import__("os").path.exists("android/app/build.gradle.kts") else "android/app/build.gradle"
           grad = open(g).read()
           grad = re.sub(r"compileSdk\s*=\s*flutter\.compileSdkVersion", "compileSdk = 36", grad)
           grad = re.sub(r"compileSdkVersion\s+flutter\.compileSdkVersion", "compileSdkVersion 36", grad)
           open(g, "w").write(grad)
-          print("✅ manifest: INTERNET + label | gradle: compileSdk 36")
+          print("✅ manifest: INTERNET + label | gradle(" + g + "): compileSdk 36")
           PYEOF
 
       # ── Icon launcher native dari assets/icon.png (mipmap semua densitas) ──
