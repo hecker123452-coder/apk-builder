@@ -1,0 +1,270 @@
+name: Repack APK (REKON)
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🔄 v4.1.0 REKON — ZIP → APK 100% UTUH (jalur ZIP editan/asing)
+# ══════════════════════════════════════════════════════════════════════════
+# Bot kirim ZIP isinya APK utuh (root: AndroidManifest.xml + classes*.dex).
+# Runner:
+#   1) Struktur dicek (bukan APK → gagal jelas, gak buang waktu)
+#   2) apksigner verify ATAS BYTE ASLI ZIP-nya:
+#        ✅ valid  → MODE=passthrough → byte ASLI dijadiin output (signature
+#                    ASLI kekang — 100% bit-per-byte, update-over-install aman)
+#        ❌ invalid (ZIP pernah diedit / APK unsigned) → MODE=resigned:
+#             - buang file signature lama (META-INF/*.SF dst, META-INF/services
+#               dipertahankan — file service-loader jangan sampai kebuang!)
+#             - repack DETERMINISTIK via python zipfile:
+#                 resources.arsc + lib/*/*.so → STORED (wajib uncompressed
+#                 buat targetSdk 30+ / extractNativeLibs=false),
+#                 sisanya DEFLATED
+#             - zipalign -f -p 4 → rapikan alignment 4-byte + page-align .so
+#             - sign pake keystore per-user (keystores/u<id>.jks.enc, sistem
+#               yang sama dengan build DZR) → signature konsisten antar build
+#   3) meta.json (mode + aapt badging) + artifact repack-output
+# Bot (index.js) yang ngambil artifact + kirim APK ke user — consistent dgn
+# jalur build.yml, anti double-send.
+#
+# NOTE: chat_id/bot_token dideklarasiin tapi sengaja gak dipake bot — kompat
+# dispatch manual + slot fallback kirim langsung kalau suatu saat perlu.
+# ══════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: 'URL ZIP isinya APK utuh (hasil /apk2zip ato ZIP asing)'
+        required: true
+      tag:
+        description: 'Tag run REKON'
+        required: true
+      chat_id:
+        description: 'Telegram chat (dipake bot, bukan runner)'
+        required: false
+        default: ''
+      bot_token:
+        description: 'Telegram bot token (dipake bot, bukan runner)'
+        required: false
+        default: ''
+      keystore_id:
+        description: 'ID keystore per user (mis. 12345 → keystores/u12345.jks.enc). Kosong = keystore global.'
+        required: false
+        default: ''
+      apk_name:
+        description: 'Nama file APK output'
+        required: false
+        default: 'app.apk'
+
+jobs:
+  repack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: write
+    env:
+      LC_ALL: C.UTF-8
+      LANG: C.UTF-8
+      INPUT_ZIP_URL: ${{ inputs.zip_url }}
+      INPUT_TAG: ${{ inputs.tag }}
+      INPUT_KEYSTORE_ID: ${{ inputs.keystore_id }}
+      INPUT_APK_NAME: ${{ inputs.apk_name }}
+
+    steps:
+      - name: Setup JDK 17 (buat apksigner)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Download + cek struktur APK
+        run: |
+          HTTP_CODE=$(curl -sL -w "%{http_code}" -o project.zip \
+            --retry 3 --retry-delay 2 --retry-connrefused \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "$INPUT_ZIP_URL")
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "ERROR: Download failed! HTTP $HTTP_CODE"; exit 1
+          fi
+          MAGIC=$(od -A n -t x1 -N 4 project.zip 2>/dev/null | tr -d ' ')
+          if ! echo "$MAGIC" | grep -qi "^504b"; then
+            echo "ERROR: Bukan ZIP valid!"; exit 1
+          fi
+          echo "📦 ZIP: $(du -sh project.zip | cut -f1)"
+          rm -rf work && mkdir -p work
+          if ! unzip -q project.zip -d work; then
+            echo "ERROR: Extract gagal — ZIP korup!"; exit 1
+          fi
+          if [ ! -f "work/AndroidManifest.xml" ]; then
+            echo "ERROR: AndroidManifest.xml gak ada di root — INI BUKAN APK UTUH."
+            echo "Hint: kirim file .apk langsung ke /apk2zip, ato ZIP-nya keliru."
+            exit 1
+          fi
+          if ! ls work/classes*.dex >/dev/null 2>&1 && [ ! -f "work/resources.arsc" ]; then
+            echo "ERROR: classes*.dex / resources.arsc gak ketemu — bukan APK utuh."
+            exit 1
+          fi
+          echo "✅ Struktur APK valid: $(ls work | wc -l) entri root"
+
+      # ── Coba PASSTHROUGH: signature di atas byte ASLI masih valid? ──
+      # ZIP = APK. Kalau byte gak pernah diutak-atik, signature asli tetep
+      # sah → output = byte asli persis (100% mirip, signature kekang).
+      - name: Verifikasi signature asli (passthrough?)
+        run: |
+          mkdir -p out
+          BT=$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* | sort -V | tail -1)
+          echo "BT=$BT" >> "$GITHUB_ENV"
+          cp project.zip /tmp/candidate.apk
+          if "$BT/apksigner" verify /tmp/candidate.apk >/tmp/verify.log 2>&1; then
+            echo "MODE=passthrough" >> "$GITHUB_ENV"
+            cp /tmp/candidate.apk out/final.apk
+            echo "✅ PASSTHROUGH: signature ASLI masih valid — byte 100% utuh"
+          else
+            echo "MODE=resigned" >> "$GITHUB_ENV"
+            echo "ℹ️ signature asli gak valid (ZIP diedit / unsigned) → jalur re-pack + re-sign"
+            tail -5 /tmp/verify.log || true
+          fi
+
+      - name: Repack presisi (hanya kalau gak passthrough)
+        if: env.MODE == 'resigned'
+        run: |
+          cd work
+          python3 - <<'PYREPACK'
+          import os, re, zipfile
+          src = "."
+          out = "/tmp/repacked.apk"
+          SIG = re.compile(r"^META-INF/(MANIFEST\.MF|.*\.(SF|RSA|DSA|EC))$")
+          def store(rel):
+              if rel == "resources.arsc": return True          # wajib uncompressed (API 30+)
+              if rel.startswith("lib/") and rel.endswith(".so"): return True  # extractNativeLibs=false
+              return False
+          n = 0
+          with zipfile.ZipFile(out, "w") as z:
+              for root, dirs, files in os.walk(src):
+                  dirs.sort()
+                  for f in sorted(files):
+                      p = os.path.join(root, f)
+                      rel = os.path.relpath(p, src).replace(os.sep, "/")
+                      if SIG.match(rel): continue              # buang signature lama
+                      zi = zipfile.ZipInfo(rel, date_time=(2024, 1, 1, 0, 0, 0))
+                      zi.compress_type = zipfile.ZIP_STORED if store(rel) else zipfile.ZIP_DEFLATED
+                      zi.external_attr = 0o644 << 16
+                      with open(p, "rb") as fh:
+                          z.writestr(zi, fh.read())
+                      n += 1
+          print(f"📦 repack: {n} file | arsc/so STORED, sisanya deflated")
+          PYREPACK
+          # zipalign: 4-byte align (termasuk resources.arsc) + page-align .so
+          "$BT/zipalign" -f -p 4 /tmp/repacked.apk /tmp/aligned.apk
+          echo "✅ zipalign OK"
+
+      # ── 🔐 Keystore stabil (sistem identik build.yml — per-user, terenkripsi) ──
+      - name: Stable signing (REKON re-sign)
+        if: env.MODE == 'resigned'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          KS_PASS: ${{ secrets.KS_PASS }}
+          KS_PASS_OLD: ${{ secrets.KS_PASS_OLD }}
+          KS_ENC_KEY: ${{ secrets.KS_ENC_KEY }}
+        run: |
+          KID=$(printf '%s' "${INPUT_KEYSTORE_ID:-}" | tr -cd 'a-zA-Z0-9')
+          if [ -n "$KID" ]; then
+            KS_ENC_PATH="keystores/u${KID}.jks.enc"
+            echo "🔐 Keystore PER-USER: $KS_ENC_PATH"
+          else
+            KS_ENC_PATH="signing/global-v2.jks.enc"
+            echo "🔐 Keystore GLOBAL (keystore_id kosong): $KS_ENC_PATH"
+          fi
+          KS_ENC="$KS_ENC_PATH"
+          KS=/tmp/keystore.jks
+          rm -f "$KS" /tmp/ks.enc
+          ENC_HTTP=$(curl -sL -o /tmp/ks_enc.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GH_REPO}/contents/${KS_ENC}?ref=main")
+          if [ "$ENC_HTTP" = "200" ]; then
+            python3 -c "import json,base64;open('/tmp/ks.enc','wb').write(base64.b64decode(json.load(open('/tmp/ks_enc.json'))['content']))" 2>/dev/null || true
+          fi
+          if [ "$ENC_HTTP" = "200" ] && [ -s /tmp/ks.enc ]; then
+            if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in /tmp/ks.enc -out "$KS" -pass pass:"$KS_ENC_KEY" 2>/dev/null || [ ! -s "$KS" ]; then
+              echo "=== REKON FAILED: keystore terenkripsi ada tapi GAGAL didekrip (cek secret KS_ENC_KEY) ==="
+              exit 1
+            fi
+            KS_USE_PASS=""
+            if keytool -list -keystore "$KS" -storepass "$KS_PASS" -alias dzr >/dev/null 2>&1; then
+              KS_USE_PASS="$KS_PASS"
+            elif [ -n "$KS_PASS_OLD" ] && keytool -list -keystore "$KS" -storepass "$KS_PASS_OLD" -alias dzr >/dev/null 2>&1; then
+              KS_USE_PASS="$KS_PASS_OLD"
+              echo "ℹ️ Keystore legacy (pass lama) — tetep dipake"
+            fi
+            if [ -z "$KS_USE_PASS" ]; then
+              echo "=== REKON FAILED: keystore didekrip tapi pass gak cocok (KS_PASS/KS_PASS_OLD salah) ==="
+              exit 1
+            fi
+            echo "🔐 Keystore stabil: DIPAKE dari $KS_ENC (dekripsi OK)"
+          else
+            echo "Keystore belum ada — generate BARU + commit TERENKRIPSI ($KS_ENC)..."
+            keytool -genkeypair -v -keystore "$KS" -alias dzr -keyalg RSA -keysize 2048 \
+              -validity 10950 -storepass "$KS_PASS" -keypass "$KS_PASS" \
+              -dname "CN=DZR CloudBuilder, OU=Deruzuan, O=DZR, L=Jakarta, C=ID" >/dev/null 2>&1
+            ENC_B64=$(openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -in "$KS" -pass pass:"$KS_ENC_KEY" | base64 -w0)
+            PAYLOAD=$(python3 -c "import json,sys;print(json.dumps({'message':'chore: stable signing keystore (encrypted at rest)','content':sys.argv[1],'branch':'main'}))" "$ENC_B64")
+            PUT_HTTP=$(curl -sL -o /tmp/ks_put.json -w "%{http_code}" -X PUT \
+              -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+              -d "$PAYLOAD" "https://api.github.com/repos/${GH_REPO}/contents/${KS_ENC}")
+            KS_USE_PASS="$KS_PASS"
+            if [ "$PUT_HTTP" != "200" ] && [ "$PUT_HTTP" != "201" ]; then
+              echo "Commit gagal (HTTP $PUT_HTTP) — race guard: ambil yang di repo..."
+              ENC_HTTP=$(curl -sL -o /tmp/ks_enc.json -w "%{http_code}" \
+                -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${GH_REPO}/contents/${KS_ENC}?ref=main")
+              if [ "$ENC_HTTP" = "200" ]; then
+                python3 -c "import json,base64;open('/tmp/ks.enc','wb').write(base64.b64decode(json.load(open('/tmp/ks_enc.json'))['content']))" 2>/dev/null || true
+              fi
+              if [ "$ENC_HTTP" = "200" ] && [ -s /tmp/ks.enc ] \
+                && openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in /tmp/ks.enc -out "$KS" -pass pass:"$KS_ENC_KEY" 2>/dev/null \
+                && [ -s "$KS" ] && keytool -list -keystore "$KS" -storepass "$KS_PASS" -alias dzr >/dev/null 2>&1; then
+                echo "🔐 Race guard: pake keystore dari repo (identik)"
+              else
+                echo "=== REKON FAILED: keystore gak bisa disimpan/diambil ==="
+                exit 1
+              fi
+            else
+              echo "🔐 Keystore baru disimpen TERENKRIPSI di repo ($KS_ENC)"
+            fi
+          fi
+          "$BT/apksigner" sign --ks "$KS" --ks-key-alias dzr \
+            --ks-pass "pass:$KS_USE_PASS" --key-pass "pass:$KS_USE_PASS" \
+            --out out/final.apk /tmp/aligned.apk
+          "$BT/apksigner" verify out/final.apk \
+            && echo "✅ APK hasil repack ke-sign + verify OK" \
+            || { echo "=== REKON FAILED: verify pasca-sign gagal ==="; exit 1; }
+
+      - name: Meta + laporan badging
+        if: always()
+        run: |
+          if [ -f out/final.apk ]; then
+            MODE_LINE=$(grep -o "MODE=[a-z]*" "$GITHUB_ENV" | tail -1 | cut -d= -f2)
+            MODE="${MODE_LINE:-unknown}"
+            PKG=""; VER=""
+            if [ -x "$BT/aapt" ]; then
+              BADGE=$("$BT/aapt" dump badging out/final.apk 2>/dev/null | head -40 || true)
+              PKG=$(echo "$BADGE" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -1)
+              VER=$(echo "$BADGE" | sed -n "s/^package:.*versionName='\([^']*\)'.*/\1/p" | head -1)
+              echo "$BADGE" > out/badging.txt || true
+            fi
+            printf '{"mode":"%s","package":"%s","versionName":"%s","tag":"%s","at":"%s"}\n' \
+              "$MODE" "$PKG" "$VER" "$INPUT_TAG" "$(date -u +%FT%TZ)" > out/meta.json
+            cat out/meta.json
+          else
+            echo "out/final.apk gak ada — run gagal di step sebelumnya"
+          fi
+
+      - name: Upload hasil REKON
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repack-output
+          path: |
+            out/final.apk
+            out/meta.json
+          retention-days: 3
+          if-no-files-found: error
