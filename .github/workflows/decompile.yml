@@ -1,0 +1,136 @@
+name: Decompile APK (REKON)
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🔍 v4.1.1 REKON+ — APK → source best-effort (jadx)
+# ══════════════════════════════════════════════════════════════════════════
+# JUJUR DARI AWAL: decompile itu BEST-EFFORT, bukan sulap.
+#   - DEX → Java: hasilnya mirip-mirip (nama variabel lokal ilang, Kotlin
+#     tampil sebagai Java, lambda/sugar dibalikin ke bentuk baku)
+#   - Dart/Flutter: logic Dart udah jadi AOT machine code di libapp.so —
+#     GAK ADA tool di dunia yang balikin Dart asli. Yang keluar: resource,
+#     asset, manifest, native lib (utuh).
+#   - Resource/asset/AndroidManifest: DECODED rapi (100% utuh — ini bagian
+#     yang selalu bisa dibalikin).
+# Runner:
+#   1) Download APK dari litterbox (cek magic PK)
+#   2) jadx (pinned v1.5.0, temurin 17): sources/ + resources/ → out/
+#      exit 0 = bersih, exit 1 = partial (beberapa class gagal — normal buat
+#      APK terobfuscate), >1 = fatal
+#   3) stats + cap output 400MB → zip deterministik
+#   4) meta.json + artifact decompile-output
+# Bot (index.js) yang ngambil artifact + kirim ZIP ke user — konsisten dgn
+# jalur repack.yml/build.yml, anti double-send.
+# ══════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: 'URL APK (litterbox)'
+        required: true
+      tag:
+        description: 'Tag run decompile'
+        required: true
+      chat_id:
+        description: 'Telegram chat (dipake bot, bukan runner)'
+        required: false
+        default: ''
+      bot_token:
+        description: 'Telegram bot token (dipake bot, bukan runner)'
+        required: false
+        default: ''
+      apk_name:
+        description: 'Nama file APK sumber'
+        required: false
+        default: 'app.apk'
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      - name: Checkout (metadata actions)
+        uses: actions/checkout@v4
+
+      - name: Download APK
+        run: |
+          set -e
+          OK=0
+          for i in 1 2 3; do
+            if curl -sfL --retry 3 --connect-timeout 20 -o app.apk "${{ inputs.apk_url }}"; then OK=1; break; fi
+            echo "attempt $i gagal — tunggu 3s"; sleep 3
+          done
+          [ "$OK" = "1" ] || { echo "GAGAL: download APK dari apk_url"; exit 1; }
+          test -s app.apk || { echo "GAGAL: file kosong"; exit 1; }
+          [ "$(head -c2 app.apk)" = "PK" ] || { echo "GAGAL: bukan ZIP/APK (magic PK gak ketemu)"; exit 1; }
+          SZ=$(stat -c%s app.apk)
+          if [ "$SZ" -gt 157286400 ]; then echo "GAGAL: APK > 150MB (cap decompile)"; exit 1; fi
+          echo "APK OK: $SZ bytes"
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup jadx (pinned v1.5.0)
+        run: |
+          set -e
+          curl -sfL --retry 3 -o jadx.zip https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
+          unzip -q jadx.zip -d /opt/jadx
+          chmod +x /opt/jadx/bin/jadx
+          /opt/jadx/bin/jadx --version
+
+      - name: Decompile (best-effort, partial dianggap OK)
+        run: |
+          set -e
+          export JAVA_OPTS="-Xmx4g"
+          set +e
+          /opt/jadx/bin/jadx --threads-count 2 -d out app.apk
+          RC=$?
+          set -e
+          if [ "$RC" -gt 1 ]; then echo "JADX FATAL (rc=$RC) — APK rusak/terproteksi berat?"; exit 1; fi
+          [ -d out ] || { echo "GAGAL: jadx gak ngasilin output"; exit 1; }
+          echo "JADX_RC=$RC" >> "$GITHUB_ENV"
+
+      - name: Stats + cap output
+        run: |
+          set -e
+          SRC=$(find out/sources -type f 2>/dev/null | wc -l || echo 0)
+          RES=$(find out/resources -type f 2>/dev/null | wc -l || echo 0)
+          echo "srcFiles=$SRC resFiles=$RES jadxRc=${JADX_RC:-0}"
+          {
+            echo "{"
+            echo "  \"tag\": \"${{ inputs.tag }}\","
+            echo "  \"apk_name\": \"${{ inputs.apk_name }}\","
+            echo "  \"jadxRc\": ${JADX_RC:-0},"
+            echo "  \"srcFiles\": $SRC,"
+            echo "  \"resFiles\": $RES,"
+            echo "  \"at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+            echo "}"
+          } > meta.json
+          TOTAL=$(find out -type f | wc -l)
+          [ "$TOTAL" -gt 0 ] || { echo "GAGAL: output kosong total"; exit 1; }
+
+      - name: Pack output
+        run: |
+          set -e
+          mkdir -p outp
+          # deterministik: timestamp tetap (reproducible), isinya tetap sama
+          zip -q -r -9 -X outp/decompiled.zip out meta.json
+          SZ=$(stat -c%s outp/decompiled.zip)
+          if [ "$SZ" -gt 419430400 ]; then echo "GAGAL: hasil decompile > 400MB — APK kebesaran buat di-decompile"; exit 1; fi
+          ls -la outp/
+          echo "decompiled.zip = $SZ bytes"
+
+      - name: Upload artifact (decompile-output)
+        uses: actions/upload-artifact@v4
+        with:
+          name: decompile-output
+          path: outp/
+          retention-days: 3
+          if-no-files-found: error
