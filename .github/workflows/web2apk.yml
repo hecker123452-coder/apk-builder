@@ -246,6 +246,11 @@ on:
         required: false
         default: '0'
 
+      license:
+        description: '🛡️ v4.3 Benteng Lisensi (anti-repack): "on" = pasang LicenseGuard (cek signature asli runtime). Kosong = off.'
+        required: false
+        default: ''
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -3156,6 +3161,360 @@ jobs:
       #    (rolling) — kanal download buat OTA in-app update.
       # Gagal ambil/simpan keystore = FAIL LOUD (exit 1) — jangan pernah
       # sign pake kunci beda-beda tiap build, itu merusak rantai update.
+      # ── 🛡️ v4.3 BENTENG LISENSI — tulis helper guard (murah, selalu jalan) ──
+      - name: Write License Guard helper
+        run: |
+          cat > /tmp/dzr_license_guard.py <<'DZRGUARD'
+          #!/usr/bin/env python3
+          # -*- coding: utf-8 -*-
+          # 🛡️ DZR CloudBuilder v4.3.0 — BENTENG LISENSI (anti-repack guard installer)
+          # Jalan di GitHub Actions SEBELUM compile (step "Benteng Lisensi"):
+          #   1. ambil keystore per-user (terenkripsi di repo) → dekrip → SHA-256 cert
+          #      (keystore belum ada? generate + commit terenkripsi, race-guard —
+          #       identik pola signing block, biar signature konsisten)
+          #   2. tulis LicenseGuard.kt / .java (EXPECTED = sha cert) di package launcher
+          #   3. patch onCreate → LicenseGuard.check(this) SETELAH super.onCreate
+          # Runtime: app cek signature APK-nya sendiri; beda dari asli = layar merah
+          # "APK TIDAK SAH" + mati (fail-closed). Repack/re-sign orang lain = kekang.
+          # Env: GUARD_MODE=flutter|kotlin · INPUT_KEYSTORE_ID · GH_TOKEN · GH_REPO ·
+          #      KS_ENC_KEY · KS_PASS · KS_PASS_OLD · (GUARD_OFFLINE=1 utk test lokal)
+          import os, sys, json, base64, glob, re, subprocess, urllib.request, urllib.error
+
+          def fail(msg):
+              print("=== BUILD FAILED: " + msg + " ===")
+              sys.exit(1)
+
+          MODE = os.environ.get("GUARD_MODE", "flutter").strip()
+          GH_TOKEN = os.environ.get("GH_TOKEN", "")
+          GH_REPO = os.environ.get("GH_REPO", "")
+          KS_ENC_KEY = os.environ.get("KS_ENC_KEY", "")
+          KS_PASS = os.environ.get("KS_PASS", "")
+          KS_PASS_OLD = os.environ.get("KS_PASS_OLD", "")
+          KID = re.sub(r"[^a-zA-Z0-9]", "", os.environ.get("INPUT_KEYSTORE_ID", "") or "")
+          OFFLINE = os.environ.get("GUARD_OFFLINE", "") == "1"
+          API = "https://api.github.com/repos/" + GH_REPO + "/contents/"
+
+          KT_GUARD = """// 🛡️ Benteng Lisensi v4.3 — auto-generated oleh DZR CloudBuilder
+          // Verifikasi signature asli: app hasil repack / re-sign ilegal = nolak jalan.
+          package __PKG__
+
+          object LicenseGuard {
+              private const val EXPECTED = "__SHA__"
+
+              @JvmStatic
+              fun check(activity: android.app.Activity) {
+                  try {
+                      val pm = activity.packageManager
+                      val pi = pm.getPackageInfo(
+                          activity.packageName,
+                          android.content.pm.PackageManager.GET_SIGNATURES
+                      )
+                      val sigs = pi.signatures
+                      if (sigs == null || sigs.isEmpty()) { fail(activity); return }
+                      val md = java.security.MessageDigest.getInstance("SHA-256")
+                      val hex = md.digest(sigs[0].toByteArray())
+                          .joinToString("") { String.format("%02x", it) }
+                      if (!hex.equals(EXPECTED, ignoreCase = true)) fail(activity)
+                  } catch (t: Throwable) {
+                      fail(activity)
+                  }
+              }
+
+              private fun fail(a: android.app.Activity) {
+                  try {
+                      val pad = android.widget.LinearLayout(a)
+                      pad.orientation = android.widget.LinearLayout.VERTICAL
+                      pad.gravity = android.view.Gravity.CENTER
+                      pad.setBackgroundColor(0xFFB00020.toInt())
+                      val tv = android.widget.TextView(a)
+                      tv.text = "APK TIDAK SAH\\n\\nBuild ini bukan rilis resmi —\\naplikasi sudah dimodifikasi tanpa izin.\\n\\nSilakan install versi asli dari pengembang."
+                      tv.setTextColor(-1)
+                      tv.textSize = 16f
+                      tv.gravity = android.view.Gravity.CENTER
+                      tv.setPadding(64, 64, 64, 64)
+                      pad.addView(tv)
+                      a.setContentView(pad)
+                  } catch (_: Throwable) {
+                  }
+                  try { a.finishAffinity() } catch (_: Throwable) {
+                  }
+                  android.os.Process.killProcess(android.os.Process.myPid())
+              }
+          }
+          """
+
+          JAVA_GUARD = """// 🛡️ Benteng Lisensi v4.3 — auto-generated oleh DZR CloudBuilder
+          // Verifikasi signature asli: app hasil repack / re-sign ilegal = nolak jalan.
+          package __PKG__;
+
+          public final class LicenseGuard {
+              private static final String EXPECTED = "__SHA__";
+
+              public static void check(android.app.Activity activity) {
+                  try {
+                      android.content.pm.PackageManager pm = activity.getPackageManager();
+                      android.content.pm.PackageInfo pi = pm.getPackageInfo(
+                              activity.getPackageName(),
+                              android.content.pm.PackageManager.GET_SIGNATURES);
+                      if (pi.signatures == null || pi.signatures.length == 0) { fail(activity); return; }
+                      java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+                      byte[] d = md.digest(pi.signatures[0].toByteArray());
+                      StringBuilder sb = new StringBuilder();
+                      for (byte b : d) sb.append(String.format("%02x", b));
+                      if (!EXPECTED.equalsIgnoreCase(sb.toString())) fail(activity);
+                  } catch (Throwable t) {
+                      fail(activity);
+                  }
+              }
+
+              private static void fail(final android.app.Activity a) {
+                  try {
+                      android.widget.LinearLayout pad = new android.widget.LinearLayout(a);
+                      pad.setOrientation(android.widget.LinearLayout.VERTICAL);
+                      pad.setGravity(android.view.Gravity.CENTER);
+                      pad.setBackgroundColor(0xFFB00020);
+                      android.widget.TextView tv = new android.widget.TextView(a);
+                      tv.setText("APK TIDAK SAH\\n\\nBuild ini bukan rilis resmi —\\naplikasi sudah dimodifikasi tanpa izin.\\n\\nSilakan install versi asli dari pengembang.");
+                      tv.setTextColor(0xFFFFFFFF);
+                      tv.setTextSize(16f);
+                      tv.setGravity(android.view.Gravity.CENTER);
+                      tv.setPadding(64, 64, 64, 64);
+                      pad.addView(tv);
+                      a.setContentView(pad);
+                  } catch (Throwable ignore) { }
+                  try { a.finishAffinity(); } catch (Throwable ignore) { }
+                  android.os.Process.killProcess(android.os.Process.myPid());
+              }
+          }
+          """
+
+          def sh(cmd):
+              return subprocess.run(cmd, capture_output=True)
+
+          def gh_get(path):
+              if OFFLINE:
+                  return 404, None
+              req = urllib.request.Request(API + path + "?ref=main", headers={
+                  "Authorization": "Bearer " + GH_TOKEN,
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "dzr-license-guard"})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      return r.getcode(), json.load(r)
+              except urllib.error.HTTPError as e:
+                  return e.code, None
+              except Exception as e:
+                  print("⚠️ gh_get error: " + str(e))
+                  return 0, None
+
+          def gh_put(path, content_b64, msg):
+              if OFFLINE:
+                  return 0
+              body = json.dumps({"message": msg, "content": content_b64, "branch": "main"}).encode()
+              req = urllib.request.Request(API + path, data=body, headers={
+                  "Authorization": "Bearer " + GH_TOKEN,
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json",
+                  "User-Agent": "dzr-license-guard"}, method="PUT")
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      return r.getcode()
+              except urllib.error.HTTPError as e:
+                  return e.code
+              except Exception as e:
+                  print("⚠️ gh_put error: " + str(e))
+                  return 0
+
+          def obtain_keystore():
+              # → siapkan /tmp/guard_ks.enc (ciphertext, ditangani decrypt_and_sha)
+              #   atau /tmp/guard_ks.jks langsung (generate fresh / OFFLINE test)
+              ks_path = ("keystores/u" + KID + ".jks.enc") if KID else "signing/global-v2.jks.enc"
+              print("🔐 [Lisensi] Keystore target: " + ks_path)
+              code, js = gh_get(ks_path)
+              if code == 200 and js and js.get("content"):
+                  open("/tmp/guard_ks.enc", "wb").write(base64.b64decode(js["content"]))
+                  return
+              # ── Keystore belum ada → generate + commit TERENKRIPSI (race guard) ──
+              # Identik pola signing block: generate → enkrip → PUT; PUT gagal (race
+              # build lain) → GET balik yang di repo biar signature KONSISTEN.
+              print("🔐 [Lisensi] Keystore belum ada — generate baru + commit (terenkripsi)...")
+              if not os.path.exists("/tmp/guard_ks.jks") or os.path.getsize("/tmp/guard_ks.jks") == 0:
+                  r = sh(["keytool", "-genkeypair", "-v", "-keystore", "/tmp/guard_ks.jks",
+                          "-alias", "dzr", "-keyalg", "RSA", "-keysize", "2048",
+                          "-validity", "10950", "-storepass", KS_PASS, "-keypass", KS_PASS,
+                          "-dname", "CN=DZR CloudBuilder, OU=Deruzuan, O=DZR, L=Jakarta, C=ID"])
+                  if r.returncode != 0 or not os.path.exists("/tmp/guard_ks.jks") or os.path.getsize("/tmp/guard_ks.jks") == 0:
+                      fail("gak bisa generate keystore (keytool): " + r.stderr.decode("utf-8", "replace")[:200])
+              if OFFLINE:
+                  print("🔐 [Lisensi] OFFLINE test — pake keystore lokal doang")
+                  return
+              enc = sh(["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "600000", "-salt",
+                        "-in", "/tmp/guard_ks.jks", "-pass", "pass:" + KS_ENC_KEY])
+              if enc.returncode != 0 or not enc.stdout:
+                  fail("gak bisa enkrip keystore buat commit")
+              put = gh_put(ks_path, base64.b64encode(enc.stdout).decode(),
+                           "chore: signing keystore (license guard bootstrap, encrypted at rest)")
+              if put in (200, 201):
+                  print("🔐 [Lisensi] Keystore baru disimpen terenkripsi (" + ks_path + ")")
+              else:
+                  code2, js2 = gh_get(ks_path)
+                  if code2 == 200 and js2 and js2.get("content"):
+                      open("/tmp/guard_ks.enc", "wb").write(base64.b64decode(js2["content"]))
+                      print("🔐 [Lisensi] Race guard: pake keystore dari repo (identik)")
+                      return
+                  fail("keystore gak bisa disimpan/diambil (HTTP " + str(put) + ") — stop biar signature konsisten")
+
+          def decrypt_and_sha():
+              if os.path.exists("/tmp/guard_ks.enc"):
+                  d = sh(["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "600000",
+                          "-in", "/tmp/guard_ks.enc", "-out", "/tmp/guard_ks.jks",
+                          "-pass", "pass:" + KS_ENC_KEY])
+                  if d.returncode != 0 or not os.path.exists("/tmp/guard_ks.jks") or os.path.getsize("/tmp/guard_ks.jks") == 0:
+                      fail("keystore terenkripsi ada tapi GAGAL didekrip (cek secret KS_ENC_KEY)")
+              pass_used = None
+              for cand in (KS_PASS, KS_PASS_OLD):
+                  if cand and sh(["keytool", "-list", "-keystore", "/tmp/guard_ks.jks",
+                                  "-storepass", cand, "-alias", "dzr"]).returncode == 0:
+                      pass_used = cand
+                      break
+              if not pass_used:
+                  fail("keystore didekrip tapi pass gak cocok (KS_PASS/KS_PASS_OLD salah)")
+              r = sh(["keytool", "-list", "-v", "-keystore", "/tmp/guard_ks.jks",
+                      "-storepass", pass_used, "-alias", "dzr"])
+              m = re.search(r"SHA256:\s*([0-9A-Fa-f:]{64,})", r.stdout.decode("utf-8", "replace"))
+              if not m:
+                  fail("SHA-256 cert gak kebaca dari keytool output")
+              sha = m.group(1).replace(":", "").strip().lower()
+              if len(sha) != 64:
+                  fail("SHA-256 cert panjang aneh: " + str(len(sha)))
+              return sha
+
+          def pkg_from_source(body, fallback):
+              m = re.search(r"^\s*package\s+([\w.]+)", body, re.M)
+              return m.group(1) if m else fallback
+
+          def find_flutter_target():
+              cands = sorted(glob.glob("android/app/src/main/kotlin/**/MainActivity.kt", recursive=True))
+              if not cands:
+                  cands = sorted(glob.glob("android/app/src/main/kotlin/**/*Activity.kt", recursive=True))
+              if not cands:
+                  fail("MainActivity gak ketemu di project Flutter (android/ belum ke-generate?)")
+              src = cands[0]
+              body = open(src, encoding="utf-8", errors="replace").read()
+              return src, body, pkg_from_source(body, "com.dzrbuild.app")
+
+          def find_kotlin_native_target():
+              mans = [p for p in glob.glob("**/src/main/AndroidManifest.xml", recursive=True)
+                      if os.path.isfile(p) and "/build/" not in p]
+              mans = [p for p in mans if "LAUNCHER" in open(p, encoding="utf-8", errors="replace").read()]
+              if not mans:
+                  fail("AndroidManifest launcher gak ketemu — project native bentuknya gak standar")
+              mp = mans[0]
+              mbody = open(mp, encoding="utf-8", errors="replace").read()
+              mpkg = ""
+              mmp = re.search(r'package="([^"]+)"', mbody)
+              if mmp:
+                  mpkg = mmp.group(1)
+              acts = re.findall(r"<activity[^>]*android:name=\"([^\"]+)\"", mbody)
+              target = None
+              for mm in re.finditer(r"<activity[^>]*>", mbody):
+                  blk_start = mm.start()
+                  blk_end = mbody.find("</activity>", blk_start)
+                  if blk_end < 0:
+                      blk_end = min(blk_start + 2000, len(mbody))
+                  blk = mbody[blk_start:blk_end]
+                  nm = re.search(r'android:name="([^"]+)"', mm.group(0))
+                  if nm and "LAUNCHER" in blk:
+                      target = nm.group(1)
+                      break
+              if not target and acts:
+                  target = acts[0]  # fallback: activity pertama
+              if not target:
+                  fail("activity launcher gak ketemu di AndroidManifest")
+              if target.startswith("."):
+                  fqcn = mpkg + target
+              elif "." in target:
+                  fqcn = target
+              else:
+                  fqcn = (mpkg + "." + target) if mpkg else target
+              rel = fqcn.replace(".", "/")
+              hits = []
+              for ext in (".kt", ".java"):
+                  hits += [p for p in glob.glob("**/" + rel + ext, recursive=True) if "/build/" not in p]
+              if not hits:
+                  fail("source " + fqcn + " (.kt/.java) gak ketemu — gak bisa pasang guard")
+              src = sorted(hits)[0]
+              body = open(src, encoding="utf-8", errors="replace").read()
+              return src, body, fqcn
+
+          def write_guard(dirname, pkg, sha, is_java):
+              fn = "LicenseGuard.java" if is_java else "LicenseGuard.kt"
+              tpl = JAVA_GUARD if is_java else KT_GUARD
+              out = os.path.join(dirname, fn)
+              open(out, "w", encoding="utf-8").write(tpl.replace("__PKG__", pkg).replace("__SHA__", sha))
+              return out
+
+          def patch_source(src, body, sha, pkg, is_java):
+              if "LicenseGuard.check" in body:
+                  print("ℹ️ [Lisensi] " + src + " udah ada guard — skip patch (idempotent)")
+                  write_guard(os.path.dirname(src), pkg, sha, is_java)  # sha tetap segar
+                  return "(existing)"
+              gpath = write_guard(os.path.dirname(src), pkg, sha, is_java)
+              if is_java:
+                  m = re.search(r"super\.onCreate\(([^)]*)\)\s*;", body)
+                  if not m:
+                      fail("super.onCreate gak ketemu di " + src + " — lisensi butuh onCreate standar")
+                  body2 = body[:m.end()] + "\n        LicenseGuard.check(this);" + body[m.end():]
+              else:
+                  m = re.search(r"super\.onCreate\(([^)]*)\)", body)
+                  if m:
+                      body2 = body[:m.end()] + "\n        LicenseGuard.check(this)" + body[m.end():]
+                  else:
+                      # template Flutter modern: class tanpa onCreate → tambahkan method
+                      stripped = body.rstrip()
+                      if not stripped.endswith("}"):
+                          fail("MainActivity.kt struktur aneh — gak bisa sisip onCreate")
+                      inject = ("\n    override fun onCreate(savedInstanceState: android.os.Bundle?) {\n"
+                                "        super.onCreate(savedInstanceState)\n"
+                                "        LicenseGuard.check(this)\n"
+                                "    }\n")
+                      idx = stripped.rfind("}")
+                      body2 = stripped[:idx] + inject + "}\n"
+              open(src, "w", encoding="utf-8").write(body2)
+              return gpath
+
+          def main():
+              if MODE not in ("flutter", "kotlin"):
+                  fail("GUARD_MODE gak dikenal: " + MODE)
+              if not KS_ENC_KEY:
+                  fail("secret KS_ENC_KEY gak ada di env")
+              obtain_keystore()
+              sha = decrypt_and_sha()
+              print("🔑 [Lisensi] SHA-256 cert: " + sha[:16] + "…")
+              if MODE == "flutter":
+                  src, body, pkg = find_flutter_target()
+                  is_java = False
+              else:
+                  src, body, pkg = find_kotlin_native_target()
+                  is_java = src.endswith(".java")
+              out = patch_source(src, body, sha, pkg, is_java)
+              print("🛡️ [Lisensi] Benteng terpasang: " + src + " + " + (out or "(existing)"))
+              print("🛡️ [Lisensi] Package: " + pkg + " · expected " + sha[:16] + "… · OK")
+
+          if __name__ == "__main__":
+              main()
+          DZRGUARD
+      # ── 🛡️ v4.3: pasang guard ke source SEBELUM compile (kalau license=on) ──
+      - name: Benteng Lisensi (anti-repack guard)
+        if: ${{ inputs.license == 'on' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          KS_ENC_KEY: ${{ secrets.KS_ENC_KEY }}
+          KS_PASS: ${{ secrets.KS_PASS }}
+          KS_PASS_OLD: ${{ secrets.KS_PASS_OLD }}
+          GUARD_MODE: flutter
+        run: python3 /tmp/dzr_license_guard.py
       - name: Stable signing + OTA release
         env:
           GH_TOKEN: ${{ github.token }}
