@@ -1301,15 +1301,30 @@ jobs:
                   fqcn = target
               else:
                   fqcn = (mpkg + "." + target) if mpkg else target
-              rel = fqcn.replace(".", "/")
+              # resolve file via NAMA CLASS pendek — immune terhadap manifest
+              # namespace-style (AGP 8+) yang gak punya package="..." attr
+              cls_short = target.split(".")[-1]
               hits = []
               for ext in (".kt", ".java"):
-                  hits += [p for p in glob.glob("**/" + rel + ext, recursive=True) if "/build/" not in p]
+                  hits += [p for p in glob.glob("**/" + cls_short + ext, recursive=True) if "/build/" not in p]
               if not hits:
-                  fail("source " + fqcn + " (.kt/.java) gak ketemu — gak bisa pasang guard")
+                  fail("source " + cls_short + " (.kt/.java) gak ketemu — gak bisa pasang guard")
               src = sorted(hits)[0]
               body = open(src, encoding="utf-8", errors="replace").read()
-              return src, body, fqcn
+              spkg = pkg_from_source(body, "")
+              if spkg:
+                  return src, body, spkg  # package dari source paling akurat
+              # fallback: manifest package + target tanpa nama class
+              if target.startswith("."):
+                  fqcn = mpkg + target
+              elif "." in target:
+                  fqcn = target
+              else:
+                  fqcn = (mpkg + "." + target) if mpkg else target
+              if "." not in fqcn:
+                  fail("package activity gak bisa ditentuin (manifest gak ada package attr + source gak ada package line)")
+              pkg = fqcn[:fqcn.rfind(".")]
+              return src, body, pkg
 
           def write_guard(dirname, pkg, sha, is_java):
               fn = "LicenseGuard.java" if is_java else "LicenseGuard.kt"
