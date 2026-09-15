@@ -3670,23 +3670,29 @@ jobs:
                 # pasti + newSize) — app decode streaming hemat memori.
                 # ⚠️ Heredoc: konten & terminator wajib di base indent.
                 python3 << 'PYEOF3'
-          import struct, bz2, hashlib, json
-          src = open('/tmp/bsdiff.raw', 'rb').read()
-          assert src[:8] == b'BSDIFF40', 'bukan output bsdiff'
-          ctrl_len, diff_len, extra_len, newsize = struct.unpack('>QQQq', src[8:40])
-          body = src[40:]
-          d1 = bz2.BZ2Decompressor(); c = d1.decompress(body); r1 = d1.unused_data
-          d2 = bz2.BZ2Decompressor(); df = d2.decompress(r1); r2 = d2.unused_data
-          d3 = bz2.BZ2Decompressor(); ex = d3.decompress(r2); r3 = d3.unused_data
-          assert len(c) == ctrl_len and len(df) == diff_len and len(ex) == extra_len, 'ukuran blok bsdiff gak cocok'
-          l1 = len(body) - len(r1)
-          l2 = len(r1) - len(r2)
-          l3 = len(r2) - len(r3)
-          out = b'DZRDELTA' + struct.pack('<I', 1) + struct.pack('<III', l1, l2, l3) + struct.pack('<q', newsize) + body[:l1] + body[l1:l1+l2] + body[l1+l2:l1+l2+l3]
-          open('/tmp/delta.patch', 'wb').write(out)
-          sha = hashlib.sha256(out).hexdigest()
-          json.dump({'size': len(out), 'sha256': sha, 'newSize': newsize}, open('/tmp/delta-info.json', 'w'))
-          print('DZR frame: ctrl=%d diff=%d extra=%d newSize=%d' % (l1, l2, l3, newsize))
+          import struct, bz2, hashlib, json, sys
+          try:
+            src = open('/tmp/bsdiff.raw', 'rb').read()
+            if src[:8] != b'BSDIFF40':
+              raise ValueError('bukan output bsdiff: %r' % src[:8])
+            ctrl_len, diff_len, extra_len, newsize = struct.unpack('>QQQq', src[8:40])
+            body = src[40:]
+            d1 = bz2.BZ2Decompressor(); c = d1.decompress(body); r1 = d1.unused_data
+            d2 = bz2.BZ2Decompressor(); df = d2.decompress(r1); r2 = d2.unused_data
+            d3 = bz2.BZ2Decompressor(); ex = d3.decompress(r2); r3 = d3.unused_data
+            if not (len(c) == ctrl_len and len(df) == diff_len and len(ex) == extra_len):
+              raise ValueError('ukuran blok bsdiff gak cocok (%d/%d/%d vs %d/%d/%d)' % (len(c), ctrl_len, len(df), diff_len, len(ex), extra_len))
+            l1 = len(body) - len(r1); l2 = len(r1) - len(r2); l3 = len(r2) - len(r3)
+            out = b'DZRDELTA' + struct.pack('<I', 1) + struct.pack('<III', l1, l2, l3) + struct.pack('<q', newsize) + body[:l1] + body[l1:l1+l2] + body[l1+l2:l1+l2+l3]
+            open('/tmp/delta.patch', 'wb').write(out)
+            sha = hashlib.sha256(out).hexdigest()
+            json.dump({'size': len(out), 'sha256': sha, 'newSize': newsize}, open('/tmp/delta-info.json', 'w'))
+            print('DZR frame: ctrl=%d diff=%d extra=%d newSize=%d' % (l1, l2, l3, newsize))
+          except Exception as _dlerr:
+            print('WARNING: delta skip (parser bsdiff: %s)' % _dlerr)
+            if 'src' in dir():
+              print('diag: raw=%d B, hdr=%r' % (len(src), src[:40]))
+            sys.exit(0)
           PYEOF3
               else
                 echo "WARNING: bsdiff gagal — delta skip (non-fatal)"
