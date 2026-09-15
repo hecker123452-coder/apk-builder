@@ -242,8 +242,10 @@ jobs:
         if: always()
         run: |
           if [ -f out/final.apk ]; then
-            MODE_LINE=$(grep -o "MODE=[a-z]*" "$GITHUB_ENV" | tail -1 | cut -d= -f2)
-            MODE="${MODE_LINE:-unknown}"
+            # $MODE ke-warisan otomatis dari step sebelumnya (GITHUB_ENV);
+            # grep cuma fallback kalau env gak nempel.
+            MODE="${MODE:-$(grep -o "MODE=[a-z]*" "$GITHUB_ENV" 2>/dev/null | tail -1 | cut -d= -f2)}"
+            MODE="${MODE:-unknown}"
             PKG=""; VER=""
             if [ -x "$BT/aapt" ]; then
               BADGE=$("$BT/aapt" dump badging out/final.apk 2>/dev/null | head -40 || true)
