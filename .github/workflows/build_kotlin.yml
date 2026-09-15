@@ -387,7 +387,7 @@ jobs:
 
           # module dir dari manifest ketemu
           mans = sorted(glob.glob('*/src/main/AndroidManifest.xml'))
-          base = os.path.dirname(os.path.dirname(os.path.dirname(mans[0]))) if mans else 'app'
+          base = os.path.dirname(mans[0]) if mans else 'app/src/main'
           sizes = {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96, 'xxhdpi': 144, 'xxxhdpi': 192}
           for q, px in sizes.items():
               odir = os.path.join(base, 'res', 'mipmap-' + q)
