@@ -59,6 +59,11 @@ on:
         required: false
         default: ''
 
+      license:
+        description: '🛡️ v4.3 Benteng Lisensi (anti-repack): "on" = pasang LicenseGuard (cek signature asli runtime). Kosong = off.'
+        required: false
+        default: ''
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -195,6 +200,418 @@ jobs:
             fi
           fi
 
+      # ── 🩺 v3.8.0: DOKTER BUILD (auto-repair pra-build) — request owner:
+      # "kalo kurang apa gitu otomatis di cek apa yang kurang baru tambahin
+      # semua biar bisa biar user gak usah bolak balik fix". Ini dia dia:
+      # permission ilang, label/icon kosong, launcher activity gak ke-daftar,
+      # namespace/applicationId kosong (WAJIB di AGP 8), sdk literal ke tua,
+      # wrapper ilang, icon launcher ilang (auto-generate premium). Primum
+      # non nocere: nilai yang udah di-set user GAK disentuh. ──
+      - name: Doctor (auto-repair project)
+        run: |
+          python3 << 'PYDOC'
+          import glob, os, re
+
+          APP = os.environ.get('INPUT_APP_NAME', 'MyApp') or 'MyApp'
+          applied = []
+
+          def xml_esc(s):
+              return (str(s).replace('&', '&amp;').replace('<', '&lt;')
+                      .replace('>', '&gt;').replace('"', '&quot;'))
+
+          # ── cari manifest utama (module terdangkal) ──
+          mans = sorted(glob.glob('*/src/main/AndroidManifest.xml')) + ['src/main/AndroidManifest.xml']
+          MAN = next((p for p in mans if os.path.isfile(p)), None)
+          if MAN:
+              src = open(MAN, encoding='utf-8').read()
+              tagm = re.search(r'<application\b[^>]*>', src)
+              if not tagm:
+                  print('DOC: manifest rusak (gak ada <application>) — dokter runner gak nerjemahin, biarin gradle yang protes')
+              else:
+                  tag = tagm.group(0)
+                  newtag = tag
+                  if 'android.permission.INTERNET' not in src:
+                      src = re.sub(r'(<application\b)',
+                                   '    <uses-permission android:name="android.permission.INTERNET"/>\n'
+                                   '    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n\\1', src, count=1)
+                      applied.append('permission INTERNET ke-inject')
+                      tagm = re.search(r'<application\b[^>]*>', src)
+                      tag = tagm.group(0)
+                      newtag = tag
+                  if 'android:label=' not in tag:
+                      newtag = newtag.replace('<application', '<application android:label="' + xml_esc(APP) + '"', 1)
+                      applied.append('android:label="' + APP + '" ke-inject')
+                  if 'android:icon=' not in tag:
+                      newtag = newtag.replace('<application', '<application android:icon="@mipmap/ic_launcher"', 1)
+                      applied.append('android:icon=@mipmap/ic_launcher ke-inject')
+                  if newtag != tag:
+                      src = src.replace(tag, newtag, 1)
+                      tag = newtag
+                  if 'android.intent.category.LAUNCHER' not in src:
+                      mainc = None
+                      for root, _, files in os.walk('.'):
+                          if '/build/' in root.replace(os.sep, '/'):
+                              continue
+                          for f in files:
+                              if f in ('MainActivity.kt', 'MainActivity.java'):
+                                  mainc = os.path.join(root, f)
+                      if mainc:
+                          cls = os.path.splitext(mainc)[0].replace(os.sep, '.').lstrip('.')
+                          act = ('        <activity\n            android:name="' + cls + '"\n'
+                                 '            android:exported="true">\n'
+                                 '            <intent-filter>\n'
+                                 '                <action android:name="android.intent.action.MAIN"/>\n'
+                                 '                <category android:name="android.intent.category.LAUNCHER"/>\n'
+                                 '            </intent-filter>\n        </activity>\n    ')
+                          src = src.replace('</application>', act + '</application>', 1)
+                          applied.append('MainActivity (' + cls + ') ke-daftar + intent launcher')
+                      else:
+                          print('DOC: WARNING — gak ada intent LAUNCHER dan class MainActivity gak ketemu')
+                  open(MAN, 'w', encoding='utf-8').write(src)
+                  # label @string/app_name tapi strings.xml gak punya → inject
+                  lm = re.search(r'android:label\s*=\s*"@string/([a-zA-Z0-9_]+)"', src)
+                  if lm:
+                      vdir = os.path.join(os.path.dirname(MAN), 'res', 'values')
+                      spath = os.path.join(vdir, 'strings.xml')
+                      old = open(spath, encoding='utf-8').read() if os.path.isfile(spath) else ''
+                      if ('name="' + lm.group(1) + '"') not in old:
+                          os.makedirs(vdir, exist_ok=True)
+                          item = '    <string name="' + lm.group(1) + '">' + xml_esc(APP) + '</string>'
+                          open(spath, 'w', encoding='utf-8').write(
+                              old.replace('<resources>', '<resources>\n' + item) if '<resources>' in old
+                              else '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n' + item + '\n</resources>\n')
+                          applied.append('strings.xml: ' + lm.group(1) + '="' + APP + '" ke-inject')
+
+          # ── module gradle: applicationId + floor sdk + migrasi namespace ──
+          pkg = None
+          mods = [p for p in sorted(glob.glob('*/build.gradle') + glob.glob('*/build.gradle.kts'))
+                  if 'defaultConfig' in (open(p, encoding='utf-8').read())]
+          if MAN and os.path.isfile(MAN):
+              pm = re.search(r'<application\b[^>]*\spackage\s*=\s*"([^"]+)"', open(MAN, encoding='utf-8').read())
+              if pm:
+                  pkg = pm.group(1)
+          for p in mods:
+              src = open(p, encoding='utf-8').read()
+              orig = src
+              am = re.search(r'applicationId\s*=?\s*["\']([^"\']+)["\']', src)
+              if am and not pkg:
+                  pkg = am.group(1)
+              if not re.search(r'(?m)^\s*applicationId\s*=?\s*["\'][^"\']+["\']', src) and pkg:
+                  src = re.sub(r'(?m)^([ \t]*)defaultConfig\s*\{',
+                               lambda m: m.group(0) + '\n' + m.group(1) + '    applicationId "' + pkg + '"', src, count=1)
+                  applied.append('applicationId "' + pkg + '" ke-inject (' + p + ')')
+              for kind, floor in (('compileSdk', 34), ('minSdk', 23), ('targetSdk', 34)):
+                  def _floor(m):
+                      n = int(m.group(2))
+                      if n < floor:
+                          applied.append(kind + ' ' + str(n) + ' -> ' + str(floor) + ' (' + p + ')')
+                          return m.group(1) + str(floor)
+                      return m.group(0)
+                  src = re.sub(r'(?m)(' + kind + r'\s*=?\s*)(\d+)', _floor, src)
+              if src != orig:
+                  open(p, 'w', encoding='utf-8').write(src)
+
+          # migrasi namespace (AGP 8 wajib): inject ke module + buang package attr
+          if pkg and mods:
+              p = mods[0]
+              src = open(p, encoding='utf-8').read()
+              if not re.search(r'(?m)^\s*namespace\s*=?\s*["\']', src) and re.search(r'(?m)^([ \t]*)android\s*\{', src):
+                  src = re.sub(r'(?m)^([ \t]*)android\s*\{',
+                               lambda m: m.group(0) + '\n' + m.group(1) + '    namespace "' + pkg + '"', src, count=1)
+                  if MAN and os.path.isfile(MAN):
+                      msrc = open(MAN, encoding='utf-8').read()
+                      tagm = re.search(r'<application\b[^>]*>', msrc)
+                      if tagm and ' package="' in tagm.group(0):
+                          msrc = msrc.replace(tagm.group(0), re.sub(r'\s+package\s*=\s*"[^"]+"', '', tagm.group(0)), 1)
+                          open(MAN, 'w', encoding='utf-8').write(msrc)
+                  open(p, 'w', encoding='utf-8').write(src)
+                  applied.append('namespace "' + pkg + '" ke-inject + package attr dibersihin (siap AGP 8)')
+
+          for a in applied:
+              print('DOC: ' + a)
+          if not applied:
+              print('DOC: project sehat — gak ada yang perlu dibenerin')
+          PYDOC
+
+          # ── wrapper ilang total → inject Gradle 8.7 (gradlew bakal jalan) ──
+          if [ ! -f "gradle/wrapper/gradle-wrapper.properties" ] && [ -f "gradlew" ]; then
+            mkdir -p gradle/wrapper
+            printf 'distributionBase=GRADLE_USER_HOME\ndistributionPath=wrapper/dists\ndistributionUrl=https\\://services.gradle.org/distributions/gradle-8.7-bin.zip\nvalidateDistributionUrl=true\nzipStoreBase=GRADLE_USER_HOME\nzipStorePath=wrapper/dists\n' > gradle/wrapper/gradle-wrapper.properties
+            echo "DOC: gradle-wrapper.properties ilang → ke-inject (Gradle 8.7)"
+          fi
+
+          # ── icon launcher ilang → generate premium (gradient + inisial) ──
+          if [ -z "$(find . -path '*res/mipmap*' -name 'ic_launcher*' -not -path '*/build/*' 2>/dev/null)" ] && [ -z "$(find . -path '*res/drawable*' -name 'ic_launcher*' -not -path '*/build/*' 2>/dev/null)" ]; then
+            python3 -c "import PIL" 2>/dev/null || pip3 install -q pillow || true
+            python3 << 'PILGEN'
+          import glob, hashlib, os
+
+          try:
+              from PIL import Image, ImageDraw, ImageFont
+          except Exception:
+              print('PILGEN: pillow gak tersedia — icon dilewat (non-fatal)')
+              raise SystemExit(0)
+
+          APP = os.environ.get('INPUT_APP_NAME', 'MyApp') or 'MyApp'
+          h = int(hashlib.md5(APP.encode()).hexdigest(), 16)
+          hue1, hue2 = h % 360, (h % 360 + 55) % 360
+
+          def hsl(hdeg, s, l):
+              s /= 100; l /= 100
+              k = lambda n: (n + hdeg / 30) % 12
+              f = lambda n: l - s * min(l, 1 - l) * max(-1, min(k(n) - 3, 9 - k(n), 1))
+              return tuple(int(255 * x) for x in (f(0), f(8), f(4)))
+
+          c1, c2 = hsl(hue1, 72, 52), hsl(hue2, 70, 40)
+          S = 512
+          img = Image.new('RGB', (S, S))
+          d = ImageDraw.Draw(img)
+          for y in range(S):
+              t = y / (S - 1)
+              d.line([(0, y), (S, y)], fill=tuple(int(a + (b - a) * t) for a, b in zip(c1, c2)))
+          d.ellipse((-S * 0.25, S * 0.55, S * 0.9, S * 1.6), outline=(255, 255, 255), width=10)
+
+          words = [w for w in APP.split() if w][:2]
+          ini = ''.join(w[0] for w in words).upper() or 'AP'
+          font = None
+          for fp in ('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+                     '/usr/share/fonts/truetype/freefont/FreeSansBold.ttf'):
+              if os.path.isfile(fp):
+                  font = ImageFont.truetype(fp, 200)
+                  break
+          if font is None:
+              font = ImageFont.load_default()
+          tb = d.textbbox((0, 0), ini, font=font)
+          d.text(((S - (tb[2] - tb[0])) / 2 - tb[0], (S - (tb[3] - tb[1])) / 2 - tb[1]), ini,
+                 fill=(255, 255, 255), font=font)
+
+          # module dir dari manifest ketemu
+          mans = sorted(glob.glob('*/src/main/AndroidManifest.xml'))
+          base = os.path.dirname(os.path.dirname(os.path.dirname(mans[0]))) if mans else 'app'
+          sizes = {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96, 'xxhdpi': 144, 'xxxhdpi': 192}
+          for q, px in sizes.items():
+              odir = os.path.join(base, 'res', 'mipmap-' + q)
+              os.makedirs(odir, exist_ok=True)
+              img.resize((px, px), Image.LANCZOS).save(os.path.join(odir, 'ic_launcher.png'))
+          print('PILGEN: icon premium "' + ini + '" ke-generate ke ' + base + '/res/mipmap-*')
+          PILGEN
+          else
+            echo "DOC: icon launcher udah ada — gak disentuh"
+          fi
+
+      # ── 🩺 v3.8.0: KFIX.PY — dokter REAKTIF pas build gagal (pola bldfix.py
+      # di build.yml). Baca error gradle → patch toolchain/project → retry.
+      # Jangkar: wrapper gradle, AGP (+migrasi namespace), Kotlin plugin,
+      # compileSdk/minSdk, SDK location. ──
+      - name: Write Kotlin Doctor helper (kfix.py)
+        run: |
+          cat > /tmp/kfix.py <<'PYKFIX'
+          import glob, os, re
+
+          err = os.environ.get('BLD_ERR', '')
+          applied = []
+          V = r'(\d+(?:\.\d+)*)'
+
+          def vkey(v):
+              return [int(x) for x in v.split('.') if x.isdigit()]
+
+          def rewrite(path, fn):
+              src = open(path, encoding='utf-8').read()
+              out = fn(src)
+              if out != src:
+                  open(path, 'w', encoding='utf-8').write(out)
+                  return True
+              return False
+
+          def bump_wrapper(target):
+              n = 0
+              p = 'gradle/wrapper/gradle-wrapper.properties'
+              if os.path.isfile(p):
+                  cur = None
+                  mm = re.search(r'gradle-' + V + r'-(bin|all)\.zip', open(p, encoding='utf-8').read())
+                  if mm:
+                      cur = mm.group(1)
+                  if cur is None or vkey(cur) < vkey(target):
+                      # dist gradle gak ada X.Y.0 (8.14.0->8.14) DAN gak ada bare X (8.0 tetap 8.0)
+                      dist = re.sub(r'(\.0)+$', '', target) if target.count('.') >= 2 else target
+                      url = 'https\\://services.gradle.org/distributions/gradle-' + dist + '-' + (mm.group(2) if mm else 'bin') + '.zip'
+                      def _w(src):
+                          src = re.sub(r'(?m)^distributionUrl\s*=.*$', 'distributionUrl=' + url, src)
+                          return re.sub(r'(?m)^distributionSha256Sum\s*=.*\n?', '', src)
+                      n += rewrite(p, _w)
+                      applied.append('Gradle wrapper ' + str(cur) + ' -> ' + target)
+              return n
+
+          def gradle_for_agp(v):
+              kv = vkey(v)
+              if kv < [8, 0]:   return '7.5'
+              if kv < [8, 2]:   return '8.0'
+              if kv < [8, 3]:   return '8.2'
+              if kv < [8, 4]:   return '8.4'
+              if kv < [8, 5]:   return '8.6'
+              if kv < [8, 7]:   return '8.7'
+              if kv < [8, 8]:   return '8.9'
+              if kv < [8, 9]:   return '8.10'
+              return '8.11'
+
+          def gradle_files():
+              return ['settings.gradle', 'settings.gradle.kts', 'build.gradle', 'build.gradle.kts'] + \
+                     glob.glob('*/build.gradle') + glob.glob('*/build.gradle.kts') + \
+                     glob.glob('buildSrc/*/build.gradle') + glob.glob('buildSrc/*/build.gradle.kts')
+
+          def bump_agp(target):
+              n = 0
+              pat_classpath = re.compile(r'(classpath\s+["\']com\.android\.tools\.build:gradle:)' + V + r'(["\'])')
+              pat_plugin = re.compile(r'((?:id|alias)\s+\(?["\']com\.android\.application["\']\)?\s+version\s+["\'])' + V + r'(["\'])')
+              def _p(src):
+                  return pat_plugin.sub(lambda m: m.group(1) + target + m.group(2), src)
+              def _c(src):
+                  return pat_classpath.sub(lambda m: m.group(1) + target + m.group(2), src)
+              for p in gradle_files():
+                  if os.path.isfile(p):
+                      n += rewrite(p, _p) + rewrite(p, _c)
+              if n:
+                  applied.append('AGP -> ' + target)
+                  # AGP 8+ butuh Gradle pasangan-nya + namespace di module
+                  n += bump_wrapper(gradle_for_agp(target))
+                  if vkey(target) >= vkey('8.0'):
+                      n += migrate_namespace()
+              return n
+
+          def migrate_namespace():
+              n = 0
+              MAN = None
+              for cand in sorted(glob.glob('*/src/main/AndroidManifest.xml')):
+                  MAN = cand
+                  break
+              pkg = None
+              if MAN:
+                  msrc = open(MAN, encoding='utf-8').read()
+                  pm = re.search(r'<application\b[^>]*?\spackage\s*=\s*"([^"]+)"', msrc)
+                  if pm:
+                      pkg = pm.group(1)
+              for p in glob.glob('*/build.gradle') + glob.glob('*/build.gradle.kts'):
+                  src = open(p, encoding='utf-8').read()
+                  if 'namespace' in src or not re.search(r'(?m)^([ \t]*)android\s*\{', src):
+                      continue
+                  use = pkg
+                  if not use:
+                      am = re.search(r'applicationId\s*=?\s*["\']([^"\']+)["\']', src)
+                      if am:
+                          use = am.group(1)
+                  if not use:
+                      continue
+                  def _ns(m):
+                      return m.group(0) + '\n' + m.group(1) + '    namespace "' + use + '"'
+                  src2 = re.sub(r'(?m)^([ \t]*)android\s*\{', _ns, src, count=1)
+                  open(p, 'w', encoding='utf-8').write(src2)
+                  if MAN:
+                      msrc = open(MAN, encoding='utf-8').read()
+                      tm = re.search(r'<application\b[^>]*>', msrc)
+                      if tm and ' package="' in tm.group(0):
+                          msrc = msrc.replace(tm.group(0), re.sub(r'\s+package\s*=\s*"[^"]+"', '', tm.group(0)), 1)
+                          open(MAN, 'w', encoding='utf-8').write(msrc)
+                  applied.append('namespace "' + use + '" ke-inject (' + p + ')')
+                  n += 1
+              return n
+
+          def bump_compile_sdk(target):
+              n = 0
+              for p in glob.glob('*/build.gradle') + glob.glob('*/build.gradle.kts'):
+                  src = open(p, encoding='utf-8').read()
+                  def _b(m):
+                      nonlocal n
+                      if int(m.group(2)) < int(target):
+                          n += 1
+                          applied.append('compileSdk ' + m.group(2) + ' -> ' + target + ' (' + p + ')')
+                          return m.group(1) + target
+                      return m.group(0)
+                  src2 = re.sub(r'(?m)(compileSdk\w*\s*=?\s*)(\d+)', _b, src)
+                  if src2 != src:
+                      open(p, 'w', encoding='utf-8').write(src2)
+              return n
+
+          def bump_min_sdk(target):
+              n = 0
+              for p in glob.glob('*/build.gradle') + glob.glob('*/build.gradle.kts'):
+                  src = open(p, encoding='utf-8').read()
+                  def _b(m):
+                      nonlocal n
+                      if int(m.group(2)) < int(target):
+                          n += 1
+                          applied.append('minSdk ' + m.group(2) + ' -> ' + target + ' (' + p + ')')
+                          return m.group(1) + target
+                      return m.group(0)
+                  src2 = re.sub(r'(?m)(minSdk\w*\s*=?\s*)(\d+)', _b, src)
+                  if src2 != src:
+                      open(p, 'w', encoding='utf-8').write(src2)
+              return n
+
+          def bump_kotlin(target):
+              n = 0
+              pat_cp = re.compile(r'(classpath\s+["\']org\.jetbrains\.kotlin:kotlin-gradle-plugin:)' + V + r'(["\'])')
+              pat_id = re.compile(r'((?:id|alias)\s+\(?["\']org\.jetbrains\.kotlin\.(?:android|jvm|multiplatform)["\']\)?\s+version\s+["\'])' + V + r'(["\'])')
+              for p in gradle_files():
+                  if os.path.isfile(p):
+                      src = open(p, encoding='utf-8').read()
+                      out = pat_cp.sub(lambda m: m.group(1) + target + m.group(2), src)
+                      out = pat_id.sub(lambda m: m.group(1) + target + m.group(2), out)
+                      if out != src:
+                          open(p, 'w', encoding='utf-8').write(out)
+                          n += 1
+              if n:
+                  applied.append('Kotlin plugin -> ' + target)
+              return n
+
+          # ── 1) Gradle ke tua / JDK mismatch ──
+          m = re.search(r'Minimum supported Gradle version is ' + V, err) \
+              or re.search(r'requires Gradle ' + V, err) \
+              or re.search(r'Gradle version ' + V + r' is required', err)
+          if m and bump_wrapper(m.group(1)):
+              pass
+          m2 = re.search(r'Unsupported class file major version (\d+)', err)
+          if m2:
+              major = int(m2.group(1))
+              bump_wrapper('8.7' if major >= 61 else '7.6')
+          # ── 2) AGP ke tua / namespace ──
+          m = re.search(r'Minimum supported AGP version is ' + V, err) \
+              or re.search(r'Android Gradle Plugin version .{0,20}minimum supported version of ' + V, err) \
+              or re.search(r'requires Android Gradle Plugin ' + V, err)
+          if m:
+              tgt = m.group(1)
+              if vkey(tgt) < vkey('8.2.2'):
+                  tgt = '8.2.2'
+              bump_agp(tgt)
+          if 'Namespace not specified' in err or 'namespace not specified' in err.lower() \
+             or 'package="com' in err and 'no longer supported' in err:
+              migrate_namespace()
+          # ── 3) compileSdk / minSdk ──
+          m = re.search(r'requires compileSdk(?: version)? ' + r'(\d+)', err) \
+              or re.search(r'compileSdk (\d+) is (?:lower|older)', err) \
+              or re.search(r'platforms;android-(\d+)', err)
+          if m and int(m.group(1)) >= 34:
+              bump_compile_sdk(m.group(1))
+          m = re.search(r'cannot be smaller than version (\d+) declared in library', err) \
+              or re.search(r'minSdkVersion (\d+) is required', err)
+          if m:
+              bump_min_sdk(m.group(1))
+          # ── 4) Kotlin plugin ke tua ──
+          m = re.search(r'minimum supported Kotlin(?: plugin)? version is ' + V, err) \
+              or re.search(r'Kotlin version ' + V + r' is (?:too old|not supported)', err)
+          if m and vkey(m.group(1)) >= vkey('1.9'):
+              bump_kotlin(m.group(1))
+          # ── 5) SDK location ilang ──
+          if 'SDK location not found' in err and not os.path.isfile('local.properties'):
+              sdk = os.environ.get('ANDROID_HOME') or os.environ.get('ANDROID_SDK_ROOT') or ''
+              if sdk:
+                  open('local.properties', 'w', encoding='utf-8').write('sdk.dir=' + sdk.replace('\\', '\\\\') + '\n')
+                  applied.append('local.properties sdk.dir ke-inject')
+
+          print('KFIX: ' + ('; '.join(applied) if applied else 'gak ada pola error yang kebaca'))
+          print('KFIX_APPLIED=' + str(len(applied)))
+          PYKFIX
+          echo "🩺 kfix.py siap (dokter reaktif build)"
+
       # ── 🤖 v3.3: ALIGN versionCode → RUN NUMBER (syarat kanal OTA) ──
       # Semantik OTA bot: versionCode = GitHub run number (naik terus, rantai
       # update-over-install aman). Project user biasanya versionCode statis (1)
@@ -231,9 +648,364 @@ jobs:
           print('versionCode →', run_no, '| patched:', patched or 'GAK ADA', '| injected:', injected or '-')
           PYEOF
 
-      # ── 🔨 Build + retry sederhana (max 3x) ──
-      # Gak ada auto-fix Dart/pub — project Gradle native jauh lebih simpel.
-      # --stacktrace biar error keliatan jelas di log buat autodiag bot.
+      # ── 🔨 Build + DOKTER REAKTIF (v3.8.0, max 3x) ──
+      # Dulu: retry bodoh (sleep 5, error yang sama 3x 🤡). Sekarang: gagal
+      # → kfix.py analisa errornya → patch toolchain/project → retry. Gak ada
+      # fix yang cocok? berhenti terang-terangan (bot kirim log ke owner).
+      # ── 🛡️ v4.3 BENTENG LISENSI — tulis helper guard (murah, selalu jalan) ──
+      - name: Write License Guard helper
+        run: |
+          cat > /tmp/dzr_license_guard.py <<'DZRGUARD'
+          #!/usr/bin/env python3
+          # -*- coding: utf-8 -*-
+          # 🛡️ DZR CloudBuilder v4.3.0 — BENTENG LISENSI (anti-repack guard installer)
+          # Jalan di GitHub Actions SEBELUM compile (step "Benteng Lisensi"):
+          #   1. ambil keystore per-user (terenkripsi di repo) → dekrip → SHA-256 cert
+          #      (keystore belum ada? generate + commit terenkripsi, race-guard —
+          #       identik pola signing block, biar signature konsisten)
+          #   2. tulis LicenseGuard.kt / .java (EXPECTED = sha cert) di package launcher
+          #   3. patch onCreate → LicenseGuard.check(this) SETELAH super.onCreate
+          # Runtime: app cek signature APK-nya sendiri; beda dari asli = layar merah
+          # "APK TIDAK SAH" + mati (fail-closed). Repack/re-sign orang lain = kekang.
+          # Env: GUARD_MODE=flutter|kotlin · INPUT_KEYSTORE_ID · GH_TOKEN · GH_REPO ·
+          #      KS_ENC_KEY · KS_PASS · KS_PASS_OLD · (GUARD_OFFLINE=1 utk test lokal)
+          import os, sys, json, base64, glob, re, subprocess, urllib.request, urllib.error
+
+          def fail(msg):
+              print("=== BUILD FAILED: " + msg + " ===")
+              sys.exit(1)
+
+          MODE = os.environ.get("GUARD_MODE", "flutter").strip()
+          GH_TOKEN = os.environ.get("GH_TOKEN", "")
+          GH_REPO = os.environ.get("GH_REPO", "")
+          KS_ENC_KEY = os.environ.get("KS_ENC_KEY", "")
+          KS_PASS = os.environ.get("KS_PASS", "")
+          KS_PASS_OLD = os.environ.get("KS_PASS_OLD", "")
+          KID = re.sub(r"[^a-zA-Z0-9]", "", os.environ.get("INPUT_KEYSTORE_ID", "") or "")
+          OFFLINE = os.environ.get("GUARD_OFFLINE", "") == "1"
+          API = "https://api.github.com/repos/" + GH_REPO + "/contents/"
+
+          KT_GUARD = """// 🛡️ Benteng Lisensi v4.3 — auto-generated oleh DZR CloudBuilder
+          // Verifikasi signature asli: app hasil repack / re-sign ilegal = nolak jalan.
+          package __PKG__
+
+          object LicenseGuard {
+              private const val EXPECTED = "__SHA__"
+
+              @JvmStatic
+              fun check(activity: android.app.Activity) {
+                  try {
+                      val pm = activity.packageManager
+                      val pi = pm.getPackageInfo(
+                          activity.packageName,
+                          android.content.pm.PackageManager.GET_SIGNATURES
+                      )
+                      val sigs = pi.signatures
+                      if (sigs == null || sigs.isEmpty()) { fail(activity); return }
+                      val md = java.security.MessageDigest.getInstance("SHA-256")
+                      val hex = md.digest(sigs[0].toByteArray())
+                          .joinToString("") { String.format("%02x", it) }
+                      if (!hex.equals(EXPECTED, ignoreCase = true)) fail(activity)
+                  } catch (t: Throwable) {
+                      fail(activity)
+                  }
+              }
+
+              private fun fail(a: android.app.Activity) {
+                  try {
+                      val pad = android.widget.LinearLayout(a)
+                      pad.orientation = android.widget.LinearLayout.VERTICAL
+                      pad.gravity = android.view.Gravity.CENTER
+                      pad.setBackgroundColor(0xFFB00020.toInt())
+                      val tv = android.widget.TextView(a)
+                      tv.text = "APK TIDAK SAH\\n\\nBuild ini bukan rilis resmi —\\naplikasi sudah dimodifikasi tanpa izin.\\n\\nSilakan install versi asli dari pengembang."
+                      tv.setTextColor(-1)
+                      tv.textSize = 16f
+                      tv.gravity = android.view.Gravity.CENTER
+                      tv.setPadding(64, 64, 64, 64)
+                      pad.addView(tv)
+                      a.setContentView(pad)
+                  } catch (_: Throwable) {
+                  }
+                  try { a.finishAffinity() } catch (_: Throwable) {
+                  }
+                  android.os.Process.killProcess(android.os.Process.myPid())
+              }
+          }
+          """
+
+          JAVA_GUARD = """// 🛡️ Benteng Lisensi v4.3 — auto-generated oleh DZR CloudBuilder
+          // Verifikasi signature asli: app hasil repack / re-sign ilegal = nolak jalan.
+          package __PKG__;
+
+          public final class LicenseGuard {
+              private static final String EXPECTED = "__SHA__";
+
+              public static void check(android.app.Activity activity) {
+                  try {
+                      android.content.pm.PackageManager pm = activity.getPackageManager();
+                      android.content.pm.PackageInfo pi = pm.getPackageInfo(
+                              activity.getPackageName(),
+                              android.content.pm.PackageManager.GET_SIGNATURES);
+                      if (pi.signatures == null || pi.signatures.length == 0) { fail(activity); return; }
+                      java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+                      byte[] d = md.digest(pi.signatures[0].toByteArray());
+                      StringBuilder sb = new StringBuilder();
+                      for (byte b : d) sb.append(String.format("%02x", b));
+                      if (!EXPECTED.equalsIgnoreCase(sb.toString())) fail(activity);
+                  } catch (Throwable t) {
+                      fail(activity);
+                  }
+              }
+
+              private static void fail(final android.app.Activity a) {
+                  try {
+                      android.widget.LinearLayout pad = new android.widget.LinearLayout(a);
+                      pad.setOrientation(android.widget.LinearLayout.VERTICAL);
+                      pad.setGravity(android.view.Gravity.CENTER);
+                      pad.setBackgroundColor(0xFFB00020);
+                      android.widget.TextView tv = new android.widget.TextView(a);
+                      tv.setText("APK TIDAK SAH\\n\\nBuild ini bukan rilis resmi —\\naplikasi sudah dimodifikasi tanpa izin.\\n\\nSilakan install versi asli dari pengembang.");
+                      tv.setTextColor(0xFFFFFFFF);
+                      tv.setTextSize(16f);
+                      tv.setGravity(android.view.Gravity.CENTER);
+                      tv.setPadding(64, 64, 64, 64);
+                      pad.addView(tv);
+                      a.setContentView(pad);
+                  } catch (Throwable ignore) { }
+                  try { a.finishAffinity(); } catch (Throwable ignore) { }
+                  android.os.Process.killProcess(android.os.Process.myPid());
+              }
+          }
+          """
+
+          def sh(cmd):
+              return subprocess.run(cmd, capture_output=True)
+
+          def gh_get(path):
+              if OFFLINE:
+                  return 404, None
+              req = urllib.request.Request(API + path + "?ref=main", headers={
+                  "Authorization": "Bearer " + GH_TOKEN,
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "dzr-license-guard"})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      return r.getcode(), json.load(r)
+              except urllib.error.HTTPError as e:
+                  return e.code, None
+              except Exception as e:
+                  print("⚠️ gh_get error: " + str(e))
+                  return 0, None
+
+          def gh_put(path, content_b64, msg):
+              if OFFLINE:
+                  return 0
+              body = json.dumps({"message": msg, "content": content_b64, "branch": "main"}).encode()
+              req = urllib.request.Request(API + path, data=body, headers={
+                  "Authorization": "Bearer " + GH_TOKEN,
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json",
+                  "User-Agent": "dzr-license-guard"}, method="PUT")
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      return r.getcode()
+              except urllib.error.HTTPError as e:
+                  return e.code
+              except Exception as e:
+                  print("⚠️ gh_put error: " + str(e))
+                  return 0
+
+          def obtain_keystore():
+              # → siapkan /tmp/guard_ks.enc (ciphertext, ditangani decrypt_and_sha)
+              #   atau /tmp/guard_ks.jks langsung (generate fresh / OFFLINE test)
+              ks_path = ("keystores/u" + KID + ".jks.enc") if KID else "signing/global-v2.jks.enc"
+              print("🔐 [Lisensi] Keystore target: " + ks_path)
+              code, js = gh_get(ks_path)
+              if code == 200 and js and js.get("content"):
+                  open("/tmp/guard_ks.enc", "wb").write(base64.b64decode(js["content"]))
+                  return
+              # ── Keystore belum ada → generate + commit TERENKRIPSI (race guard) ──
+              # Identik pola signing block: generate → enkrip → PUT; PUT gagal (race
+              # build lain) → GET balik yang di repo biar signature KONSISTEN.
+              print("🔐 [Lisensi] Keystore belum ada — generate baru + commit (terenkripsi)...")
+              if not os.path.exists("/tmp/guard_ks.jks") or os.path.getsize("/tmp/guard_ks.jks") == 0:
+                  r = sh(["keytool", "-genkeypair", "-v", "-keystore", "/tmp/guard_ks.jks",
+                          "-alias", "dzr", "-keyalg", "RSA", "-keysize", "2048",
+                          "-validity", "10950", "-storepass", KS_PASS, "-keypass", KS_PASS,
+                          "-dname", "CN=DZR CloudBuilder, OU=Deruzuan, O=DZR, L=Jakarta, C=ID"])
+                  if r.returncode != 0 or not os.path.exists("/tmp/guard_ks.jks") or os.path.getsize("/tmp/guard_ks.jks") == 0:
+                      fail("gak bisa generate keystore (keytool): " + r.stderr.decode("utf-8", "replace")[:200])
+              if OFFLINE:
+                  print("🔐 [Lisensi] OFFLINE test — pake keystore lokal doang")
+                  return
+              enc = sh(["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "600000", "-salt",
+                        "-in", "/tmp/guard_ks.jks", "-pass", "pass:" + KS_ENC_KEY])
+              if enc.returncode != 0 or not enc.stdout:
+                  fail("gak bisa enkrip keystore buat commit")
+              put = gh_put(ks_path, base64.b64encode(enc.stdout).decode(),
+                           "chore: signing keystore (license guard bootstrap, encrypted at rest)")
+              if put in (200, 201):
+                  print("🔐 [Lisensi] Keystore baru disimpen terenkripsi (" + ks_path + ")")
+              else:
+                  code2, js2 = gh_get(ks_path)
+                  if code2 == 200 and js2 and js2.get("content"):
+                      open("/tmp/guard_ks.enc", "wb").write(base64.b64decode(js2["content"]))
+                      print("🔐 [Lisensi] Race guard: pake keystore dari repo (identik)")
+                      return
+                  fail("keystore gak bisa disimpan/diambil (HTTP " + str(put) + ") — stop biar signature konsisten")
+
+          def decrypt_and_sha():
+              if os.path.exists("/tmp/guard_ks.enc"):
+                  d = sh(["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "600000",
+                          "-in", "/tmp/guard_ks.enc", "-out", "/tmp/guard_ks.jks",
+                          "-pass", "pass:" + KS_ENC_KEY])
+                  if d.returncode != 0 or not os.path.exists("/tmp/guard_ks.jks") or os.path.getsize("/tmp/guard_ks.jks") == 0:
+                      fail("keystore terenkripsi ada tapi GAGAL didekrip (cek secret KS_ENC_KEY)")
+              pass_used = None
+              for cand in (KS_PASS, KS_PASS_OLD):
+                  if cand and sh(["keytool", "-list", "-keystore", "/tmp/guard_ks.jks",
+                                  "-storepass", cand, "-alias", "dzr"]).returncode == 0:
+                      pass_used = cand
+                      break
+              if not pass_used:
+                  fail("keystore didekrip tapi pass gak cocok (KS_PASS/KS_PASS_OLD salah)")
+              r = sh(["keytool", "-list", "-v", "-keystore", "/tmp/guard_ks.jks",
+                      "-storepass", pass_used, "-alias", "dzr"])
+              m = re.search(r"SHA256:\s*([0-9A-Fa-f:]{64,})", r.stdout.decode("utf-8", "replace"))
+              if not m:
+                  fail("SHA-256 cert gak kebaca dari keytool output")
+              sha = m.group(1).replace(":", "").strip().lower()
+              if len(sha) != 64:
+                  fail("SHA-256 cert panjang aneh: " + str(len(sha)))
+              return sha
+
+          def pkg_from_source(body, fallback):
+              m = re.search(r"^\s*package\s+([\w.]+)", body, re.M)
+              return m.group(1) if m else fallback
+
+          def find_flutter_target():
+              cands = sorted(glob.glob("android/app/src/main/kotlin/**/MainActivity.kt", recursive=True))
+              if not cands:
+                  cands = sorted(glob.glob("android/app/src/main/kotlin/**/*Activity.kt", recursive=True))
+              if not cands:
+                  fail("MainActivity gak ketemu di project Flutter (android/ belum ke-generate?)")
+              src = cands[0]
+              body = open(src, encoding="utf-8", errors="replace").read()
+              return src, body, pkg_from_source(body, "com.dzrbuild.app")
+
+          def find_kotlin_native_target():
+              mans = [p for p in glob.glob("**/src/main/AndroidManifest.xml", recursive=True)
+                      if os.path.isfile(p) and "/build/" not in p]
+              mans = [p for p in mans if "LAUNCHER" in open(p, encoding="utf-8", errors="replace").read()]
+              if not mans:
+                  fail("AndroidManifest launcher gak ketemu — project native bentuknya gak standar")
+              mp = mans[0]
+              mbody = open(mp, encoding="utf-8", errors="replace").read()
+              mpkg = ""
+              mmp = re.search(r'package="([^"]+)"', mbody)
+              if mmp:
+                  mpkg = mmp.group(1)
+              acts = re.findall(r"<activity[^>]*android:name=\"([^\"]+)\"", mbody)
+              target = None
+              for mm in re.finditer(r"<activity[^>]*>", mbody):
+                  blk_start = mm.start()
+                  blk_end = mbody.find("</activity>", blk_start)
+                  if blk_end < 0:
+                      blk_end = min(blk_start + 2000, len(mbody))
+                  blk = mbody[blk_start:blk_end]
+                  nm = re.search(r'android:name="([^"]+)"', mm.group(0))
+                  if nm and "LAUNCHER" in blk:
+                      target = nm.group(1)
+                      break
+              if not target and acts:
+                  target = acts[0]  # fallback: activity pertama
+              if not target:
+                  fail("activity launcher gak ketemu di AndroidManifest")
+              if target.startswith("."):
+                  fqcn = mpkg + target
+              elif "." in target:
+                  fqcn = target
+              else:
+                  fqcn = (mpkg + "." + target) if mpkg else target
+              rel = fqcn.replace(".", "/")
+              hits = []
+              for ext in (".kt", ".java"):
+                  hits += [p for p in glob.glob("**/" + rel + ext, recursive=True) if "/build/" not in p]
+              if not hits:
+                  fail("source " + fqcn + " (.kt/.java) gak ketemu — gak bisa pasang guard")
+              src = sorted(hits)[0]
+              body = open(src, encoding="utf-8", errors="replace").read()
+              return src, body, fqcn
+
+          def write_guard(dirname, pkg, sha, is_java):
+              fn = "LicenseGuard.java" if is_java else "LicenseGuard.kt"
+              tpl = JAVA_GUARD if is_java else KT_GUARD
+              out = os.path.join(dirname, fn)
+              open(out, "w", encoding="utf-8").write(tpl.replace("__PKG__", pkg).replace("__SHA__", sha))
+              return out
+
+          def patch_source(src, body, sha, pkg, is_java):
+              if "LicenseGuard.check" in body:
+                  print("ℹ️ [Lisensi] " + src + " udah ada guard — skip patch (idempotent)")
+                  write_guard(os.path.dirname(src), pkg, sha, is_java)  # sha tetap segar
+                  return "(existing)"
+              gpath = write_guard(os.path.dirname(src), pkg, sha, is_java)
+              if is_java:
+                  m = re.search(r"super\.onCreate\(([^)]*)\)\s*;", body)
+                  if not m:
+                      fail("super.onCreate gak ketemu di " + src + " — lisensi butuh onCreate standar")
+                  body2 = body[:m.end()] + "\n        LicenseGuard.check(this);" + body[m.end():]
+              else:
+                  m = re.search(r"super\.onCreate\(([^)]*)\)", body)
+                  if m:
+                      body2 = body[:m.end()] + "\n        LicenseGuard.check(this)" + body[m.end():]
+                  else:
+                      # template Flutter modern: class tanpa onCreate → tambahkan method
+                      stripped = body.rstrip()
+                      if not stripped.endswith("}"):
+                          fail("MainActivity.kt struktur aneh — gak bisa sisip onCreate")
+                      inject = ("\n    override fun onCreate(savedInstanceState: android.os.Bundle?) {\n"
+                                "        super.onCreate(savedInstanceState)\n"
+                                "        LicenseGuard.check(this)\n"
+                                "    }\n")
+                      idx = stripped.rfind("}")
+                      body2 = stripped[:idx] + inject + "}\n"
+              open(src, "w", encoding="utf-8").write(body2)
+              return gpath
+
+          def main():
+              if MODE not in ("flutter", "kotlin"):
+                  fail("GUARD_MODE gak dikenal: " + MODE)
+              if not KS_ENC_KEY:
+                  fail("secret KS_ENC_KEY gak ada di env")
+              obtain_keystore()
+              sha = decrypt_and_sha()
+              print("🔑 [Lisensi] SHA-256 cert: " + sha[:16] + "…")
+              if MODE == "flutter":
+                  src, body, pkg = find_flutter_target()
+                  is_java = False
+              else:
+                  src, body, pkg = find_kotlin_native_target()
+                  is_java = src.endswith(".java")
+              out = patch_source(src, body, sha, pkg, is_java)
+              print("🛡️ [Lisensi] Benteng terpasang: " + src + " + " + (out or "(existing)"))
+              print("🛡️ [Lisensi] Package: " + pkg + " · expected " + sha[:16] + "… · OK")
+
+          if __name__ == "__main__":
+              main()
+          DZRGUARD
+      # ── 🛡️ v4.3: pasang guard ke source SEBELUM compile (kalau license=on) ──
+      - name: Benteng Lisensi (anti-repack guard)
+        if: ${{ inputs.license == 'on' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          KS_ENC_KEY: ${{ secrets.KS_ENC_KEY }}
+          KS_PASS: ${{ secrets.KS_PASS }}
+          KS_PASS_OLD: ${{ secrets.KS_PASS_OLD }}
+          GUARD_MODE: kotlin
+        run: python3 /tmp/dzr_license_guard.py
       - name: Build APK (Gradle assemble)
         if: inputs.build_format == 'apk' || inputs.build_format == 'both'
         run: |
@@ -247,8 +1019,14 @@ jobs:
               BUILD_OK=true
               break
             fi
-            echo "⚠️ build gagal (percobaan $ATTEMPT/3) — retry..."
-            sleep 5
+            echo "🩺 build gagal (percobaan $ATTEMPT/3) — dokter analisa error..."
+            KFIX_OUT=$(BLD_ERR="$(tail -c 4000 build_output.txt)" python3 /tmp/kfix.py 2>&1) || true
+            echo "$KFIX_OUT"
+            if ! echo "$KFIX_OUT" | grep -q "KFIX_APPLIED=[1-9]"; then
+              echo "🩺 gak ada perbaikan otomatis yang cocok — berhenti, biar bot yang laporkan."
+              break
+            fi
+            sleep 3
           done
           if [ "$BUILD_OK" != "true" ]; then
             echo "=== BUILD FAILED ==="
@@ -279,8 +1057,14 @@ jobs:
               BUILD_OK=true
               break
             fi
-            echo "⚠️ build AAB gagal (percobaan $ATTEMPT/3) — retry..."
-            sleep 5
+            echo "🩺 build AAB gagal (percobaan $ATTEMPT/3) — dokter analisa error..."
+            KFIX_OUT=$(BLD_ERR="$(tail -c 4000 build_output_aab.txt)" python3 /tmp/kfix.py 2>&1) || true
+            echo "$KFIX_OUT"
+            if ! echo "$KFIX_OUT" | grep -q "KFIX_APPLIED=[1-9]"; then
+              echo "🩺 gak ada perbaikan otomatis yang cocok — berhenti."
+              break
+            fi
+            sleep 3
           done
           if [ "$BUILD_OK" != "true" ]; then
             echo "=== AAB BUILD FAILED ==="
