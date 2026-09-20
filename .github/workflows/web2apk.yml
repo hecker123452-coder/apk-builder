@@ -2480,8 +2480,15 @@ jobs:
             if ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
               sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />\n    <application|' "$MANIFEST"
             fi
+            # ⚡ v4.10.1 FIX LAYAR PUTIH: anchor lama `android:allowBackup=` gak ada
+            # di template flutter create modern → sed no-op SENYAP → cleartext gak
+            # pernah ke-set → Android 9+ blokir http://localhost:8080 (situs offline
+            # InAppLocalhostServer) → webview putih doang. Anchor baru: <application
+            # (dipake juga inject queries/REQUEST_INSTALL — proven landed di APK)
+            # + guard fail-loud biar no-op kayak gini gak keulang diam-diam.
             if ! grep -q "usesCleartextTraffic" "$MANIFEST"; then
-              sed -i 's|android:allowBackup="[^"]*"|android:allowBackup="false"\n        android:usesCleartextTraffic="true"|' "$MANIFEST"
+              sed -i 's|<application|<application\n        android:allowBackup="false"\n        android:usesCleartextTraffic="true"|' "$MANIFEST"
+              grep -q 'usesCleartextTraffic="true"' "$MANIFEST" || { echo "ERROR: inject usesCleartextTraffic gagal (anchor <application gak match)!"; exit 1; }
             fi
             # <queries> wajib di Android 11+ (package visibility) biar
             # url_launcher bisa buka browser/telpon/email buat link eksternal
