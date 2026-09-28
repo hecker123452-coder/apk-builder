@@ -1180,6 +1180,33 @@ jobs:
           with open(p, 'w', encoding='utf-8') as f:
               f.write(src2)
           print('FA-NET: FaIconData extends IconData — semua konstruksi pemakaian kompil')
+          # v5.7.3: IconData di Flutter >=3.47 = final class → gak bisa
+          # di-extend dari luar library-nya (E2E run #76: "The class
+          # 'IconData' can't be extended outside of its library because
+          # it's a final class"). Patch 1 baris di SDK runner (ephemeral
+          # per job): buang modifier final — semantik IconData gak berubah
+          # (final = larangan subtyping doang; subclass FaIconData
+          # nyediain semua member via getter override).
+          import subprocess as _sp
+          try:
+              _wf = _sp.check_output(['which', 'flutter']).decode().strip()
+              _fl = _sp.check_output(['readlink', '-f', _wf]).decode().strip()
+              _sdk = os.path.dirname(os.path.dirname(_fl))
+              _ip = os.path.join(_sdk, 'packages', 'flutter', 'lib', 'src', 'widgets', 'icon_data.dart')
+              if os.path.isfile(_ip):
+                  with open(_ip, encoding='utf-8') as f:
+                      _isrc = f.read()
+                  if 'final class IconData' in _isrc:
+                      _isrc2 = _isrc.replace('final class IconData', 'class IconData', 1)
+                      with open(_ip, 'w', encoding='utf-8') as f:
+                          f.write(_isrc2)
+                      print('FA-NET SDK: modifier final IconData dibuang → FaIconData extends legal (' + _sdk + ')')
+                  else:
+                      print('FA-NET SDK: IconData udah gak final, skip')
+              else:
+                  print('FA-NET SDK: icon_data.dart SDK gak ketemu, skip')
+          except Exception as _e:
+              print('FA-NET SDK: skip (' + repr(_e)[:80] + ')')
           PYFANET
           FAICON_FILE=""
           for CACHEDIR in "${PUB_CACHE:-$HOME/.pub-cache}" "$HOME/.pub-cache" "$HOME/.pub-cache/hosted/pub.dev"; do
