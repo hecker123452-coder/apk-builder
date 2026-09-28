@@ -1425,6 +1425,16 @@ jobs:
             sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />\n    <application|' "$MANIFEST"
             echo "🔐 [v6.1] Izin INTERNET + NETWORK_STATE + WIFI_STATE di-inject ke manifest"
           fi
+          # ── ⚪ v4.10.2: cleartext buat APK sideload (kelas bug layar putih) ──
+          # App project user yang fetch http:// (API lama/gambar) keblokir
+          # Android 9+ tanpa flag ini — sama kayak kasus web2apk run #31
+          # (localhost server keblokir → putih). Jalur AAB Play SENGAJA
+          # gak di-inject (kebijakan cleartext Play).
+          if [ -f "$MANIFEST" ] && ! grep -q "usesCleartextTraffic" "$MANIFEST"; then
+            sed -i 's|<application|<application\n        android:usesCleartextTraffic="true"|' "$MANIFEST"
+            grep -q 'usesCleartextTraffic="true"' "$MANIFEST" || { echo "ERROR: inject cleartext gagal (anchor <application gak match)!"; exit 1; }
+            echo "⚪ [v4.10.2] usesCleartextTraffic=true ke-inject (APK sideload)"
+          fi
           # ── ⚙️ v4.8 AGP9 safety net: patch plugin pub-cache lama yang masih
           # pake proguard-android.txt (di-blok AGP 9+). Non-fatal. (APK step)
           find "$HOME/.pub-cache/hosted" -name "build.gradle" -path "*android*" \
