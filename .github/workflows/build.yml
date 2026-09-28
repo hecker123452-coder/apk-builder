@@ -957,26 +957,31 @@ jobs:
               pubspec_changed = True
               return True
 
-          def add_import_prefix(f, ident, root_uri):
+          def add_import_prefix(f, ident, root_uri, verify=True):
               src = read_f(f)
               if re.search(r"^import\s+['\"]package:" + re.escape(ident) + r"/", src, re.M):
                   return False
               if re.search(r"\bimport\b[^;\n]*\bas\s+" + re.escape(ident) + r"\b", src):
                   return False
-              root = root_uri.replace('file://', '')
-              if not root.startswith('/'):
-                  root = os.path.normpath(os.path.join('.dart_tool', root))
-              hit = os.path.join(root, 'lib', ident + '.dart')
-              if not os.path.isfile(hit):
-                  libdir = os.path.join(root, 'lib')
-                  if os.path.isdir(libdir):
-                      same = [x for x in sorted(os.listdir(libdir)) if x == ident + '.dart']
-                      hit = os.path.join(libdir, same[0]) if same else None
-                  else:
-                      hit = None
-              if not hit:
-                  return False
-              rel = os.path.relpath(hit, os.path.join(root, 'lib')).replace(os.sep, '/')
+              if verify:
+                  root = (root_uri or '').replace('file://', '')
+                  if not root.startswith('/'):
+                      root = os.path.normpath(os.path.join('.dart_tool', root))
+                  hit = os.path.join(root, 'lib', ident + '.dart')
+                  if not os.path.isfile(hit):
+                      libdir = os.path.join(root, 'lib')
+                      if os.path.isdir(libdir):
+                          same = [x for x in sorted(os.listdir(libdir)) if x == ident + '.dart']
+                          hit = os.path.join(libdir, same[0]) if same else None
+                      else:
+                          hit = None
+                  if not hit:
+                      return False
+                  rel = os.path.relpath(hit, os.path.join(root, 'lib')).replace(os.sep, '/')
+              else:
+                  # dep baru ditambahin ke pubspec, belum ke-resolve — buat
+                  # whitelist, layout lib/<nama>.dart standar semua
+                  rel = ident + '.dart'
               line = "import 'package:" + ident + "/" + rel + "' as " + ident + ";"
               ms = list(re.finditer(r'(?m)^import\s[^;]+;\s*$', src))
               if ms:
@@ -1005,17 +1010,20 @@ jobs:
                   continue
               if ident not in deps and ident not in KNOWN_MISSING:
                   continue
+              fresh = False
               if ident not in deps:
                   if not add_dependency(ident, KNOWN_MISSING[ident]):
                       continue
+                  fresh = True
+              root_uri = deps.get(ident) if not fresh else None
               added_imp = False
               for f in err_files:
                   if not os.path.isfile(f):
                       continue
-                  if add_import_prefix(f, ident, deps.get(ident, 'file://' + os.path.join('.dart_tool', '..', '.pub-cache'))):
+                  if add_import_prefix(f, ident, root_uri, verify=not fresh):
                       applied.append(f + ": import 'package:" + ident + "/' as " + ident + " ditambahin")
                       added_imp = True
-              if added_imp and ident in KNOWN_MISSING and ident not in deps:
+              if added_imp and fresh:
                   pubspec_changed = True
 
           if applied:
