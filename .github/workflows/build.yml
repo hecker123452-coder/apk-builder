@@ -1138,21 +1138,23 @@ jobs:
           import subprocess as _sp3
 
           def _syn_count(path):
+              # v5.8.2: dart analyze <file> di runner ternyata gak reliable
+              # (run #84: output gak nyebut file → metric 0→0 → repair
+              # selalu revert). Ganti ke dart format --output=none: file
+              # PARSE-able = exit 0 (GAK nulis apa-apa), syntax error =
+              # non-zero + output nyebut file:baris:kolom. Metric: 0 = parse
+              # OK, else jumlah baris yang nyebut file (>=1). Repair bener =
+              # file jadi parseable → after 0 < base → keep.
               try:
-                  _r = _sp3.run(['dart', 'analyze', '--no-pub', path], capture_output=True, text=True, timeout=240)
+                  _r = _sp3.run(['dart', 'format', '--output=none', path], capture_output=True, text=True, timeout=180)
+                  if _r.returncode == 0:
+                      return 0
                   _txt = (_r.stdout or '') + (_r.stderr or '')
-                  # v5.8.1: format output dart analyze beda-beda antar versi
-                  # (severity • depan, atau belakang) — metric kata kunci
-                  # ("Expected to find" dll) bikin 0→0 di run #83 → repair
-                  # selalu di-revert. Sekarang: hitung SEMUA baris error yang
-                  # nyebut file ini — repair yang bener PASTI nurunin total
-                  # error (kurung bener = cascade hilang), tanpa peduli
-                  # wording.
                   _n = 0
                   for _ln in _txt.splitlines():
-                      if path in _ln and re.search(r'\berror\b', _ln, re.I):
+                      if path in _ln:
                           _n += 1
-                  return _n
+                  return max(_n, 1)
               except Exception:
                   return -1
 
@@ -1204,12 +1206,37 @@ jobs:
           # flutter_secure_storage lupa ditulis). Cari kelas di lib/ SEMUA
           # package deps; ketemu → import ditambahin, bukan di-stub.
           _pci_cache = {}
+          # v5.8.2: batasi R-PCI ke DIRECT dependency pubspec + skip package
+          # project sendiri. Run #84: (a) stub NewsMedia yang nyasar dalam
+          # kurung rusak ke-import sbg 'package:fmedic2test/dashboard.dart'
+          # (self-import = kacau), (b) class dikejar ke package TRANSITIF
+          # (windows_file_picker / file_picker_platform_interface) yang ilang
+          # pas pub get berikutnya setelah dependency_overrides → import
+          # "Not found" bikin build makin rusak.
+          _PROJ_NAME = ''
+          _DIRECT_DEPS = set()
+          if os.path.isfile('pubspec.yaml'):
+              _psrc = read_f('pubspec.yaml')
+              _mn = re.search(r'(?m)^name:\s*(\S+)', _psrc)
+              if _mn:
+                  _PROJ_NAME = _mn.group(1)
+              _sec = None
+              for _ln2 in _psrc.splitlines():
+                  if re.match(r'^\S', _ln2):
+                      _sec = _ln2.split(':')[0].strip()
+                      continue
+                  if _sec in ('dependencies', 'dev_dependencies', 'dependency_overrides') and re.match(r'^ {2}[A-Za-z0-9_.-]+\s*:', _ln2):
+                      _DIRECT_DEPS.add(_ln2.strip().split(':')[0])
 
           def pkg_class_import(cls):
               if cls in _pci_cache:
                   return _pci_cache[cls]
               _out = None
               for _pkg, _uri in (deps or {}).items():
+                  if _pkg == _PROJ_NAME:
+                      continue
+                  if _DIRECT_DEPS and _pkg not in _DIRECT_DEPS:
+                      continue
                   _r = (_uri or '').replace('file://', '')
                   if not _r:
                       continue
