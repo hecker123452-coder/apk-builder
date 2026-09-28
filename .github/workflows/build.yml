@@ -1175,7 +1175,7 @@ jobs:
           PYFANET
           FAICON_FILE=""
           for CACHEDIR in "${PUB_CACHE:-$HOME/.pub-cache}" "$HOME/.pub-cache" "$HOME/.pub-cache/hosted/pub.dev"; do
-            FAICON_FILE=$(find "$CACHEDIR" -maxdepth 4 -path '*font_awesome_flutter-11*' -name 'icon_data.dart' 2>/dev/null | head -1)
+            FAICON_FILE=$(find "$CACHEDIR" -maxdepth 8 -path '*font_awesome_flutter-11*' -name 'icon_data.dart' 2>/dev/null | head -1)
             [ -n "$FAICON_FILE" ] && break
           done
           if [ -n "$FAICON_FILE" ]; then
