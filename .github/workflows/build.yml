@@ -773,6 +773,7 @@ jobs:
                   return None
 
           fp12 = bool(re.search(r"Type 'FilePickerResult' not found|'FilePickerResult' isn't a type", out))
+          fp_done = os.path.exists('/tmp/dartfix_fp_done')
 
           # R1: flutter_secure_storage >=11 hapus opsi encryptedSharedPreferences
           for f in err_files:
@@ -785,16 +786,18 @@ jobs:
                   write_f(f, src2)
                   applied.append(f + ': encryptedSharedPreferences dibuang (flutter_secure_storage >=11)')
 
-          if fp12:
+          if fp12 and not fp_done:
               # R6: file_picker >=12 ngerewrite total API-nya (FilePickerResult +
               # FilePicker.platform dihapus) → refactor kode terlalu dalem buat
               # di-regex. Balikin API lama via dependency_overrides ke 11.0.3
-              # (rilis terakhir sebelum rewrite 12.0.0) + win32 ^6 buat project
-              # yang bawa better_player/wakelock_plus (kode win32 gak pernah
-              # dikompil buat APK/AAB, aman dipaksa).
+              # (rilis terakhir sebelum rewrite 12.0.0). v5.8: JANGAN maksa
+              # win32 ^6 lagi — file_picker 11.0.3 pairs with win32 ^5.9.0
+              # (kode windows-nya pake API klasik COINIT/HRESULT) dan file
+              # file_picker_windows.dart DIKOMPIL di build Android (run #80:
+              # 30+ error "Member not found: 'COINIT...'" vs win32 6.4.0).
               if not os.path.exists('/tmp/dartfix_fp_done'):
-                  add_overrides({'file_picker': '11.0.3', 'win32': '^6.0.1'})
-                  applied.append('file_picker -> 11.0.3 + win32 ^6.0.1 via dependency_overrides (API lama dikembalikan)')
+                  add_overrides({'file_picker': '11.0.3'})
+                  applied.append('file_picker -> 11.0.3 via dependency_overrides (API lama dikembalikan; win32 gak diutak-atik — v5.8)')
                   with open('/tmp/dartfix_fp_done', 'w') as f:
                       f.write('ok')
           else:
@@ -1038,6 +1041,290 @@ jobs:
               if added_imp and fresh:
                   pubspec_changed = True
 
+          # ── 🩹 v5.8 R-FPI: file_picker dipake tanpa import (kode
+          # generatoran) — "Type 'FilePickerResult' not found" & kelas
+          # internal FilePickerWindows/Linux/IO manggil tanpa import. Path
+          # internal dicari DINAMIS di pub-cache (lokasi beda antar versi).
+          def _fp_pkg_root():
+              _u = deps.get('file_picker') if deps else None
+              if not _u:
+                  return None
+              _r = _u.replace('file://', '')
+              if not os.path.isabs(_r):
+                  _r = os.path.normpath(os.path.join('.dart_tool', _r))
+              return _r if os.path.isdir(_r) else None
+
+          _FP_ROOT = _fp_pkg_root()
+
+          def fp_class_import(cls):
+              if not _FP_ROOT:
+                  return None
+              _lib = os.path.join(_FP_ROOT, 'lib')
+              for _root, _dirs, _fs in os.walk(_lib):
+                  for _fn in _fs:
+                      if not _fn.endswith('.dart'):
+                          continue
+                      _p = os.path.join(_root, _fn)
+                      try:
+                          with open(_p, encoding='utf-8') as _fh:
+                              if re.search(r'\bclass\s+' + re.escape(cls) + r'\b', _fh.read()):
+                                  return 'package:file_picker/' + os.path.relpath(_p, _lib).replace(os.sep, '/')
+                      except Exception:
+                          pass
+              return None
+
+          def add_plain_import(f, uri):
+              src = read_f(f)
+              if ("'" + uri + "'" in src) or ('"' + uri + '"' in src):
+                  return False
+              line = "import '" + uri + "';"
+              _ms = list(re.finditer(r'(?m)^import\s[^;]+;\s*$', src))
+              if _ms:
+                  src = src[:_ms[-1].end()] + '\n' + line + src[_ms[-1].end():]
+              else:
+                  src = line + '\n' + src
+              write_f(f, src)
+              return True
+
+          for f in set(re.findall(r"((?:lib|test)/[\w./-]+\.dart):\d+:\d+: (?:Error|Warning): (?:Type 'FilePickerResult' not found|'FilePickerResult' isn't a type)", out)):
+              if os.path.isfile(f) and add_plain_import(f, 'package:file_picker/file_picker.dart'):
+                  applied.append(f + ": import 'package:file_picker/file_picker.dart' ditambahin")
+          for cls in dict.fromkeys(re.findall(r"(?:lib|test)/[\w./-]+\.dart:\d+:\d+: Error: The (?:method|getter) '(FilePicker[A-Z]\w*)' isn't defined", out)):
+              _uri = fp_class_import(cls)
+              if not _uri:
+                  continue
+              for f in set(re.findall(r"((?:lib|test)/[\w./-]+\.dart):\d+:\d+: Error: The (?:method|getter) '" + re.escape(cls) + r"' isn't defined", out)):
+                  if os.path.isfile(f) and add_plain_import(f, _uri):
+                      applied.append(f + ": import '" + _uri + "' ditambahin (kelas internal file_picker)")
+
+          # ── 🛡️ v5.8 R10: FA-NET reaktif — SDK fresh per job = IconData
+          # 'final' lagi sementara pub-cache bisa bawa FA 11 ter-patch
+          # (extends IconData, warisan cache run lain) → "The class 'IconData'
+          # can't be extended outside of its library". Juga arah balik:
+          # "argument type 'IconData' can't be assigned to ... 'FaIconData?'"
+          # (run #79: FaIcon(c.icon)). Fix: fanet2.py dipanggil ulang (sdk
+          # strip + patch + widen) + sweep anotasi FaIconData → IconData.
+          import glob as _g
+          if re.search(r"The class 'IconData' can't be extended outside of its library", out) or re.search(r"The argument type 'IconData\??' can't be assigned to the (?:parameter|variable) type 'FaIconData\??'", out):
+              if os.path.isfile('/tmp/fanet2.py'):
+                  import subprocess as _sp2
+                  _cands = []
+                  for _base in (os.environ.get('PUB_CACHE', ''), os.path.expanduser('~/.pub-cache')):
+                      if _base:
+                          _cands += _g.glob(os.path.join(_base, 'hosted', 'pub.dev', 'font_awesome_flutter-11*', 'lib', 'src', 'icon_data.dart'))
+                  _cmd = ['python3', '/tmp/fanet2.py'] + ([_cands[0]] if _cands else [])
+                  _rr = _sp2.run(_cmd, capture_output=True, text=True, timeout=120)
+                  _tail = ((_rr.stdout or '') + (_rr.stderr or '')).strip().splitlines()
+                  print('R10 FA-NET reaktif: ' + ' | '.join(_tail[-4:])[:300])
+              for f in err_files:
+                  if not os.path.isfile(f):
+                      continue
+                  _s = read_f(f)
+                  if 'FaIconData' not in _s:
+                      continue
+                  _s2 = re.sub(r'\bFaIconData\b(?!\s*\()', 'IconData', _s)
+                  if _s2 != _s:
+                      write_f(f, _s2)
+                      applied.append(f + ': anotasi FaIconData → IconData (R10)')
+
+          # ── 🔧 v5.8 R-SYN: kurung gak balans — kode generatoran kepotong
+          # di tengah widget tree → CFE "Can't find ')' to match '('" +
+          # cascade "Expected ';'" + "missing implementations State.build"
+          # (run #81 dashboard_page.dart _buildAccountInfo, 5 percobaan mati).
+          # Repair: delimiter yang gak ke-tutup di-collect dari error, closer
+          # di-append di EOF urut innermost→outermost; separator dari konteks
+          # baris pembuka (return/await/assignment → ';', lainnya ',').
+          # FAIL-SAFE: dart analyze sebelum vs sesudah — makin parah → revert.
+          import subprocess as _sp3
+
+          def _syn_count(path):
+              try:
+                  _r = _sp3.run(['dart', 'analyze', '--no-pub', path], capture_output=True, text=True, timeout=240)
+                  _txt = (_r.stdout or '') + (_r.stderr or '')
+                  return len(re.findall(r"(?:Can't find (?:'|\")|\bExpected\s+';')", _txt))
+              except Exception:
+                  return -1
+
+          _syn = re.findall(r"((?:lib|test)/[\w./-]+\.dart):(\d+):\d+: Error: Can't find '([)\]}])' to match '([({[])'\.", out)
+          if _syn:
+              _byfile = {}
+              for _f, _ln, _cl, _op in _syn:
+                  _byfile.setdefault(_f, []).append((int(_ln), _op, _cl))
+              for _f, _plist in _byfile.items():
+                  if not os.path.isfile(_f):
+                      continue
+                  _src = read_f(_f)
+                  _lines = _src.split('\n')
+                  _stmt = re.compile(r'^\s*(?:return\b|await\b|[\w<>,?\[\] ]+\s+\w+\s*=\s*|\w+\s*=\s*)')
+                  _tail = []
+                  _plist = sorted(set(_plist), key=lambda t: -t[0])
+                  for _ln, _op, _cl in _plist:
+                      _oline = _lines[_ln - 1] if 0 < _ln <= len(_lines) else ''
+                      if _op in '([' and _stmt.match(_oline):
+                          _tail.append(_cl + ';')
+                      elif _op in '([':
+                          _tail.append(_cl + ',')
+                      else:
+                          _tail.append(_cl)
+                  _base = _syn_count(_f)
+                  if _base < 0:
+                      continue
+                  _new = _src
+                  if not _new.endswith('\n'):
+                      _new += '\n'
+                  _new += '\n// [DZR dartfix R-SYN] kurung penutup auto\n' + '\n'.join(_tail) + '\n'
+                  write_f(_f, _new)
+                  _after = _syn_count(_f)
+                  if _after < 0 or _after >= _base:
+                      write_f(_f, _src)
+                      print('R-SYN: ' + _f + ' repair GAGAL validasi (' + str(_base) + '→' + str(_after) + '), di-revert')
+                  else:
+                      applied.append(_f + ': kurung penutup di-append di EOF (' + str(len(_plist)) + ' delimiter, syntax error ' + str(_base) + '→' + str(_after) + ')')
+
+          # ── 🧩 v5.8 R-STUB: method/kelas GAK PERNAH didefinisi (kode
+          # generatoran kepotong) — run #81: NewsMedia(url: ...) &
+          # _getRoleColor(role) mati 5 percobaan. Dua jalur:
+          # (a) method di class project → sisipin stub dynamic di class itu;
+          # (b) constructor kelas yang gak ada sama sekali → stub
+          #     StatelessWidget (named params ditangkep dari call site).
+          _STUB_MAX = 30
+          _stub_done = set()
+
+          def _lib_files():
+              _acc = []
+              for _r2, _d2, _fs2 in os.walk('lib'):
+                  for _fn2 in _fs2:
+                      if _fn2.endswith('.dart'):
+                          _acc.append(os.path.join(_r2, _fn2))
+              return _acc
+
+          def _find_class_file(cls):
+              for _p in _lib_files():
+                  try:
+                      with open(_p, encoding='utf-8') as _fh:
+                          if re.search(r'\bclass\s+' + re.escape(cls) + r'\b', _fh.read()):
+                              return _p
+                  except Exception:
+                      pass
+              return None
+
+          def _class_close_pos(_src, cls):
+              _m = re.search(r'(?m)^(?:@\w+\s*\n\s*)*(?:abstract\s+|sealed\s+|base\s+|final\s+)*class\s+' + re.escape(cls) + r'\b[^{]*\{', _src)
+              if not _m:
+                  return None
+              _depth = 0
+              for _i in range(_m.end() - 1, len(_src)):
+                  if _src[_i] == '{':
+                      _depth += 1
+                  elif _src[_i] == '}':
+                      _depth -= 1
+                      if _depth == 0:
+                          return _i
+              return None
+
+          def _scan_calls(ident):
+              _named, _posc = [], 0
+              _pat = re.compile(r'(?<![\w.])' + re.escape(ident) + r'\(')
+              for _p in _lib_files():
+                  try:
+                      _src = read_f(_p)
+                  except Exception:
+                      continue
+                  for _m in _pat.finditer(_src):
+                      _seg = _src[_m.end():_m.end() + 500]
+                      _depth, _end = 1, -1
+                      for _i, _ch in enumerate(_seg):
+                          if _ch == '(':
+                              _depth += 1
+                          elif _ch == ')':
+                              _depth -= 1
+                              if _depth == 0:
+                                  _end = _i
+                                  break
+                      if _end < 0:
+                          continue
+                      _parts, _d, _cur = [], 0, ''
+                      for _ch in _seg[:_end]:
+                          if _ch in '([{':
+                              _d += 1
+                          elif _ch in ')]}':
+                              _d -= 1
+                          if _ch == ',' and _d == 0:
+                              _parts.append(_cur)
+                              _cur = ''
+                          else:
+                              _cur += _ch
+                      if _cur.strip():
+                          _parts.append(_cur)
+                      for _part in _parts:
+                          _nm = re.match(r'^\s*(\w+)\s*:\s', _part)
+                          if _nm:
+                              _named.append(_nm.group(1))
+                          elif _part.strip():
+                              _posc += 1
+              return list(dict.fromkeys(_named)), _posc
+
+          for _mm in re.finditer(r"(?:lib|test)/[\w./-]+\.dart:\d+:\d+: Error: The method '(\w+)' isn't defined for the type '(\w+)'", out):
+              _ident, _cls = _mm.group(1), _mm.group(2)
+              _key = _ident + '@' + _cls
+              if _key in _stub_done or len(_stub_done) >= _STUB_MAX:
+                  continue
+              if _ident in ('toString', 'hashCode', 'runtimeType', 'noSuchMethod', 'build', 'initState', 'dispose', 'didUpdateWidget', 'createState'):
+                  continue
+              if _ident in deps or fp_class_import(_ident):
+                  continue
+              _cls_file = _find_class_file(_cls)
+              if not _cls_file:
+                  continue
+              if _find_class_file(_ident):
+                  continue
+              _named, _posc = _scan_calls(_ident)
+              if re.match(r'^[A-Z]', _ident):
+                  # (b) stub kelas widget
+                  _ef = re.search(r"((?:lib|test)/[\w./-]+\.dart):\d+:\d+: Error: The method '" + re.escape(_ident) + r"'", out)
+                  _tgt = _ef.group(1) if _ef and os.path.isfile(_ef.group(1)) else _cls_file
+                  _tsrc = read_f(_tgt)
+                  if _named:
+                      _sig = '{super.key, ' + ', '.join('this.' + n for n in _named) + '}'
+                      _fields = '\n'.join('  final dynamic %s;' % n for n in _named)
+                  elif _posc:
+                      _sig = '[' + ', '.join('this.p%d' % i for i in range(min(_posc, 4))) + ']'
+                      _fields = '\n'.join('  final dynamic p%d;' % i for i in range(min(_posc, 4)))
+                  else:
+                      _sig = '{super.key}'
+                      _fields = ''
+                  _stub = ('\n// [DZR dartfix R-STUB] stub kelas ' + _ident + ' (definisi gak ada di project)\n'
+                           'class ' + _ident + ' extends StatelessWidget {\n'
+                           '  const ' + _ident + '(' + _sig + ');\n'
+                           + (_fields + '\n' if _fields else '')
+                           + '  @override\n'
+                           '  Widget build(BuildContext context) => const SizedBox.shrink();\n'
+                           '}\n')
+                  if 'package:flutter/widgets.dart' not in _tsrc and 'package:flutter/material.dart' not in _tsrc:
+                      _tsrc = "import 'package:flutter/widgets.dart';\n" + _tsrc
+                  if not _tsrc.endswith('\n'):
+                      _tsrc += '\n'
+                  write_f(_tgt, _tsrc + _stub)
+                  applied.append(_tgt + ': stub kelas ' + _ident + ' extends StatelessWidget dibikin')
+                  _stub_done.add(_key)
+              else:
+                  # (a) stub method di class _cls
+                  _src = read_f(_cls_file)
+                  _bpos = _class_close_pos(_src, _cls)
+                  if _bpos is None:
+                      continue
+                  if _named:
+                      _params = '{' + ', '.join('dynamic ' + n for n in _named) + '}'
+                  elif _posc:
+                      _params = '[' + ', '.join('dynamic p%d' % i for i in range(min(_posc, 4))) + ']'
+                  else:
+                      _params = ''
+                  _stub = ('\n  // [DZR dartfix R-STUB] stub method ' + _ident + ' (definisi gak ada)\n'
+                           '  dynamic ' + _ident + '(' + _params + ') => null;\n')
+                  write_f(_cls_file, _src[:_bpos] + _stub + _src[_bpos:])
+                  applied.append(_cls_file + ': stub method ' + _ident + '() disisipin di class ' + _cls)
+                  _stub_done.add(_key)
+
           if applied:
               print('DART-FIX:', '; '.join(applied))
               with open('/tmp/dartfix_applied', 'w') as f:
@@ -1105,6 +1392,13 @@ jobs:
               new = re.sub(r'\bIcon\(FontAwesomeIcons\.', 'FaIcon(FontAwesomeIcons.', content)
               if new != content: changes.append('P1'); content = new
               if new != content: changes.append('P5'); content = new
+              # v5.8 P6: anotasi tipe FaIconData di kode project → IconData.
+              # FaIconData sekarang subtype IconData (FA-NET v2) tapi IconData
+              # GAK BISA di-assign ke var bertipe FaIconData (run #79:
+              # landing.dart:453 & #80 pasar_online_page.dart:1709 "argument
+              # type 'IconData' can't be assigned to ... 'FaIconData?'").
+              new = re.sub(r'\bFaIconData\b(?!\s*\()', 'IconData', content)
+              if new != content: changes.append('P6'); content = new
               if content != original:
                   with open(filepath, 'w', encoding='utf-8') as f: f.write(content)
                   return True
@@ -1122,78 +1416,110 @@ jobs:
           PC=$(cat /tmp/fa_cnt.txt 2>/dev/null || echo "0")
           if [ "$PC" -gt 0 ] 2>/dev/null; then flutter pub get || true; fi
 
-          # ── 🛡️ v5.7 FA-NET: patch source font_awesome_flutter 11.x di
-          # pub-cache → FaIconData extends IconData (+ getter data => this).
-          # Konstruksi pemakaian yang lolos dari migrasi P1-P5 (variabel
-          # bertipe FaIconData, generic, dsb — run #70: landing.dart:560)
-          # jadi GAK BISA bikin gagal kompil: FaIconData sekarang subtype
-          # IconData. Idempotent, skip kalau format beda. Jaring kedua
-          # buat kasus ini ada di dartfix.py R8 (reaktif).
-          cat > /tmp/fanet.py <<'PYFANET'
+          # ── 🛡️ v5.8 FA-NET v2: 3 langkah INDEPENDEN — GAK ADA
+          # early-return yang nge-skip langkah lain. BUG (run #79/#80/#81):
+          # pub-cache di-restore dari cache run sebelumnya (berisi FA 11
+          # TER-PATCH "extends IconData") → check idempotensi "udah extends"
+          # → sys.exit(0) → SDK final-strip GAK JALAN, padahal SDK Flutter
+          # dipasang FRESH tiap job (IconData 'final' lagi) → "The class
+          # 'IconData' can't be extended outside of its library" di attempt
+          # pertama, 5 percobaan tetap mati.
+          cat > /tmp/fanet2.py <<'PYFANET2'
           import os, re, sys
 
-          p = sys.argv[1] if len(sys.argv) > 1 else ''
-          if not p or not os.path.isfile(p):
-              sys.exit(0)
-          with open(p, encoding='utf-8') as f:
-              src = f.read()
-          if 'class FaIconData extends IconData' in src:
-              print('FA-NET: FaIconData udah extends IconData, skip')
-              sys.exit(0)
-          src2 = src.replace('final class FaIconData {', 'final class FaIconData extends IconData {', 1)
-          # v5.7.2 const-safe: super(0) doang — akses member di initializer
-          # const itu ILEGAL di Dart (getter call bukan potentially-const;
-          # E2E run #75: "Constant evaluation error" di 28 ribu konstanta FA).
-          # Nilai asli tetap keluar: getter lama baca FIELD data (IconData
-          # asli yang di-wrap), bukan this → gak rekursi. matchTextDirection
-          # gak punya getter → nurun dari super(0) = false (FA gak pake).
-          src2 = src2.replace(
-              'const FaIconData(this.data);',
-              'const FaIconData(this.data) : super(0);', 1)
-          if src2 == src or 'class FaIconData extends IconData' not in src2:
-              print('FA-NET: pola source FA 11 gak dikenali, skip')
-              sys.exit(0)
-          with open(p, 'w', encoding='utf-8') as f:
-              f.write(src2)
-          print('FA-NET: FaIconData extends IconData — semua konstruksi pemakaian kompil')
-          # v5.7.3: IconData di Flutter >=3.47 = final class → gak bisa
-          # di-extend dari luar library-nya (E2E run #76: "The class
-          # 'IconData' can't be extended outside of its library because
-          # it's a final class"). Patch 1 baris di SDK runner (ephemeral
-          # per job): buang modifier final — semantik IconData gak berubah
-          # (final = larangan subtyping doang; subclass FaIconData
-          # nyediain semua member via getter override).
-          import subprocess as _sp
-          try:
-              _wf = _sp.check_output(['which', 'flutter']).decode().strip()
-              _fl = _sp.check_output(['readlink', '-f', _wf]).decode().strip()
-              _sdk = os.path.dirname(os.path.dirname(_fl))
-              _ip = os.path.join(_sdk, 'packages', 'flutter', 'lib', 'src', 'widgets', 'icon_data.dart')
-              if os.path.isfile(_ip):
-                  with open(_ip, encoding='utf-8') as f:
-                      _isrc = f.read()
-                  if 'final class IconData' in _isrc:
-                      _isrc2 = _isrc.replace('final class IconData', 'class IconData', 1)
-                      with open(_ip, 'w', encoding='utf-8') as f:
-                          f.write(_isrc2)
-                      print('FA-NET SDK: modifier final IconData dibuang → FaIconData extends legal (' + _sdk + ')')
+          def sdk_strip():
+              # (1) Flutter SDK: buang modifier 'final' dari class IconData
+              # (SDK ephemeral per job — dicek di SEMUA kasus FA, idempotent:
+              # cuma nyentuh kalau masih 'final class IconData').
+              try:
+                  import subprocess as _sp
+                  _sdk = os.environ.get('FLUTTER_ROOT', '')
+                  if not _sdk:
+                      _wf = _sp.check_output(['which', 'flutter']).decode().strip()
+                      _fl = _sp.check_output(['readlink', '-f', _wf]).decode().strip()
+                      _sdk = os.path.dirname(os.path.dirname(_fl))
+                  _ip = os.path.join(_sdk, 'packages', 'flutter', 'lib', 'src', 'widgets', 'icon_data.dart')
+                  if os.path.isfile(_ip):
+                      with open(_ip, encoding='utf-8') as f:
+                          _isrc = f.read()
+                      if 'final class IconData' in _isrc:
+                          _isrc2 = _isrc.replace('final class IconData', 'class IconData', 1)
+                          with open(_ip, 'w', encoding='utf-8') as f:
+                              f.write(_isrc2)
+                          print('FA-NET SDK: modifier final IconData dibuang → FaIconData extends legal (' + _sdk + ')')
+                      else:
+                          print('FA-NET SDK: IconData udah gak final, skip')
                   else:
-                      print('FA-NET SDK: IconData udah gak final, skip')
+                      print('FA-NET SDK: icon_data.dart SDK gak ketemu, skip')
+              except Exception as _e:
+                  print('FA-NET SDK: skip (' + repr(_e)[:80] + ')')
+
+          def patch_fa_pkg(p):
+              # (2) FA package: FaIconData extends IconData (+ super(0)
+              # const-safe) — idempotent; skip kalau cache udah ter-patch.
+              if not p or not os.path.isfile(p):
+                  print('FA-NET: icon_data.dart gak ada, skip')
+                  return
+              with open(p, encoding='utf-8') as f:
+                  src = f.read()
+              if 'class FaIconData extends IconData' in src:
+                  print('FA-NET: FaIconData udah extends IconData, skip')
+                  return
+              src2 = src.replace('final class FaIconData {', 'final class FaIconData extends IconData {', 1)
+              src2 = src2.replace('const FaIconData(this.data);', 'const FaIconData(this.data) : super(0);', 1)
+              if src2 == src or 'class FaIconData extends IconData' not in src2:
+                  print('FA-NET: pola source FA 11 gak dikenali, skip')
+                  return
+              with open(p, 'w', encoding='utf-8') as f:
+                  f.write(src2)
+              print('FA-NET: FaIconData extends IconData — konstanta FA valid buat param IconData?')
+
+          def widen_faicon(fa_root):
+              # (3) FaIcon nerima IconData? apa adanya (run #79:
+              # FaIcon(c.icon) dengan c.icon = IconData biasa mati
+              # "argument type 'IconData' can't be assigned to the parameter
+              # type 'FaIconData?'"). fa_icon.dart: field _icon + ctor param
+              # + getter override + local var di build().
+              if not fa_root or not os.path.isdir(fa_root):
+                  return
+              p = os.path.join(fa_root, 'lib', 'src', 'fa_icon.dart')
+              if not os.path.isfile(p):
+                  return
+              with open(p, encoding='utf-8') as f:
+                  src = f.read()
+              if 'FaIconData?' not in src:
+                  print('FA-NET WIDEN: FaIcon udah nerima IconData, skip')
+                  return
+              src2 = src.replace('final FaIconData? _icon;', 'final IconData? _icon;', 1)
+              src2 = re.sub(r'const FaIcon\(\s*FaIconData\? icon, \{', 'const FaIcon(\n    IconData? icon, {', src2, count=1)
+              src2 = src2.replace('IconData? get icon => _icon?.data;', 'IconData? get icon => _icon;', 1)
+              src2 = src2.replace('final IconData? icon = _icon?.data;', 'final IconData? icon = _icon;', 1)
+              if src2 != src:
+                  with open(p, 'w', encoding='utf-8') as f:
+                      f.write(src2)
+                  print('FA-NET WIDEN: FaIcon(param IconData?) — IconData & FaIconData dua-duanya diterima')
               else:
-                  print('FA-NET SDK: icon_data.dart SDK gak ketemu, skip')
-          except Exception as _e:
-              print('FA-NET SDK: skip (' + repr(_e)[:80] + ')')
-          PYFANET
+                  print('FA-NET WIDEN: pola fa_icon.dart gak dikenali, skip')
+
+          sdk_strip()
+          _p = sys.argv[1] if len(sys.argv) > 1 else ''
+          _fa_root = ''
+          if _p and os.path.isfile(_p):
+              # .../font_awesome_flutter-11.x.y/lib/src/icon_data.dart → root paket
+              _fa_root = os.path.dirname(os.path.dirname(os.path.dirname(_p)))
+              patch_fa_pkg(_p)
+          widen_faicon(_fa_root)
+          PYFANET2
           FAICON_FILE=""
           for CACHEDIR in "${PUB_CACHE:-$HOME/.pub-cache}" "$HOME/.pub-cache" "$HOME/.pub-cache/hosted/pub.dev"; do
             FAICON_FILE=$(find "$CACHEDIR" -maxdepth 8 -path '*font_awesome_flutter-11*' -name 'icon_data.dart' 2>/dev/null | head -1)
             [ -n "$FAICON_FILE" ] && break
           done
           if [ -n "$FAICON_FILE" ]; then
-            echo "── v5.7 FA-NET: $FAICON_FILE ──"
-            python3 /tmp/fanet.py "$FAICON_FILE" || true
+            echo "── v5.8 FA-NET v2: $FAICON_FILE ──"
+            python3 /tmp/fanet2.py "$FAICON_FILE" || true
           else
-            echo "FA-NET: icon_data.dart FA 11 gak ketemu di pub-cache, skip"
+            echo "FA-NET v2: icon_data.dart FA 11 gak ketemu di pub-cache, skip"
           fi
 
       # ── 🩺 v3.8.0: DOKTER ICON — input icon_url yang sejak awal nganggur
