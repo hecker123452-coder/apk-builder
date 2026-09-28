@@ -292,6 +292,18 @@ jobs:
           for pkg, ver in re.findall(r'which depends on ([a-z0-9_]+) \^(\d+\.\d+\.\d+)', err):
               bump(pkg, ver)
 
+          # v5.7.1: "which doesn't match any versions" — dep dipin ke versi
+          # yang GAK ADA di pub.dev (khas pubspec generatoran/AI ngarang
+          # versi, kena sendiri di E2E run #74) → relax ke any, solver pub
+          # yang milih versi beneran ada & kompatibel.
+          for pkg in dict.fromkeys(re.findall(r"depends on ([a-z0-9_]+) [^\s]+ which doesn't match any versions", err)):
+              relax(pkg)
+          # v5.7.1: saran resmi pub ("Consider downgrading/upgrading your
+          # constraint on X: flutter pub add X:^9.0.1") → constraint pasti
+          # jalan, dipake langsung.
+          for pkg, ver in re.findall(r"Consider (?:downgrading|upgrading) your constraint on ([a-z0-9_]+): flutter pub add \1:([^\s,]+)", err):
+              rewrite(pkg, ver, 'ikut saran pub')
+
           clauses = []
           for m in re.finditer(r'([a-z0-9_]+)((?:\s+[\^><=~]{0,2}[\d.]+)(?:\s*[<>]=?\s*[\d.]+)?)?(?:\s+from\s+git)?\s+(?:which\s+)?(?:depends on|requires)\s+([a-z0-9_]+)\s+([\^><=~]{0,2}[\d.]+(?:\s*[<>]=?\s*[\d.]+)?)', err):
               clauses.append((m.group(1), m.group(2) or '', m.group(3), m.group(4)))
