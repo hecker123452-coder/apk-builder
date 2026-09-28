@@ -1141,7 +1141,10 @@ jobs:
               try:
                   _r = _sp3.run(['dart', 'analyze', '--no-pub', path], capture_output=True, text=True, timeout=240)
                   _txt = (_r.stdout or '') + (_r.stderr or '')
-                  return len(re.findall(r"(?:Can't find (?:'|\")|\bExpected\s+';')", _txt))
+                  # wording CFE ("Can't find ')' to match '('", "Expected ';'
+                  # after this") vs wording ANALYZER dart ("Expected to find
+                  # ')'", "Expected to find ';'") — dua-duanya dihitung.
+                  return len(re.findall(r"(?:Can't find (?:'|\")|Expected to find '[^']+'|\bExpected\s+';')", _txt))
               except Exception:
                   return -1
 
