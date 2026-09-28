@@ -1094,40 +1094,16 @@ jobs:
                   content = f.read()
               original = content
               changes = []
-              # v5.7: lindungi deklarasi bertipe FaIconData — konstanta FA
-              # di RHS-nya GAK boleh dapet .data (arah inverted: tipenya
-              # memang FaIconData; dgn FA-NET FaIconData extends IconData
-              # tetap kompil apa adanya)
-              content = re.sub(r'(?:List<\s*)?FaIconData(?:\?)?\s+\w+\s*=\s*[^;]*;',
-                               lambda mm: mm.group(0).replace('FontAwesomeIcons.', PH), content)
+              # v5.7.4: migrasi FA11 dipesarkin — mekanisme .data (P2/P3) &
+              # const-strip (P4) DIHAPUS karena FA-NET bikin FaIconData
+              # extends IconData (subtype) → konstanta FA LANGSUNG valid
+              # buat semua param IconData? TANPA .data. Bonus: konteks const
+              # gak rusak lagi (P4 suka nyamber const constructor dalam
+              # radius 10 baris — E2E run #77: const OtaxApp({super.key})
+              # ke-strip → "Cannot invoke a non-'const' constructor").
+              # Net gagal terpasang → DART-FIX R8 yang nyembuhin reaktif.
               new = re.sub(r'\bIcon\(FontAwesomeIcons\.', 'FaIcon(FontAwesomeIcons.', content)
               if new != content: changes.append('P1'); content = new
-              new = re.sub(r'find\.byIcon\(FontAwesomeIcons\.(\w+)\)', r'find.byIcon(FontAwesomeIcons.\1.data)', content)
-              if new != content: changes.append('P2'); content = new
-              before = content
-              content = re.sub(r'(FaIcon\(\s*)FontAwesomeIcons\.(\w+)', rf'\1{PH}\2', content)
-              content = re.sub(r'FontAwesomeIcons\.(\w+)\.data', rf'{PH}\1.data', content)
-              content = re.sub(r'FontAwesomeIcons\.(\w+)', r'FontAwesomeIcons.\1.data', content)
-              content = content.replace(PH, 'FontAwesomeIcons.')
-              if content != before: changes.append('P3')
-              if 'FontAwesomeIcons.' in content:
-                  lines = content.split('\n')
-                  fa_data_lines = set()
-                  for i, line in enumerate(lines):
-                      if re.search(r'FontAwesomeIcons\.\w+\.data', line): fa_data_lines.add(i)
-                  if fa_data_lines:
-                      const_removals = set()
-                      for fa_line in fa_data_lines:
-                          for back in range(min(fa_line + 1, 10)):
-                              check = fa_line - back
-                              if check >= 0 and check not in const_removals:
-                                  if re.search(r'\bconst\b', lines[check]):
-                                      const_removals.add(check); break
-                      for idx in sorted(const_removals, reverse=True):
-                          lines[idx] = re.sub(r'\bconst\s+', '', lines[idx], count=1)
-                          changes.append(f'P4:{idx+1}')
-                      content = '\n'.join(lines)
-              new = re.sub(r'\bFaIcon\((?!FontAwesomeIcons\.)', 'Icon(', content)
               if new != content: changes.append('P5'); content = new
               if content != original:
                   with open(filepath, 'w', encoding='utf-8') as f: f.write(content)
