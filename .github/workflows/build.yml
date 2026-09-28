@@ -1165,19 +1165,15 @@ jobs:
               print('FA-NET: FaIconData udah extends IconData, skip')
               sys.exit(0)
           src2 = src.replace('final class FaIconData {', 'final class FaIconData extends IconData {', 1)
+          # v5.7.2 const-safe: super(0) doang — akses member di initializer
+          # const itu ILEGAL di Dart (getter call bukan potentially-const;
+          # E2E run #75: "Constant evaluation error" di 28 ribu konstanta FA).
+          # Nilai asli tetap keluar: getter lama baca FIELD data (IconData
+          # asli yang di-wrap), bukan this → gak rekursi. matchTextDirection
+          # gak punya getter → nurun dari super(0) = false (FA gak pake).
           src2 = src2.replace(
               'const FaIconData(this.data);',
-              'const FaIconData(IconData data)\n'
-              '      : super(data.codePoint,\n'
-              '            fontFamily: data.fontFamily,\n'
-              '            fontPackage: data.fontPackage,\n'
-              '            matchTextDirection: data.matchTextDirection);\n\n'
-              '  IconData get data => this;', 1)
-          # getter lama nge-delegate ke data (= this) → bakal rekursi setelah
-          # extends → arahin ke super
-          src2 = src2.replace('=> data.codePoint;', '=> super.codePoint;')
-          src2 = src2.replace('=> data.fontFamily;', '=> super.fontFamily;')
-          src2 = src2.replace('=> data.fontPackage;', '=> super.fontPackage;')
+              'const FaIconData(this.data) : super(0);', 1)
           if src2 == src or 'class FaIconData extends IconData' not in src2:
               print('FA-NET: pola source FA 11 gak dikenali, skip')
               sys.exit(0)
