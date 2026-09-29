@@ -1127,24 +1127,24 @@ jobs:
                       write_f(f, _s2)
                       applied.append(f + ': anotasi FaIconData → IconData (R10)')
 
-          # ── 🔧 v5.8 R-SYN: kurung gak balans — kode generatoran kepotong
-          # di tengah widget tree → CFE "Can't find ')' to match '('" +
-          # cascade "Expected ';'" + "missing implementations State.build"
-          # (run #81 dashboard_page.dart _buildAccountInfo, 5 percobaan mati).
-          # Repair: delimiter yang gak ke-tutup di-collect dari error, closer
-          # di-append di EOF urut innermost→outermost; separator dari konteks
-          # baris pembuka (return/await/assignment → ';', lainnya ',').
-          # FAIL-SAFE: dart analyze sebelum vs sesudah — makin parah → revert.
+          # ── 🔧 v5.8.3 R-SYN: kurung gak balans — kode generatoran
+          # kepotong di tengah widget tree → CFE "Can't find ')' to match
+          # '('" + cascade "Expected ';'" + "missing implementations
+          # State.build" (run #81 dashboard_page.dart _buildAccountInfo).
+          # v5.8.1/2 baca konteks baris pembuka pakai NOMOR BARIS CFE —
+          # RUNTUG: R-FPI nambahin import sebelum R-SYN → baris geser →
+          # separator ketuker → repair selalu revert (run #83: 0→0, run
+          # #85: 4→4). v5.8.3: stack kurung dihitung LANGSUNG dari file
+          # aktual (lexer mini, string + comment aware) — nomor baris CFE
+          # cuma buat trigger. Separator dari baris pembuka di file AKTIF
+          # (return/await/assignment → ';', lainnya ','). Tetap FAIL-SAFE:
+          # dart format --output=none before/after — gak jadi parse-able →
+          # revert.
           import subprocess as _sp3
 
           def _syn_count(path):
-              # v5.8.2: dart analyze <file> di runner ternyata gak reliable
-              # (run #84: output gak nyebut file → metric 0→0 → repair
-              # selalu revert). Ganti ke dart format --output=none: file
-              # PARSE-able = exit 0 (GAK nulis apa-apa), syntax error =
-              # non-zero + output nyebut file:baris:kolom. Metric: 0 = parse
-              # OK, else jumlah baris yang nyebut file (>=1). Repair bener =
-              # file jadi parseable → after 0 < base → keep.
+              # 0 = file parse-able (exit 0, gak nulis apa-apa); else jumlah
+              # baris output yang nyebut file (>= 1).
               try:
                   _r = _sp3.run(['dart', 'format', '--output=none', path], capture_output=True, text=True, timeout=180)
                   if _r.returncode == 0:
@@ -1158,27 +1158,76 @@ jobs:
               except Exception:
                   return -1
 
-          _syn = re.findall(r"((?:lib|test)/[\w./-]+\.dart):(\d+):\d+: Error: Can't find '([)\]}])' to match '([({[])'\.", out)
-          if _syn:
-              _byfile = {}
-              for _f, _ln, _cl, _op in _syn:
-                  _byfile.setdefault(_f, []).append((int(_ln), _op, _cl))
-              for _f, _plist in _byfile.items():
+          def _unclosed_stack(src):
+              # lexer mini Dart: skip string ('..' / ".." + escape), comment
+              # // dan /* */ → stack delimiter yang gak ke-tutup (char,
+              # no_baris). Interpolation ${...} diperlakukan string biasa —
+              # kalau salah hitung, validasi dart format yang nolong.
+              _stk = []
+              _st = None
+              _esc = _lc = _bc = False
+              _prev = ''
+              _ln = 1
+              for _ch in src:
+                  if _ch == '\n':
+                      _ln += 1
+                      _lc = False
+                  if _lc:
+                      _prev = _ch
+                      continue
+                  if _bc:
+                      if _prev == '*' and _ch == '/':
+                          _bc = False
+                      _prev = _ch
+                      continue
+                  if _st:
+                      if _esc:
+                          _esc = False
+                      elif _ch == '\\':
+                          _esc = True
+                      elif _ch == _st:
+                          _st = None
+                      _prev = _ch
+                      continue
+                  if _ch == '/' and _prev == '/':
+                      _lc = True
+                      _prev = _ch
+                      continue
+                  if _ch == '*' and _prev == '/':
+                      _bc = True
+                      _prev = _ch
+                      continue
+                  if _ch in ('\'', '"'):
+                      _st = _ch
+                  elif _ch in '([{':
+                      _stk.append((_ch, _ln))
+                  elif _ch in ')]}':
+                      if _stk and _stk[-1][0] == {')': '(', ']': '[', '}': '{'}[_ch]:
+                          _stk.pop()
+                  _prev = _ch
+              return _stk
+
+          _syn_trig = dict.fromkeys(re.findall(r"((?:lib|test)/[\w./-]+\.dart):\d+:\d+: Error: (?:Can't find|Expected ';')", out))
+          if _syn_trig:
+              _stmt = re.compile(r'^\s*(?:return\b|await\b|[\w<>,?\[\] ]+\s+\w+\s*=\s*|\w+\s*=\s*)')
+              _closer = {'(': ')', '[': ']', '{': '}'}
+              for _f in _syn_trig:
                   if not os.path.isfile(_f):
                       continue
                   _src = read_f(_f)
+                  _stk = _unclosed_stack(_src)
+                  if not _stk:
+                      continue
                   _lines = _src.split('\n')
-                  _stmt = re.compile(r'^\s*(?:return\b|await\b|[\w<>,?\[\] ]+\s+\w+\s*=\s*|\w+\s*=\s*)')
                   _tail = []
-                  _plist = sorted(set(_plist), key=lambda t: -t[0])
-                  for _ln, _op, _cl in _plist:
+                  for _op, _ln in reversed(_stk):
                       _oline = _lines[_ln - 1] if 0 < _ln <= len(_lines) else ''
                       if _op in '([' and _stmt.match(_oline):
-                          _tail.append(_cl + ';')
+                          _tail.append(_closer[_op] + ';')
                       elif _op in '([':
-                          _tail.append(_cl + ',')
+                          _tail.append(_closer[_op] + ',')
                       else:
-                          _tail.append(_cl)
+                          _tail.append(_closer[_op])
                   _base = _syn_count(_f)
                   if _base < 0:
                       continue
@@ -1192,7 +1241,7 @@ jobs:
                       write_f(_f, _src)
                       print('R-SYN: ' + _f + ' repair GAGAL validasi (' + str(_base) + '→' + str(_after) + '), di-revert')
                   else:
-                      applied.append(_f + ': kurung penutup di-append di EOF (' + str(len(_plist)) + ' delimiter, syntax error ' + str(_base) + '→' + str(_after) + ')')
+                      applied.append(_f + ': kurung penutup di-append di EOF (' + str(len(_tail)) + ' delimiter, parse error ' + str(_base) + '→' + str(_after) + ')')
 
           # ── 🧩 v5.8 R-STUB: method/kelas GAK PERNAH didefinisi (kode
           # generatoran kepotong) — run #81: NewsMedia(url: ...) &
