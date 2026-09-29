@@ -1302,30 +1302,17 @@ jobs:
                   return _pci_cache[cls]
               _out = None
               for _pkg, _uri in (deps or {}).items():
-                  # v5.8.4: MAIN LIB dulu — kelas publik (mis. AndroidOptions)
-                  # pasti di-export sama main lib, dan URI-nya PASTI valid
-                  # (run #86: import path internal hasil walk gak resolve
-                  # di versi package lain → "Can't import").
-                  if _pkg != _PROJ_NAME and _pkg in _DIRECT_DEPS:
-                      _r3 = (_uri or '').replace('file://', '')
-                      if not os.path.isabs(_r3):
-                          _r3 = os.path.normpath(os.path.join('.dart_tool', _r3))
-                      _main = os.path.join(_r3, 'lib', _pkg + '.dart')
-                      if os.path.isfile(_main):
-                          _out = 'package:' + _pkg + '/' + _pkg + '.dart'
-                          break
                   if _pkg == _PROJ_NAME:
                       continue
                   if _DIRECT_DEPS and _pkg not in _DIRECT_DEPS:
                       continue
                   _r = (_uri or '').replace('file://', '')
-                  if not _r:
-                      continue
                   if not os.path.isabs(_r):
                       _r = os.path.normpath(os.path.join('.dart_tool', _r))
                   _lib = os.path.join(_r, 'lib')
                   if not os.path.isdir(_lib):
                       continue
+                  _found = None
                   try:
                       for _root, _dirs, _fs in os.walk(_lib):
                           for _fn in _fs:
@@ -1335,15 +1322,24 @@ jobs:
                               try:
                                   with open(_p, encoding='utf-8') as _fh:
                                       if re.search(r'\bclass\s+' + re.escape(cls) + r'\b', _fh.read()):
-                                          _out = 'package:' + _pkg + '/' + os.path.relpath(_p, _lib).replace(os.sep, '/')
+                                          _found = _p
                                           break
                               except Exception:
                                   pass
-                          if _out:
+                          if _found:
                               break
                   except Exception:
                       pass
-                  if _out:
+                  if _found:
+                      # v5.8.5: kelas WAJIB ketemu di walk dulu (verifikasi),
+                      # baru balikin URI MAIN LIB (API publik — run #86: path
+                      # internal gak resolve di versi lain). Tanpa verifikasi
+                      # → bogus import buat kelas yang gak ada + R-STUB ke-
+                      # skip (run #87). Fallback: path internal hasil walk.
+                      _main = os.path.join(_lib, _pkg + '.dart')
+                      _out = ('package:' + _pkg + '/' + _pkg + '.dart'
+                              if os.path.isfile(_main)
+                              else 'package:' + _pkg + '/' + os.path.relpath(_found, _lib).replace(os.sep, '/'))
                       break
               _pci_cache[cls] = _out
               return _out
