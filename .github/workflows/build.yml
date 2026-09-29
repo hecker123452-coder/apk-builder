@@ -1127,6 +1127,26 @@ jobs:
                       write_f(f, _s2)
                       applied.append(f + ': anotasi FaIconData → IconData (R10)')
 
+          # ── 🧹 v5.8.4 R-BRI: import rusak dibuang — "Can't import
+          # '<path>'" / "Not found: 'package:...'" (self-inflicted siklus
+          # sebelumnya atau generatoran) → baris import-nya dihapus biar
+          # siklus berikutnya nyoba jalur yang bener (main lib).
+          for _b2 in dict.fromkeys(re.findall(r"((?:lib|test)/[\w./-]+\.dart):\d+:\d+: Error: Can't import '([^']+)'", out) + re.findall(r"((?:lib|test)/[\w./-]+\.dart):\d+:\d+: Error: Not found: '([^']+)'", out)):
+              _f2, _bad = _b2
+              if not os.path.isfile(_f2):
+                  continue
+              _s2 = read_f(_f2)
+              _cands = {_bad}
+              _mp = re.search(r'pub\.dev/([a-z0-9_]+)-\d[^/]*/(?:lib/)?(.+)$', _bad)
+              if _mp:
+                  _cands.add('package:' + _mp.group(1) + '/' + _mp.group(2))
+              _s3 = _s2
+              for _u in _cands:
+                  _s3 = re.sub(r'(?m)^import\s+[\'"]' + re.escape(_u) + r'[\'"]\s*;\s*\n', '', _s3)
+              if _s3 != _s2:
+                  write_f(_f2, _s3)
+                  applied.append(_f2 + ': import rusak dibuang (' + _bad[:70] + ') — R-BRI')
+
           # ── 🔧 v5.8.3 R-SYN: kurung gak balans — kode generatoran
           # kepotong di tengah widget tree → CFE "Can't find ')' to match
           # '('" + cascade "Expected ';'" + "missing implementations
@@ -1282,6 +1302,18 @@ jobs:
                   return _pci_cache[cls]
               _out = None
               for _pkg, _uri in (deps or {}).items():
+                  # v5.8.4: MAIN LIB dulu — kelas publik (mis. AndroidOptions)
+                  # pasti di-export sama main lib, dan URI-nya PASTI valid
+                  # (run #86: import path internal hasil walk gak resolve
+                  # di versi package lain → "Can't import").
+                  if _pkg != _PROJ_NAME and _pkg in _DIRECT_DEPS:
+                      _r3 = (_uri or '').replace('file://', '')
+                      if not os.path.isabs(_r3):
+                          _r3 = os.path.normpath(os.path.join('.dart_tool', _r3))
+                      _main = os.path.join(_r3, 'lib', _pkg + '.dart')
+                      if os.path.isfile(_main):
+                          _out = 'package:' + _pkg + '/' + _pkg + '.dart'
+                          break
                   if _pkg == _PROJ_NAME:
                       continue
                   if _DIRECT_DEPS and _pkg not in _DIRECT_DEPS:
