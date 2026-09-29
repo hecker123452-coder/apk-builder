@@ -616,6 +616,23 @@ jobs:
                               f.write(g2)
                           applied.append('compileSdk ' + mod + ' -> ' + tgt)
 
+          # ── v5.8.5: "cannot find symbol: class <XyzPlugin>" di
+          # GeneratedPluginRegistrant = plugin artifacts gak sinkron abis
+          # dependency_overrides ganti versi plugin (run #88: pub get #1
+          # resolve file_picker 13.1.0 → R6 override 11.0.3 → registrant &
+          # settings gak regenerate total). Fix standar: flutter clean +
+          # pub get → regenerasi penuh. Sekali per build (gate marker),
+          # non-fatal.
+          if re.search(r'GeneratedPluginRegistrant\.java:\d+: error: cannot find symbol', err) and not os.path.exists('/tmp/bldfix_clean_done'):
+              import subprocess as _sp
+              try:
+                  _sp.run(['flutter', 'clean'], capture_output=True, text=True, timeout=240)
+                  _sp.run(['flutter', 'pub', 'get'], capture_output=True, text=True, timeout=420)
+                  applied.append('flutter clean + pub get (registrant basi abis override versi plugin)')
+                  open('/tmp/bldfix_clean_done', 'w').write('ok')
+              except Exception as _e:
+                  print('flutter clean skip (' + repr(_e)[:80] + ')')
+
           if applied:
               print('AUTO-FIX toolchain:', '; '.join(applied))
               with open('/tmp/bldfix_applied', 'w') as f:
