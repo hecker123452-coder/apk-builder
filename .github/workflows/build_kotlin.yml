@@ -63,6 +63,14 @@ on:
         description: '🛡️ v4.3 Benteng Lisensi (anti-repack): "on" = pasang LicenseGuard (cek signature asli runtime). Kosong = off.'
         required: false
         default: ''
+      enc_key:
+        description: '🔒 v4.11 CRYPT VAULT: kunci enkripsi hasil build (password openssl). Kosong = plain (mode lama).'
+        required: false
+        default: ''
+      perms:
+        description: '🔐 v4.11 Perizinan: daftar izin Android dipisah koma (mis. CAMERA,RECORD_AUDIO). Kosong = tanpa tambahan.'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -86,6 +94,8 @@ jobs:
       INPUT_BUILD_TYPE: ${{ inputs.build_type }}
       INPUT_BUILD_FORMAT: ${{ inputs.build_format }}
       INPUT_KEYSTORE_ID: ${{ inputs.keystore_id }}
+      ENC_KEY: ${{ inputs.enc_key }}
+      INPUT_PERMS: ${{ inputs.perms }}
 
     steps:
       # ── ⚠️ SESUAI PROMPT: GAK ADA step install Flutter di workflow ini ──
@@ -653,6 +663,42 @@ jobs:
       # → kfix.py analisa errornya → patch toolchain/project → retry. Gak ada
       # fix yang cocok? berhenti terang-terangan (bot kirim log ke owner).
       # ── 🛡️ v4.3 BENTENG LISENSI — tulis helper guard (murah, selalu jalan) ──
+      # ── 🔐 v4.11: PERIZINAN PILIHAN USER (inject uses-permission, fail-loud) ──
+      - name: Perizinan pilihan user (inject manifest)
+        run: |
+          if [ -z "$INPUT_PERMS" ]; then
+            echo "🔐 INPUT_PERMS kosong — skip (pola lama)"
+            exit 0
+          fi
+          TOTAL_NINS=0
+          for MANIFEST in $(find . -path "*/src/main/AndroidManifest.xml" 2>/dev/null); do
+            [ -f "$MANIFEST" ] || continue
+            PERM_BEFORE=$(grep -o 'uses-permission' "$MANIFEST" | wc -l)
+            PERM_INJECT=""
+            PERM_NINS=0
+            IFS=',' read -r -a PERM_ARR <<< "$INPUT_PERMS"
+            for RP in "${PERM_ARR[@]}"; do
+              RP=$(printf '%s' "$RP" | tr -cd 'a-zA-Z0-9._')
+              [ -z "$RP" ] && continue
+              case "$RP" in android.permission.*) : ;; *) RP="android.permission.$RP" ;; esac
+              if ! grep -q "android:name=\"$RP\"" "$MANIFEST"; then
+                PERM_INJECT="$PERM_INJECT    <uses-permission android:name=\"$RP\" />\\n"
+                PERM_NINS=$((PERM_NINS+1))
+              fi
+            done
+            if [ -n "$PERM_INJECT" ]; then
+              sed -i "s|<application|$PERM_INJECT<application|" "$MANIFEST"
+              PERM_AFTER=$(grep -o 'uses-permission' "$MANIFEST" | wc -l)
+              if [ "$PERM_AFTER" -lt $((PERM_BEFORE + PERM_NINS)) ]; then
+                echo "=== BUILD FAILED: inject perizinan gagal di $MANIFEST (anchor <application gak match) ==="
+                exit 1
+              fi
+              TOTAL_NINS=$((TOTAL_NINS+PERM_NINS))
+              echo "🔐 $MANIFEST: +$PERM_NINS izin"
+            fi
+          done
+          echo "🔐 [v4.11] Perizinan selesai — total ke-inject: $TOTAL_NINS"
+
       - name: Write License Guard helper
         run: |
           cat > /tmp/dzr_license_guard.py <<'DZRGUARD'
@@ -1101,7 +1147,7 @@ jobs:
       # Sign: zipalign -p 4 + apksigner (build-tools terbaru di ANDROID_HOME).
       # MURNI Android-generic — gak ada sangkut paut Flutter.
       - name: Stable signing (Kotlin native)
-        if: inputs.build_format == 'apk' || inputs.build_format == 'both'
+        if: inputs.build_format == 'apk' || inputs.build_format == 'aab' || inputs.build_format == 'both'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -1209,6 +1255,28 @@ jobs:
             echo "WARNING: keystore/build-tools gak siap (skip re-sign, non-fatal)"
           fi
 
+          # ── 🔏 v4.11: sign AAB juga (Play nolak bundle unsigned) ──
+          AAB="$(ls -t aab_out/*.aab 2>/dev/null | head -1)"
+          if [ -n "$AAB" ] && [ -s "$KS" ]; then
+            BND_SIGNER="$(ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/*/bundlesigner 2>/dev/null | sort -V | tail -1)"
+            if [ -n "$BND_SIGNER" ] && [ -x "$BND_SIGNER" ]; then
+              if "$BND_SIGNER" sign --ks "$KS" --ks-key-alias dzr --ks-pass "pass:$KS_USE_PASS" --out "${AAB%.aab}.signed.aab" "$AAB"; then
+                mv "${AAB%.aab}.signed.aab" "$AAB"
+                echo "🔏 AAB ke-sign (bundlesigner)"
+              else
+                echo "WARNING: bundlesigner gagal (non-fatal)"
+              fi
+            elif command -v jarsigner >/dev/null 2>&1; then
+              if jarsigner -keystore "$KS" -storepass "$KS_USE_PASS" "$AAB" dzr >/dev/null 2>&1; then
+                echo "🔏 AAB ke-sign (jarsigner)"
+              else
+                echo "WARNING: jarsigner AAB gagal (non-fatal)"
+              fi
+            else
+              echo "WARNING: bundlesigner/jarsigner gak ada — AAB gak ke-sign"
+            fi
+          fi
+
       # ── 🤖 v3.3: KANAL OTA KOTLIN (paritas dgn Web2APK) ──
       # Release apk-<pkg>: app.apk rolling + APK ber-versi + build-info.json
       # + delta patch bsdiff (worth-it < 75%) + guard anti-race (CUR_VC).
@@ -1242,6 +1310,22 @@ jobs:
           cp "$APK" /tmp/app.apk
           cp "$APK" "/tmp/app-3.0.$RUN_NO.apk"
           APK_SHA="$(sha256sum /tmp/app.apk | cut -d' ' -f1)"
+          # ── 🔒 v4.11 CRYPT VAULT: enkripsi APK sebelum nyentuh release publik.
+          # Gagal enkripsi = FAIL LOUD (plain GAK BOLEH ke-upload ke repo publik).
+          ENC_MODE=""
+          ENC_JSON=""
+          if [ -n "$ENC_KEY" ]; then
+            echo "::add-mask::$ENC_KEY"
+            if openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -k "$ENC_KEY" -in /tmp/app.apk -out /tmp/app.apk.enc; then
+              ENC_MODE="enc"
+              ENC_SHA_ENC="$(sha256sum /tmp/app.apk.enc | cut -d' ' -f1)"
+              ENC_JSON=",\"enc\":true,\"enc_alg\":\"AES-256-CBC/PBKDF2-100k\",\"enc_sha256\":\"$ENC_SHA_ENC\""
+              echo "🔒 [CRYPT VAULT] app.apk → app.apk.enc OK ($(du -h /tmp/app.apk.enc | cut -f1))"
+            else
+              echo "=== BUILD FAILED: enkripsi CRYPT VAULT gagal — plain gak boleh ke-upload ==="
+              exit 1
+            fi
+          fi
           APK_SIZE=$(stat -c%s /tmp/app.apk)
 
           # ── 🚀 delta patch (pola identik Web2APK: bsdiff → bingkai DZRDELTA) ──
@@ -1258,7 +1342,7 @@ jobs:
             if [ -s /tmp/old.apk ]; then
               OLD_VC="$($BTD/aapt dump badging /tmp/old.apk 2>/dev/null | head -1 | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p")"
             fi
-            if [ -s /tmp/old.apk ] && [ -n "$OLD_VC" ] && [ "$OLD_VC" -gt 0 ] && [ "$OLD_VC" -lt "$RUN_NO" ] 2>/dev/null; then
+            if [ -s /tmp/old.apk ] && [ -n "$OLD_VC" ] && [ "$OLD_VC" -gt 0 ] && [ "$OLD_VC" -lt "$RUN_NO" ] 2>/dev/null && [ -z "$ENC_MODE" ]; then
               echo "🔀 Bikin delta patch: v$OLD_VC → v$RUN_NO (bsdiff, bisa 1-3 menit)..."
               if bsdiff /tmp/old.apk /tmp/app.apk /tmp/bsdiff.raw; then
                 python3 << 'PYEOF2'
@@ -1292,7 +1376,7 @@ jobs:
             else
               echo "ℹ️ APK lama gak ketemu/gak valid — delta skip (build pertama kanal ini normal)"
             fi
-            if [ -s /tmp/delta.patch ] && [ -s /tmp/delta-info.json ] && [ -n "$OLD_VC" ]; then
+            if [ -s /tmp/delta.patch ] && [ -s /tmp/delta-info.json ] && [ -n "$OLD_VC" ] && [ -z "$ENC_MODE" ]; then
               DELTA_SIZE=$(stat -c%s /tmp/delta.patch)
               if [ "$DELTA_SIZE" -lt $((APK_SIZE * 75 / 100)) ]; then
                 DELTA_SHA=$(python3 -c "import json;print(json.load(open('/tmp/delta-info.json'))['sha256'])")
@@ -1307,8 +1391,8 @@ jobs:
             echo "WARNING: bsdiff gak ke-install — delta skip (non-fatal, update penuh tetap jalan)"
           fi
 
-          printf '{"package":"%s","versionCode":%s,"versionName":"3.0.%s","sha256":"%s","builtAt":"%s","size":%s%s}\n' \
-            "$PKG" "$RUN_NO" "$RUN_NO" "$APK_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$APK_SIZE" "$DELTA_JSON" > /tmp/build-info.json
+          printf '{"package":"%s","versionCode":%s,"versionName":"3.0.%s","sha256":"%s","builtAt":"%s","size":%s%s%s}\n' \
+            "$PKG" "$RUN_NO" "$RUN_NO" "$APK_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$APK_SIZE" "$ENC_JSON" "$DELTA_JSON" > /tmp/build-info.json
           cp /tmp/build-info.json apk_out/build-info.json
           echo "🔧 build-info.json: v3.0.$RUN_NO sha256=$APK_SHA (nyempil di artifact buat bot)"
 
@@ -1320,6 +1404,17 @@ jobs:
             echo "⏭️ Kanal OTA udah di v$CUR_VC (>= run ini $RUN_NO) — build stale/rerun, kanal GAK disentuh"
           fi
           if [ "$OTA_FRESH" = "1" ] && gh release view "apk-$PKG" >/dev/null 2>&1; then
+            if [ -n "$ENC_MODE" ]; then
+              # 🔒 CRYPT VAULT: upload .enc + purge asset plain/delta lama
+              gh release upload "apk-$PKG" /tmp/app.apk.enc --clobber \
+                && echo "🔒 Kanal OTA updated: apk-$PKG → app.apk.enc (TERENKRIPSI)" \
+                || echo "WARNING: gh upload .enc gagal (non-fatal)"
+              gh api "repos/${GH_REPO}/releases/tags/apk-$PKG" --jq '.assets[] | select(.name == "app.apk" or (.name|test("^app-[0-9]+\\.[0-9]+\\.[0-9]+\\.apk$")) or (.name|test("^delta-"))) | [.id,.name] | @tsv' 2>/dev/null | \
+              while IFS=$'\t' read -r vaid vname; do
+                gh api -X DELETE "repos/${GH_REPO}/releases/assets/$vaid" >/dev/null 2>&1 || true
+                echo "🧹 [CRYPT VAULT] asset plain dibuang: $vname"
+              done
+            else
             gh release upload "apk-$PKG" /tmp/app.apk --clobber \
               && echo "🔄 Kanal OTA updated: apk-$PKG → app.apk" \
               || echo "WARNING: gh upload gagal (non-fatal)"
@@ -1330,6 +1425,7 @@ jobs:
               gh release upload "apk-$PKG" /tmp/delta.patch --clobber \
                 && echo "🚀 Delta asset: delta-${OLD_VC}-${RUN_NO}.patch" \
                 || echo "WARNING: upload delta gagal (non-fatal)"
+            fi
             fi
             gh release upload "apk-$PKG" /tmp/build-info.json --clobber \
               && echo "🔧 build-info.json ter-upload (bot pake ini buat manifest OTA)" \
@@ -1344,12 +1440,43 @@ jobs:
               done
             fi
           elif [ "$OTA_FRESH" = "1" ]; then
-            gh release create "apk-$PKG" /tmp/app.apk "/tmp/app-3.0.$RUN_NO.apk" /tmp/build-info.json \
-              --title "OTA $PKG" --notes "Build terbaru — kanal auto-update (Kotlin native)" \
-              && echo "🔄 Kanal OTA dibuat: apk-$PKG (+ APK ber-versi + build-info)" \
-              || echo "WARNING: gh create gagal (non-fatal)"
+            if [ -n "$ENC_MODE" ]; then
+              gh release create "apk-$PKG" /tmp/app.apk.enc /tmp/build-info.json \
+                --title "OTA $PKG" --notes "Build terbaru — kanal auto-update (terenkripsi CRYPT VAULT)" \
+                && echo "🔒 Kanal OTA dibuat: apk-$PKG (app.apk.enc + build-info)" \
+                || echo "WARNING: gh create gagal (non-fatal)"
+            else
+              gh release create "apk-$PKG" /tmp/app.apk "/tmp/app-3.0.$RUN_NO.apk" /tmp/build-info.json \
+                --title "OTA $PKG" --notes "Build terbaru — kanal auto-update (Kotlin native)" \
+                && echo "🔄 Kanal OTA dibuat: apk-$PKG (+ APK ber-versi + build-info)" \
+                || echo "WARNING: gh create gagal (non-fatal)"
+            fi
           fi
 
+      # ── 🔒 v4.11 CRYPT VAULT — enkripsi artifact (APK/AAB yang nyisa di disk).
+      # Kanal OTA udah ngurus release (upload .enc); step ini nyisa-nyisain
+      # file plain di build dir → dienkripsi in-place (.enc), plain DIHAPUS.
+      - name: Crypt Vault (artifact)
+        env:
+          ENC_KEY: ${{ inputs.enc_key }}
+        run: |
+          if [ -z "$ENC_KEY" ]; then
+            echo "🔓 ENC_KEY kosong — artifact plain (mode lama, backward compat)"
+            exit 0
+          fi
+          echo "::add-mask::$ENC_KEY"
+          ENC_N=0
+          while IFS= read -r -d '' VF; do
+            if openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -k "$ENC_KEY" -in "$VF" -out "${VF}.enc"; then
+              rm -f "$VF"
+              ENC_N=$((ENC_N+1))
+              echo "🔒 $(basename "$VF") → $(basename "$VF").enc"
+            else
+              echo "=== BUILD FAILED: enkripsi artifact gagal buat $VF ==="
+              exit 1
+            fi
+          done < <(find apk_out aab_out -type f \( -name "*.apk" -o -name "*.aab" \) -print0 2>/dev/null)
+          echo "🔒 [CRYPT VAULT] $ENC_N artifact dienkripsi"
       - name: Upload APK
         if: inputs.build_format == 'apk' || inputs.build_format == 'both'
         uses: actions/upload-artifact@v4
@@ -1357,6 +1484,7 @@ jobs:
           name: apk-output
           path: |
             apk_out/*.apk
+            apk_out/*.apk.enc
             apk_out/build-info.json
           retention-days: 7
           if-no-files-found: error
@@ -1367,6 +1495,7 @@ jobs:
         with:
           name: aab-output
           path: aab_out/*.aab
+            aab_out/*.aab.enc
           retention-days: 7
 
       # NOTE: GAK ADA step "Send to Telegram" — bot (index.js) yang handle
