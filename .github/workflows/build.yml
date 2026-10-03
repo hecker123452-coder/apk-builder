@@ -654,7 +654,7 @@ jobs:
               if os.path.isfile(_kts):
                   with open(_kts, encoding='utf-8') as f:
                       _gtxt = f.read()
-                  if 'buildDirectory' not in _gtxt:
+                  if '.layout.buildDirectory.value(' not in _gtxt:
                       _blk = ('\nval newBuildDir: Directory = rootProject.layout.buildDirectory.dir("../../build").get()\n'
                               'rootProject.layout.buildDirectory.value(newBuildDir)\n'
                               'subprojects {\n'
@@ -667,7 +667,7 @@ jobs:
               if os.path.isfile(_gro):
                   with open(_gro, encoding='utf-8') as f:
                       _gtxt = f.read()
-                  if 'rootProject.buildDir' not in _gtxt:
+                  if 'rootProject.buildDir =' not in _gtxt:
                       _blk = ('\nrootProject.buildDir = "../build"\n'
                               'subprojects {\n'
                               '    project.buildDir = "${rootProject.buildDir}/${project.name}"\n'
