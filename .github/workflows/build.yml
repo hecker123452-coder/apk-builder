@@ -716,6 +716,66 @@ jobs:
           # Helpers + Toolchain Check".
           # Isi: dartfix.py (heal error kompilasi Dart, R1-R7) + bump package
           # gak kompatibel Flutter >=3.27 + patch source font_awesome 11.
+          # ── 🩹 v6.9 RES-DUP SHIELD helper — buang resource dobel (nama sama,
+          # ekstensi beda) di folder res. Penyebab klasik "Duplicate resources":
+          # project bawa ic_launcher.png + ic_launcher.jpg sekaligus (eksport
+          # generator icon) → task merge*Resources gradle mati. Idempoten.
+          cat > /tmp/resdedup.py <<'RESDEDUP'
+          #!/usr/bin/env python3
+          # RES-DUP SHIELD - buang resource duplikat (nama sama, ekstensi beda)
+          # di folder res project android. Android cuma boleh SATU file per nama
+          # resource per folder; png + jpg sekaligus = "Duplicate resources".
+          # Prioritas keep: .png > .webp > .jpg > .jpeg > lainnya.
+          # Idempoten: jalan berkali-kali hasilnya sama. Report: RES-DUP_REMOVED=<n>.
+          import os, sys
+
+          PRIO = {'.png': 0, '.webp': 1, '.jpg': 2, '.jpeg': 3}
+          OUT = '/tmp/resdedup_removed'
+          removed = []
+
+          roots = [r for r in ('android/app/src', 'app/src', 'src') if os.path.isdir(r)]
+          if not roots:
+              print('RES-DUP: gak ada folder src android - skip')
+              sys.exit(0)
+
+          for root in roots:
+              for dpath, dirs, files in os.walk(root):
+                  parts = dpath.replace(os.sep, '/').split('/')
+                  if 'build' in parts or '.git' in parts:
+                      dirs[:] = []
+                      continue
+                  groups = {}
+                  for f in files:
+                      if f.startswith('.') or '.' not in f:
+                          continue
+                      stem, ext = f.rsplit('.', 1)
+                      if not stem or not ext:
+                          continue
+                      groups.setdefault(stem, []).append((f, '.' + ext.lower()))
+                  for stem, fl in groups.items():
+                      exts = set(e for _, e in fl)
+                      if len(exts) < 2:
+                          continue
+                      fl.sort(key=lambda t: (PRIO.get(t[1], 9), t[0]))
+                      for f, _e in fl[1:]:
+                          try:
+                              os.remove(os.path.join(dpath, f))
+                              removed.append(os.path.relpath(os.path.join(dpath, f), root))
+                          except OSError:
+                              pass
+
+          try:
+              with open(OUT, 'w') as fh:
+                  fh.write('\n'.join(removed))
+          except OSError:
+              pass
+          print('RES-DUP_REMOVED=%d' % len(removed))
+          for r in removed[:10]:
+              print('  hapus: ' + r)
+          if len(removed) > 10:
+              print('  ... +%d file lagi' % (len(removed) - 10))
+
+          RESDEDUP
           cat > /tmp/dartfix.py <<'PYDART'
           import json, os, re, sys, urllib.request
 
@@ -2263,6 +2323,12 @@ jobs:
             dart run flutter_launcher_icons || echo "⚠️ icon generation gagal (non-fatal) — build lanjut pake icon default"
             touch .icons_generated
           fi
+          # ── 🩹 v6.9 RES-DUP SHIELD: resource nama-sama-ekstensi-beda di res
+          # (klasik: ic_launcher.png + ic_launcher.jpg hasil eksport generator
+          # icon) → "Duplicate resources" → task merge*Resources mati. Buang
+          # dobelnya SEBELUM build (idempoten — jalan 2x hasil sama).
+          rm -f /tmp/resdedup_removed
+          python3 /tmp/resdedup.py || true
           # ── ⚙️ v5.4/v5.5: build + auto-fix reaktif (max 5 percobaan) ──
           # Toolchain ke tua → bldfix.py. Error kompilasi Dart (API package
           # hasil major-upgrade) → dartfix.py. Terus retry sampai OK.
@@ -2299,6 +2365,18 @@ jobs:
                 echo "🔁 retry build setelah Dart auto-fix: $(head -1 /tmp/dartfix_applied)"
                 rm -f /tmp/dartfix_applied /tmp/dartfix_pubspec
               else
+                # ── 🩹 v6.9 RES-DUP reaktif: error "Duplicate resources" →
+                # buang dobelnya lalu retry. Dupe gak ketemu di res project
+                # (mis. dupe-nya di plugin AAR) → stop, biar bot laporin.
+                if grep -qE "Duplicate resources|duplicate value for resource" build_output*.txt 2>/dev/null; then
+                  rm -f /tmp/resdedup_removed
+                  python3 /tmp/resdedup.py || true
+                  if [ -s /tmp/resdedup_removed ]; then
+                    echo "🔁 retry build setelah RES-DUP ($(wc -l < /tmp/resdedup_removed) file duplikat kehapus)"
+                    rm -f /tmp/resdedup_removed
+                    continue
+                  fi
+                fi
                 echo "❌ gak ada auto-fix yang cocok — error asli ada di atas"
                 break
               fi
@@ -2706,6 +2784,12 @@ jobs:
             dart run flutter_launcher_icons || echo "⚠️ icon generation gagal (non-fatal) — build lanjut pake icon default"
             touch .icons_generated
           fi
+          # ── 🩹 v6.9 RES-DUP SHIELD: resource nama-sama-ekstensi-beda di res
+          # (klasik: ic_launcher.png + ic_launcher.jpg hasil eksport generator
+          # icon) → "Duplicate resources" → task merge*Resources mati. Buang
+          # dobelnya SEBELUM build (idempoten — jalan 2x hasil sama).
+          rm -f /tmp/resdedup_removed
+          python3 /tmp/resdedup.py || true
           # ── ⚙️ v5.4/v5.5: build AAB + auto-fix reaktif (max 5 percobaan) ──
           # Sama kayak step APK: toolchain ke tua → bldfix.py, error Dart →
           # dartfix.py, terus retry.
@@ -2742,6 +2826,18 @@ jobs:
                 echo "🔁 retry build setelah Dart auto-fix: $(head -1 /tmp/dartfix_applied)"
                 rm -f /tmp/dartfix_applied /tmp/dartfix_pubspec
               else
+                # ── 🩹 v6.9 RES-DUP reaktif: error "Duplicate resources" →
+                # buang dobelnya lalu retry. Dupe gak ketemu di res project
+                # (mis. dupe-nya di plugin AAR) → stop, biar bot laporin.
+                if grep -qE "Duplicate resources|duplicate value for resource" build_output*.txt 2>/dev/null; then
+                  rm -f /tmp/resdedup_removed
+                  python3 /tmp/resdedup.py || true
+                  if [ -s /tmp/resdedup_removed ]; then
+                    echo "🔁 retry build setelah RES-DUP ($(wc -l < /tmp/resdedup_removed) file duplikat kehapus)"
+                    rm -f /tmp/resdedup_removed
+                    continue
+                  fi
+                fi
                 echo "❌ gak ada auto-fix yang cocok — error asli ada di atas"
                 break
               fi
