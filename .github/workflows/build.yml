@@ -2331,10 +2331,19 @@ jobs:
               fi
             done
             if [ -n "$PERM_INJECT" ]; then
-              sed -i "s|<application|$PERM_INJECT<application|" "$MANIFEST"
+              if grep -q '<application' "$MANIFEST"; then
+                sed -i "s|<application|$PERM_INJECT<application|" "$MANIFEST"
+              else
+                # ↩️ manifest tanpa <application> itu SAH (module non-app:
+                # benchmark/test/library). uses-permission tetap valid di
+                # root manifest → fallback anchor </manifest> (case nyata:
+                # kotlin run #16 NanzTube, macrobenchmark manifest).
+                sed -i "s|</manifest>|$PERM_INJECT</manifest>|" "$MANIFEST"
+                echo "↩️ $MANIFEST: fallback anchor </manifest> (gak ada <application>)"
+              fi
               PERM_AFTER=$(grep -o 'uses-permission' "$MANIFEST" | wc -l)
               if [ "$PERM_AFTER" -lt $((PERM_BEFORE + PERM_NINS)) ]; then
-                echo "=== BUILD FAILED: inject perizinan gagal (anchor <application gak match) ==="
+                echo "=== BUILD FAILED: inject perizinan gagal (anchor <application & </manifest> dua-duanya gak match) ==="
                 exit 1
               fi
               echo "🔐 [v4.11] $PERM_NINS izin pilihan user ke-inject (total uses-permission: $PERM_AFTER)"
@@ -2798,10 +2807,19 @@ jobs:
               fi
             done
             if [ -n "$PERM_INJECT" ]; then
-              sed -i "s|<application|$PERM_INJECT<application|" "$MANIFEST"
+              if grep -q '<application' "$MANIFEST"; then
+                sed -i "s|<application|$PERM_INJECT<application|" "$MANIFEST"
+              else
+                # ↩️ manifest tanpa <application> itu SAH (module non-app:
+                # benchmark/test/library). uses-permission tetap valid di
+                # root manifest → fallback anchor </manifest> (case nyata:
+                # kotlin run #16 NanzTube, macrobenchmark manifest).
+                sed -i "s|</manifest>|$PERM_INJECT</manifest>|" "$MANIFEST"
+                echo "↩️ $MANIFEST: fallback anchor </manifest> (gak ada <application>)"
+              fi
               PERM_AFTER=$(grep -o 'uses-permission' "$MANIFEST" | wc -l)
               if [ "$PERM_AFTER" -lt $((PERM_BEFORE + PERM_NINS)) ]; then
-                echo "=== BUILD FAILED: inject perizinan gagal (anchor <application gak match) ==="
+                echo "=== BUILD FAILED: inject perizinan gagal (anchor <application & </manifest> dua-duanya gak match) ==="
                 exit 1
               fi
               echo "🔐 [v4.11] $PERM_NINS izin pilihan user ke-inject (total uses-permission: $PERM_AFTER)"
