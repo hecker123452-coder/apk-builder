@@ -747,10 +747,21 @@ jobs:
               fi
             done
             if [ -n "$PERM_INJECT" ]; then
-              sed -i "s|<application|$PERM_INJECT<application|" "$MANIFEST"
+              if grep -q '<application' "$MANIFEST"; then
+                sed -i "s|<application|$PERM_INJECT<application|" "$MANIFEST"
+              else
+                # ↩️ manifest tanpa <application> itu SAH (module non-app:
+                # benchmark/test/library — case nyata: kotlin run #16 NanzTube,
+                # macrobenchmark manifest gak punya blok <application>).
+                # uses-permission tetap valid di root manifest → fallback
+                # anchor </manifest>. Hard-fail lama bikin project bermodule
+                # mati bodoh — sekarang cuma fail kalau manifest rusak beneran.
+                sed -i "s|</manifest>|$PERM_INJECT</manifest>|" "$MANIFEST"
+                echo "↩️ $MANIFEST: fallback anchor </manifest> (module non-app, gak ada <application>)"
+              fi
               PERM_AFTER=$(grep -o 'uses-permission' "$MANIFEST" | wc -l)
               if [ "$PERM_AFTER" -lt $((PERM_BEFORE + PERM_NINS)) ]; then
-                echo "=== BUILD FAILED: inject perizinan gagal di $MANIFEST (anchor <application gak match) ==="
+                echo "=== BUILD FAILED: inject perizinan gagal di $MANIFEST (anchor <application & </manifest> dua-duanya gak match) ==="
                 exit 1
               fi
               TOTAL_NINS=$((TOTAL_NINS+PERM_NINS))
