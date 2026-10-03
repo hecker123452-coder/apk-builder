@@ -643,6 +643,41 @@ jobs:
               except Exception as _e:
                   print('flutter clean skip (' + repr(_e)[:80] + ')')
 
+          # ── v6.9: "Gradle build failed to produce an .apk file" — project
+          # tulis-tangan/template-lawas pake layout build klasik, flutter tool
+          # nyari APK di <root>/build/app/outputs/flutter-apk → gak ketemu.
+          # Fix: inject blok relokasi build dir ala template baru (idempoten —
+          # cek marker buildDirectory/buildDir sebelum nulis).
+          if 'failed to produce an .apk file' in err:
+              _bdp = []
+              _kts, _gro = 'android/build.gradle.kts', 'android/build.gradle'
+              if os.path.isfile(_kts):
+                  with open(_kts, encoding='utf-8') as f:
+                      _gtxt = f.read()
+                  if 'buildDirectory' not in _gtxt:
+                      _blk = ('\nval newBuildDir: Directory = rootProject.layout.buildDirectory.dir("../../build").get()\n'
+                              'rootProject.layout.buildDirectory.value(newBuildDir)\n'
+                              'subprojects {\n'
+                              '    val newSubprojectBuildDir: Directory = newBuildDir.dir(project.name)\n'
+                              '    project.layout.buildDirectory.value(newSubprojectBuildDir)\n'
+                              '}\n')
+                      with open(_kts, 'w', encoding='utf-8') as f:
+                          f.write(_gtxt.rstrip() + '\n' + _blk)
+                      _bdp.append(_kts)
+              if os.path.isfile(_gro):
+                  with open(_gro, encoding='utf-8') as f:
+                      _gtxt = f.read()
+                  if 'rootProject.buildDir' not in _gtxt:
+                      _blk = ('\nrootProject.buildDir = "../build"\n'
+                              'subprojects {\n'
+                              '    project.buildDir = "${rootProject.buildDir}/${project.name}"\n'
+                              '}\n')
+                      with open(_gro, 'w', encoding='utf-8') as f:
+                          f.write(_gtxt.rstrip() + '\n' + _blk)
+                      _bdp.append(_gro)
+              if _bdp:
+                  applied.append('relokasi build dir buat flutter tool: ' + ', '.join(_bdp))
+
           if applied:
               print('AUTO-FIX toolchain:', '; '.join(applied))
               with open('/tmp/bldfix_applied', 'w') as f:
