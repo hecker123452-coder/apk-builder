@@ -568,7 +568,10 @@ jobs:
                   # lama bodoh — 'flutterEmbedding' di dalam comment dianggap
                   # ada → insert ke-skip → error v1 mengulang terus, run #97).
                   # Value jadul (bukan 2) dipaksa 2, urutan atribut bebas.
-                  mtxt = re.sub(r'<!--.*?flutterEmbedding.*?-->', '', mtxt, flags=re.S)
+                  def _strip_ce(m):
+                      c = m.group(0)
+                      return '' if 'flutterEmbedding' in c else c
+                  mtxt = re.sub(r'<!--.*?-->', _strip_ce, mtxt, flags=re.S)
                   def _force2(m):
                       return re.sub(r'android:value="[^"]*"', 'android:value="2"', m.group(0))
                   mtxt = re.sub(r'<meta-data\s+[^>]*android:name="flutterEmbedding"[^>]*/?>', _force2, mtxt)
@@ -2403,7 +2406,10 @@ jobs:
           with open(mani, encoding='utf-8', errors='replace') as f:
               t = f.read()
           orig = t
-          t = re.sub(r'<!--.*?flutterEmbedding.*?-->', '', t, flags=re.S)
+          def _strip_ce(m):
+              c = m.group(0)
+              return '' if 'flutterEmbedding' in c else c
+          t = re.sub(r'<!--.*?-->', _strip_ce, t, flags=re.S)
           def _force2(m):
               return re.sub(r'android:value="[^"]*"', 'android:value="2"', m.group(0))
           t = re.sub(r'<meta-data\s+[^>]*android:name="flutterEmbedding"[^>]*/?>', _force2, t)
@@ -2953,7 +2959,10 @@ jobs:
           with open(mani, encoding='utf-8', errors='replace') as f:
               t = f.read()
           orig = t
-          t = re.sub(r'<!--.*?flutterEmbedding.*?-->', '', t, flags=re.S)
+          def _strip_ce(m):
+              c = m.group(0)
+              return '' if 'flutterEmbedding' in c else c
+          t = re.sub(r'<!--.*?-->', _strip_ce, t, flags=re.S)
           def _force2(m):
               return re.sub(r'android:value="[^"]*"', 'android:value="2"', m.group(0))
           t = re.sub(r'<meta-data\s+[^>]*android:name="flutterEmbedding"[^>]*/?>', _force2, t)
