@@ -2325,7 +2325,9 @@ jobs:
           splash = (os.environ.get('INPUT_SPLASH', 'true') or 'true').strip().lower()
           # ── 👻 v5.8: gaya splash screen (khusus Web2APK: URL + HTML) ──
           splash_style = (os.environ.get('INPUT_SPLASH_STYLE', 'clean') or 'clean').strip().lower()
-          if splash_style not in ('clean', 'dark', 'gradient', 'pulse', 'off'):
+          # [T75] FIX WYSIWYG: dulu cuma 5 gaya — neon/sunset/ocean/aurora dari
+          # bot DI-COERCE diam-diam ke 'clean' (list validasi ketinggalan v3.4).
+          if splash_style not in ('clean', 'dark', 'gradient', 'pulse', 'neon', 'sunset', 'ocean', 'aurora', 'off'):
               splash_style = 'clean'
           dark = (os.environ.get('INPUT_DARK_MODE', 'false') or 'false').strip().lower()
           # ── v5.0: tabs ──
@@ -2441,6 +2443,64 @@ jobs:
 
           with open('lib/main.dart', 'w', encoding='utf-8') as f:
               f.write(src)
+
+          # ── ⚡ [T75] LAUNCH THEME SEAMLESS (anti "layar gelap aneh") ──
+          # Jendela pembuka Android (sebelum frame Flutter pertama) warna-nya
+          # ngasal (putih bawaan / gelap tema sistem) → kedip jelek pas app
+          # dibuka, apalagi pas splash OFF (mode mirip native). Sekarang
+          # warna jendela = warna splash (atau warna app kalo splash off)
+          # → app kebuka mulus, native feel, tanpa kedip gelap/putih.
+          _splash_pairs = {
+              'clean': ('#FFFFFF', '#121212'),
+              'pulse': ('#FFFFFF', '#121212'),
+              'off': ('#FFFFFF', '#121212'),
+              'dark': ('#0F1420', '#0F1420'),
+              'gradient': ('#6D5DF6', '#6D5DF6'),
+              'neon': ('#0A0A12', '#0A0A12'),
+              'sunset': ('#FF9A5A', '#FF9A5A'),
+              'ocean': ('#0EA5E9', '#0EA5E9'),
+              'aurora': ('#0B1020', '#0B1020'),
+          }
+          _pair = _splash_pairs.get(splash_style, ('#FFFFFF', '#121212'))
+          _hex = _pair[1] if dark == 'true' else _pair[0]
+          _res = 'android/app/src/main/res'
+          for _d in ('drawable', 'drawable-v21', 'values', 'values-v31'):
+              os.makedirs(os.path.join(_res, _d), exist_ok=True)
+          _lb = ('<?xml version="1.0" encoding="utf-8"?>\n'
+                 '<shape xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                 '    <solid android:color="' + _hex + '"/>\n'
+                 '</shape>\n')
+          with open(os.path.join(_res, 'drawable', 'launch_background.xml'), 'w', encoding='utf-8') as f:
+              f.write(_lb)
+          with open(os.path.join(_res, 'drawable-v21', 'launch_background.xml'), 'w', encoding='utf-8') as f:
+              f.write(_lb)
+          with open(os.path.join(_res, 'values', 'colors.xml'), 'w', encoding='utf-8') as f:
+              f.write('<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+                      '    <color name="launch_bg">' + _hex + '</color>\n'
+                      '    <color name="normal_bg">' + _hex + '</color>\n'
+                      '</resources>\n')
+          _styles = ('<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+                     '    <style name="LaunchTheme" parent="@android:style/Theme.Light.NoTitleBar">\n'
+                     '        <item name="android:windowBackground">@color/launch_bg</item>\n'
+                     '    </style>\n'
+                     '    <style name="NormalTheme" parent="@android:style/Theme.Light.NoTitleBar">\n'
+                     '        <item name="android:windowBackground">@color/normal_bg</item>\n'
+                     '    </style>\n'
+                     '</resources>\n')
+          with open(os.path.join(_res, 'values', 'styles.xml'), 'w', encoding='utf-8') as f:
+              f.write(_styles)
+          _styles31 = ('<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+                       '    <style name="LaunchTheme" parent="@android:style/Theme.Light.NoTitleBar">\n'
+                       '        <item name="android:windowBackground">@color/launch_bg</item>\n'
+                       '        <item name="android:windowSplashScreenBackground">@color/launch_bg</item>\n'
+                       '    </style>\n'
+                       '    <style name="NormalTheme" parent="@android:style/Theme.Light.NoTitleBar">\n'
+                       '        <item name="android:windowBackground">@color/normal_bg</item>\n'
+                       '    </style>\n'
+                       '</resources>\n')
+          with open(os.path.join(_res, 'values-v31', 'styles.xml'), 'w', encoding='utf-8') as f:
+              f.write(_styles31)
+          print('[T75] launch theme seamless:', splash_style, '| dark:', dark, '| bg:', _hex)
 
           # ── Daftarin assets ke pubspec.yaml ──
           assets = []
