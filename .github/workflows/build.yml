@@ -2383,7 +2383,7 @@ jobs:
           #       .java/.kt ke-swap
           if [ -d "android" ] && [ ! -f "android/settings.gradle" ] && [ ! -f "android/settings.gradle.kts" ] && [ ! -f "android/build.gradle" ] && [ ! -f "android/build.gradle.kts" ]; then
             echo "🩹 [v1-sweep L1] android/ gak punya gradle config = scaffold invalid → regenerate..."
-            PKG_NAME=$(sed -n "s/^name:[[:space:]]*["']\{0,1\}\([a-zA-Z0-9_]\+\)["']\{0,1\}[[:space:]]*$/\1/p" pubspec.yaml | head -1)
+            PKG_NAME=$(sed -n "s/^name:[[:space:]]*[\"']\{0,1\}\([a-zA-Z0-9_]\+\)[\"']\{0,1\}[[:space:]]*$/\1/p" pubspec.yaml | head -1)
             PKG_NAME=$(echo "$PKG_NAME" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9_]//g')
             case "$PKG_NAME" in "") PKG_NAME="app" ;; [0-9]*) PKG_NAME="a$PKG_NAME" ;; esac
             rm -rf android
@@ -2500,7 +2500,7 @@ jobs:
             # v6.9: pre-check image_path — config nunjuk file yang gak ada =
             # PathNotFoundException (run #97 assets/icon.png) → skip bersih,
             # pake icon default (non-fatal, gak buang waktu dart run).
-            ICON_PATH=$(sed -n "s/^\s*image_path:\s*["']\{0,1\}\([^"'# ]\+\)["']\{0,1\}.*/\1/p" pubspec.yaml | head -1)
+            ICON_PATH=$(sed -n "s/^\s*image_path:\s*[\"']\{0,1\}\([^\"'# ]\+\)[\"']\{0,1\}.*/\1/p" pubspec.yaml | head -1)
             if [ -n "$ICON_PATH" ] && [ ! -f "$ICON_PATH" ]; then
               echo "⚠️ flutter_launcher_icons nunjuk ke '$ICON_PATH' yang GAK ADA — skip generate (pake icon default, non-fatal)"
               touch .icons_generated
@@ -2933,7 +2933,7 @@ jobs:
           #       .java/.kt ke-swap
           if [ -d "android" ] && [ ! -f "android/settings.gradle" ] && [ ! -f "android/settings.gradle.kts" ] && [ ! -f "android/build.gradle" ] && [ ! -f "android/build.gradle.kts" ]; then
             echo "🩹 [v1-sweep L1] android/ gak punya gradle config = scaffold invalid → regenerate..."
-            PKG_NAME=$(sed -n "s/^name:[[:space:]]*["']\{0,1\}\([a-zA-Z0-9_]\+\)["']\{0,1\}[[:space:]]*$/\1/p" pubspec.yaml | head -1)
+            PKG_NAME=$(sed -n "s/^name:[[:space:]]*[\"']\{0,1\}\([a-zA-Z0-9_]\+\)[\"']\{0,1\}[[:space:]]*$/\1/p" pubspec.yaml | head -1)
             PKG_NAME=$(echo "$PKG_NAME" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9_]//g')
             case "$PKG_NAME" in "") PKG_NAME="app" ;; [0-9]*) PKG_NAME="a$PKG_NAME" ;; esac
             rm -rf android
@@ -3034,7 +3034,7 @@ jobs:
             # v6.9: pre-check image_path — config nunjuk file yang gak ada =
             # PathNotFoundException (run #97 assets/icon.png) → skip bersih,
             # pake icon default (non-fatal, gak buang waktu dart run).
-            ICON_PATH=$(sed -n "s/^\s*image_path:\s*["']\{0,1\}\([^"'# ]\+\)["']\{0,1\}.*/\1/p" pubspec.yaml | head -1)
+            ICON_PATH=$(sed -n "s/^\s*image_path:\s*[\"']\{0,1\}\([^\"'# ]\+\)[\"']\{0,1\}.*/\1/p" pubspec.yaml | head -1)
             if [ -n "$ICON_PATH" ] && [ ! -f "$ICON_PATH" ]; then
               echo "⚠️ flutter_launcher_icons nunjuk ke '$ICON_PATH' yang GAK ADA — skip generate (pake icon default, non-fatal)"
               touch .icons_generated
