@@ -1,0 +1,3171 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: 'URL ZIP project Flutter'
+        required: true
+      tag:
+        description: 'Build tag'
+        required: true
+      build_type:
+        description: 'Build Type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      build_format:
+        description: 'Output format'
+        required: false
+        default: 'apk'
+        type: choice
+        options:
+          - apk
+          - aab
+          - both
+      app_name:
+        description: 'App Name'
+        required: false
+        default: 'MyApp'
+      icon_url:
+        description: 'Icon URL'
+        required: false
+        default: ''
+      chat_id:
+        description: 'Telegram Chat ID'
+        required: false
+        default: ''
+      bot_token:
+        description: 'Telegram Bot Token'
+        required: false
+        default: ''
+      keystore_id:
+        description: 'v6.2 ID keystore per user (mis. 12345 → keystores/u12345.jks). Kosong = keystore global.'
+        required: false
+        default: ''
+      brand:
+        description: 'v4.2 Brand whitelabel (dipake buat dname keystore BARU). Kosong = DZR.'
+        required: false
+        default: ''
+
+      license:
+        description: '🛡️ v4.3 Benteng Lisensi (anti-repack): "on" = pasang LicenseGuard (cek signature asli runtime). Kosong = off.'
+        required: false
+        default: ''
+      enc_key:
+        description: '🔒 v4.11 CRYPT VAULT: kunci enkripsi hasil build (password openssl). Kosong = plain (mode lama).'
+        required: false
+        default: ''
+      perms:
+        description: '🔐 v4.11 Perizinan: daftar izin Android dipisah koma (mis. CAMERA,RECORD_AUDIO). Kosong = tanpa tambahan.'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # v5.4: 18 menit — auto-fix toolchain bisa retry build beberapa kali
+    # (gradle/AGP/kotlin bump + download dist gradle baru + full compile)
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      actions: write
+    env:
+      LC_ALL: C.UTF-8
+      LANG: C.UTF-8
+      INPUT_APP_NAME: ${{ inputs.app_name }}
+      INPUT_ZIP_URL: ${{ inputs.zip_url }}
+      INPUT_CHAT_ID: ${{ inputs.chat_id }}
+      INPUT_BOT_TOKEN: ${{ inputs.bot_token }}
+      INPUT_TAG: ${{ inputs.tag }}
+      INPUT_ICON_URL: ${{ inputs.icon_url }}
+      INPUT_BUILD_TYPE: ${{ inputs.build_type }}
+      INPUT_BUILD_FORMAT: ${{ inputs.build_format }}
+      INPUT_KEYSTORE_ID: ${{ inputs.keystore_id }}
+      ENC_KEY: ${{ inputs.enc_key }}
+      INPUT_PERMS: ${{ inputs.perms }}
+
+    steps:
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          # ── ⚠️ v4.8: WAJIB PIN VERSI! Flutter stable baru (AGP 9) nolak
+          # plugin lama yang masih pake proguard-android.txt → build gagal massal.
+          # 3.47.2 = versi deterministik, template & auto-fix sudah tervalidasi.
+          flutter-version: '3.47.2'
+          channel: 'stable'
+          cache: true
+
+      # ── ⚡ v6.2: ROLLING CACHE — fix cache beku ──
+      # Dulu key = hashFiles(pubspec.yaml, ...) — TAPI step ini jalan SEBELUM
+      # project di-download/extract, jadi file-nya GAK ADA → hash selalu
+      # kosong → key konstan "gpub-" → build pertama nyimpen cache, build
+      # berikutnya exact-match key yang sama → actions/cache GAK PERNAH
+      # nyimpen ulang → cache beku di isi build pertama selamanya.
+      # Sekarang: key rolling (per run_id) + restore prefix runner — tiap
+      # run restore cache TERBARU, abis run nyimpen versi barunya. Dep baru
+      # yang ke-download tetap ke-cache, build berikutnya makin cepat.
+      # Catatan: .dart_tool pre-created dulu bikin bootstrap-check palsu —
+      # udah di-guard di step Download (v5.6b), gak masalah.
+      - name: Cache Gradle + Pub
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.pub-cache
+            .dart_tool
+          key: gpub-v2-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            gpub-v2-${{ runner.os }}-
+
+      # ── ⚡ v3.4: TUNE GRADLE (request owner: "build makin cepet") ──
+      # gradle.properties global buat runner: parallel task + build cache +
+      # heap pas (runner 2-core/7GB). Aman buat semua project Flutter,
+      # dampak langsung ke fase configure/compile/dex Gradle.
+      - name: Tune Gradle (speed)
+        run: |
+          mkdir -p ~/.gradle
+          cat > ~/.gradle/gradle.properties <<'GPROP'
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          org.gradle.configureondemand=true
+          org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8
+          GPROP
+          echo "⚡ gradle.properties tuning dipasang (parallel + caching + heap 3g)"
+
+      - name: Download + Extract + Deps + Patch
+        run: |
+          # Download
+          HTTP_CODE=$(curl -sL -w "%{http_code}" -o project.zip \
+            --retry 3 --retry-delay 2 --retry-connrefused \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "$INPUT_ZIP_URL")
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "ERROR: Download failed! HTTP $HTTP_CODE"
+            exit 1
+          fi
+          MAGIC=$(od -A n -t x1 -N 4 project.zip 2>/dev/null | tr -d ' ')
+          if ! echo "$MAGIC" | grep -qi "^504b"; then
+            echo "ERROR: Not a valid ZIP file!"
+            exit 1
+          fi
+          echo "ZIP: $(du -sh project.zip | cut -f1)"
+
+          # Extract
+          mkdir -p project
+          if ! unzip -q project.zip -d project; then
+            echo "ERROR: Extraction failed!"
+            exit 1
+          fi
+          PROJECT_DIR=""
+          if [ -f "project/pubspec.yaml" ]; then
+            PROJECT_DIR="project"
+          else
+            INNER=$(find project -maxdepth 3 -name "pubspec.yaml" | head -1)
+            if [ -n "$INNER" ]; then
+              PROJECT_DIR=$(dirname "$INNER")
+            fi
+          fi
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: No pubspec.yaml found!"
+            exit 1
+          fi
+          echo "Project: $PROJECT_DIR"
+          rsync -a --remove-source-files "$PROJECT_DIR/" . 2>/dev/null || {
+            cp -r "$PROJECT_DIR"/* . 2>/dev/null || true
+            cp -r "$PROJECT_DIR"/.* . 2>/dev/null || true
+          }
+          if [ ! -f "pubspec.yaml" ]; then
+            echo "ERROR: pubspec.yaml missing!"
+            exit 1
+          fi
+          rm -rf project project.zip
+
+          # ── 🆕 v5.6: BOOTSTRAP android/ — banyak ZIP user cuma bawa lib/ + pubspec ──
+          # Flutter 3.47+ kalo folder android/ gak ada langsung mati:
+          #   "Build failed due to use of deleted Android v1 embedding."
+          # (manifest flutterEmbedding gak ketemu = dianggap project jaman batu).
+          # Solusi: generate android/ pake `flutter create` — file yang udah ada
+          # (lib/, pubspec.yaml, test/, assets/) GAK ditimpa, cuma folder kurang
+          # yang ditambah. Org/paket diambil dari name: pubspec (dibersihin).
+          # NOTE: if bersarang + echo di tiap lapis — biar kalo kondisi nyangkut
+          # kelihatan jelas di log (run #50/#51: blok ke-skip karena actions/
+          # cache@v4 PRE-CREATE folder path cache → android/.gradle dibuatkan
+          # walau project gak punya android/ → android-exists=YES palsu).
+          # v5.6b: android/.gradle dicabut dari path cache + shell kosong
+          # android/ (tanpa manifest) dihapus sebelum cek.
+          if [ -d "android" ] && [ ! -f "android/app/src/main/AndroidManifest.xml" ]; then
+            echo "🧹 [bootstrap] android/ cuma shell kosong (sisa pre-create cache path) → dihapus"
+            rm -rf android
+          fi
+          echo "🔎 [bootstrap-check] pwd=$PWD | android-exists=$([ -d android ] && echo YES || echo NO) | pubspec=$([ -f pubspec.yaml ] && echo YES || echo NO)"
+          if [ ! -d "android" ]; then
+            echo "🔎 [bootstrap] android/ gak ada di workspace (pwd=$PWD) — cek pubspec..."
+            if [ -f "pubspec.yaml" ] && grep -q "flutter" pubspec.yaml && grep -q "sdk:" pubspec.yaml; then
+              PKG_NAME=$(sed -n "s/^name:[[:space:]]*[\"']\{0,1\}\([a-zA-Z0-9_]\+\)[\"']\{0,1\}[[:space:]]*$/\1/p" pubspec.yaml | head -1)
+              PKG_NAME=$(echo "$PKG_NAME" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9_]//g')
+              case "$PKG_NAME" in
+                "") PKG_NAME="app" ;;
+                [0-9]*) PKG_NAME="a$PKG_NAME" ;;
+              esac
+              echo "🆕 android/ gak ada di ZIP → generate pake flutter create (pkg: $PKG_NAME, org: com.dzrbuild)..."
+              flutter create --platforms=android --org com.dzrbuild --project-name "$PKG_NAME" . || true
+              if [ -d "android" ]; then
+                echo "✅ android/ berhasil di-generate — file project existing gak disentuh"
+              else
+                echo "ERROR: android/ gak berhasil di-generate (flutter create gagal)"
+                exit 1
+              fi
+            else
+              echo "🔎 [bootstrap] pubspec gak nandain project Flutter (sdk:flutter) — skip bootstrap"
+            fi
+          fi
+
+          # ── ⚙️ v5.2/v5.5 Pub get ANTI-CONFLICT ──
+          # Project ZIP user sering ada konflik dependensi (mis. pubspec pin
+          # package_info_plus ^9.0.0 tapi better_player dari git butuh ^10.1.0
+          # via wakelock_plus) → pub get mati total. Sekarang: error dibaca,
+          # constraint paket langsung yang bentrok di-BUMP otomatis ngikutin
+          # versi yang diminta dependensi transitif, terus di-retry (max 4x).
+          # v5.5: pola "is incompatible" (device_info_plus <13 vs win32 ^6
+          # dari wakelock_plus) → dep langsung di-bump ke major setelah upper
+          # bound-nya — biar GAK perlu fallback pub upgrade --major-versions
+          # yang ngerewrite 25+ constraint dan bikin kode user gak kompil.
+          rm -f /tmp/pubfix_applied
+          PUB_ATTEMPT=0
+          PUB_OK=false
+          while [ "$PUB_ATTEMPT" -lt 8 ]; do
+            PUB_ATTEMPT=$((PUB_ATTEMPT+1))
+            if PUB_OUT=$(flutter pub get 2>&1); then
+              PUB_OK=true
+              echo "$PUB_OUT"
+              break
+            fi
+            echo "$PUB_OUT"
+            echo "⚠️ pub get gagal (percobaan $PUB_ATTEMPT/8) → auto-fix konflik dependensi..."
+                      PUB_ERR="$PUB_OUT" python3 - <<'PYFIX' || true
+          # ── v5.7 RESOLVER v2 (Flutter Medic) ──
+          # Run #71/#73: (1) dulu cuma bump SATU paket per iterasi — konflik
+          # 4 paket butuh 4 iterasi pas-pasan dari 4 slot; (2) dulu selalu
+          # bump KE ATAS — better_player dari git (2023) minta *_plus versi
+          # LEBIH RENDAH, bump ke atas malah makin jauh dari solusi.
+          # Sekarang: (a) proses SEMUA kandidat per iterasi, (b) kandidat
+          # yang udah di-bump tapi MASIH konflik → relax ke "any" (solver
+          # pub yang milih versi kompatibel dua arah), (c) pola gak
+          # dikenali → langsung relax. State antar-iterasi:
+          # /tmp/pubfix_state.json (hidup sepanjang job).
+          import os, re, json
+
+          err = os.environ.get('PUB_ERR', '')
+          with open('pubspec.yaml', encoding='utf-8') as f:
+              content = f.read()
+          fixed = []
+
+          def rewrite(pkg, newval, note):
+              global content
+              pat = re.compile(r'(?m)^(\s*' + re.escape(pkg) + r':\s*)([^\n#]+?)(\s*#.*)?$')
+              m = pat.search(content)
+              if not m:
+                  return False
+              val = m.group(2).strip()
+              if ':' in val or not re.search(r'\d', val):
+                  return False
+              if val == newval:
+                  return False
+              content = pat.sub(lambda mm: mm.group(1) + newval + (mm.group(3) or ''), content, count=1)
+              fixed.append(pkg + ': ' + val + ' -> ' + newval + ((' (' + note + ')') if note else ''))
+              return True
+
+          def bump(pkg, newver):
+              nv = newver if newver.startswith('^') else '^' + newver
+              return rewrite(pkg, nv, '')
+
+          def relax(pkg):
+              return rewrite(pkg, 'any', 'relax ke any, solver pub yang milih')
+
+          need = dict(re.findall(r'depends on ([a-z0-9_]+) \^(\d+\.\d+\.\d+)', err))
+          for pkg, oldver in re.findall(r'depends on both ([a-z0-9_]+) \^(\d+\.\d+\.\d+)', err):
+              if pkg in need and need[pkg] != oldver:
+                  bump(pkg, need[pkg])
+          for pkg, ver in re.findall(r'which requires ([a-z0-9_]+) \^(\d+\.\d+\.\d+)', err):
+              bump(pkg, ver)
+          for pkg, ver in re.findall(r'which depends on ([a-z0-9_]+) \^(\d+\.\d+\.\d+)', err):
+              bump(pkg, ver)
+
+          # v5.7.1: "which doesn't match any versions" — dep dipin ke versi
+          # yang GAK ADA di pub.dev (khas pubspec generatoran/AI ngarang
+          # versi, kena sendiri di E2E run #74) → relax ke any, solver pub
+          # yang milih versi beneran ada & kompatibel.
+          for pkg in dict.fromkeys(re.findall(r"depends on ([a-z0-9_]+) [^\s]+ which doesn't match any versions", err)):
+              relax(pkg)
+          # v5.7.1: saran resmi pub ("Consider downgrading/upgrading your
+          # constraint on X: flutter pub add X:^9.0.1") → constraint pasti
+          # jalan, dipake langsung.
+          for pkg, ver in re.findall(r"Consider (?:downgrading|upgrading) your constraint on ([a-z0-9_]+): flutter pub add \1:([^\s,]+)", err):
+              rewrite(pkg, ver, 'ikut saran pub')
+
+          clauses = []
+          for m in re.finditer(r'([a-z0-9_]+)((?:\s+[\^><=~]{0,2}[\d.]+)(?:\s*[<>]=?\s*[\d.]+)?)?(?:\s+from\s+git)?\s+(?:which\s+)?(?:depends on|requires)\s+([a-z0-9_]+)\s+([\^><=~]{0,2}[\d.]+(?:\s*[<>]=?\s*[\d.]+)?)', err):
+              clauses.append((m.group(1), m.group(2) or '', m.group(3), m.group(4)))
+          bothc = re.findall(r'depends on both ([a-z0-9_]+) [^\s]+(?: and ([a-z0-9_]+))?', err)
+          cands = []
+          for c in [x for tup in bothc for x in tup if x]:
+              if c not in cands:
+                  cands.append(c)
+
+          def rlim(rng):
+              parts = [int(x) for x in re.search(r'[\d.]+', rng).group(0).split('.') if x.isdigit()]
+              lo = tuple((parts + [0, 0, 0])[:3])
+              hi = None
+              if rng.lstrip().startswith('^'):
+                  hi = (lo[0] + 1, 0, 0)
+              m2 = re.search(r'<\s*(\d+)\.(\d+)\.(\d+)', rng)
+              if m2:
+                  hi = (int(m2.group(1)), int(m2.group(2)), int(m2.group(3)))
+              return (lo, hi)
+
+          def disjoint(r1, r2):
+              lo1, hi1 = rlim(r1)
+              lo2, hi2 = rlim(r2)
+              return (hi1 and lo2 >= hi1) or (hi2 and lo1 >= hi2)
+
+          def caret_of(rng):
+              m5 = re.search(r'[\^><=~]{0,2}(\d+(?:\.\d+){0,2})', rng)
+              if not m5:
+                  return None
+              parts = [x for x in m5.group(1).split('.') if x != '']
+              while len(parts) < 3:
+                  parts.append('0')
+              return '^' + '.'.join(parts[:3])
+
+          def bump_target(cand):
+              # Kasus 2: kandidat jadi OBJEK dua klausa rentangnya benturan
+              # → ikut rentang sisi yang lebih tinggi
+              rngs = [dr for (sp, sr, dp, dr) in clauses if dp == cand and sp != cand]
+              for i in range(len(rngs)):
+                  for j in range(i + 1, len(rngs)):
+                      if disjoint(rngs[i], rngs[j]):
+                          t = caret_of(rngs[i] if rlim(rngs[i])[0] >= rlim(rngs[j])[0] else rngs[j])
+                          if t:
+                              return t
+              # Kasus 1: kandidat jadi SUBJEK klausa yang minta paket P di
+              # rentang benturan sama klausa lain → major sesudah upper bound
+              for (sp, sr, dp, dr) in clauses:
+                  if sp != cand:
+                      continue
+                  if any(dp2 == dp and sp2 != cand and disjoint(dr, dr2) for (sp2, sr2, dp2, dr2) in clauses):
+                      m3 = re.search(r'\^(\d+)', sr)
+                      m4 = re.search(r'<\s*(\d+)\.', sr)
+                      if m3:
+                          return '^' + str(int(m3.group(1)) + 1) + '.0.0'
+                      if m4:
+                          return '^' + m4.group(1) + '.0.0'
+              return None
+
+          state = {}
+          try:
+              with open('/tmp/pubfix_state.json') as f:
+                  state = json.load(f)
+          except Exception:
+              state = {}
+
+          for cand in cands:
+              times = state.get(cand, 0)
+              tgt = bump_target(cand)
+              if tgt and times == 0 and bump(cand, tgt):
+                  state[cand] = times + 1
+                  continue
+              if relax(cand):
+                  state[cand] = times + 1
+
+          try:
+              with open('/tmp/pubfix_state.json', 'w') as f:
+                  json.dump(state, f)
+          except Exception:
+              pass
+
+          with open('pubspec.yaml', 'w', encoding='utf-8') as f:
+              f.write(content)
+          if fixed:
+              print('AUTO-FIX pubspec.yaml:', '; '.join(fixed))
+              with open('/tmp/pubfix_applied', 'w') as f:
+                  f.write('; '.join(fixed))
+          else:
+              print('AUTO-FIX: gak nemu constraint yang bisa di-bump otomatis')
+          PYFIX
+            if [ -s /tmp/pubfix_applied ]; then
+              echo "🔁 retry pub get setelah auto-fix..."
+              rm -f /tmp/pubfix_applied
+            else
+              echo "🔁 fallback: flutter pub upgrade --major-versions..."
+              flutter pub upgrade --major-versions || true
+            fi
+          done
+          # ── v5.7: upaya terakhir sebelum nyerah — pub upgrade
+          # --major-versions di luar loop (dulu fallback ini cuma jalan kalau
+          # fixer gak ngasilin apa-apa; kalau fixer jalan tapi salah arah,
+          # semua attempt kebuang tanpa nyoba fallback — run #73).
+          if [ "$PUB_OK" != "true" ]; then
+            echo "🔁 upaya terakhir: flutter pub upgrade --major-versions..."
+            if flutter pub upgrade --major-versions >/dev/null 2>&1 && flutter pub get >/dev/null 2>&1; then
+              PUB_OK=true
+              echo "✅ pub get sukses setelah fallback terakhir"
+            fi
+          fi
+          if [ "$PUB_OK" != "true" ]; then
+            echo "ERROR: pub get failed! Konflik dependensi gak bisa di-auto-fix — cek pubspec.yaml (paket dipin versi lama padahal plugin lain butuh versi lebih tinggi)"
+            exit 1
+          fi
+
+
+      - name: Write Auto-Fix Helpers + Toolchain Check
+        run: |
+          # Step pemisah dari "Download + Extract + Deps + Patch": GitHub
+          # Actions nolak run block > 21.000 char (max expression length).
+          # Isi: helper python anti-stale toolchain (v5.4: gradlefix.py +
+          # bldfix.py) + check gradle wrapper. dartfix.py + patch package
+          # pindah ke step "Write Dart Auto-Fix Helper + Patch Packages"
+          # (v5.6 — step 5-nya kebanyakan char lagi).
+          # ── ⚙️ v5.4 TOOLCHAIN ANTI-STALE ──
+          # Project ZIP user sering bawa toolchain Android ke tua, padahal
+          # Flutter 3.47.2 (DependencyVersionChecker) nolak: Gradle < 8.14.0,
+          # AGP < 8.11.1, Kotlin < 2.2.20, minSdk < 23 → build mati di
+          # "Failed to apply plugin dev.flutter.flutter-gradle-plugin".
+          # Dua lapis fix (pola sama kayak anti-conflict pub v5.2):
+          #   (a) PROAKTIF — gradlefix.py: bump gradle-wrapper.properties ke
+          #       minimum Flutter SEBELUM build (8.14.0 = min Flutter 3.47.2;
+          #       kalau flutter-version di atas diganti, sesuaikan angka ini,
+          #       lapis reaktif di step build tetap jadi jaring pengaman).
+          #   (b) REAKTIF — bldfix.py: baca error build di step "Patch Android
+          #       + Build", patch file toolchain yang ditolak, terus retry.
+          cat > /tmp/gradlefix.py <<'PYGW'
+          import os, re, sys
+
+          min_ver = sys.argv[1] if len(sys.argv) > 1 else '8.14.0'
+          min_ver = re.sub(r'\.0$', '', min_ver)  # dist gradle gak ada X.Y.0 (8.14.0 -> 8.14)
+          path = 'android/gradle/wrapper/gradle-wrapper.properties'
+          if not os.path.isfile(path):
+              print('GRADLE-FIX: gak ada gradle-wrapper.properties, skip')
+              sys.exit(0)
+          with open(path, encoding='utf-8') as f:
+              content = f.read()
+          m = re.search(r'distributionUrl\s*=\s*\S*gradle-(\d+(?:\.\d+)*)-(bin|all)\.zip', content)
+          if not m:
+              print('GRADLE-FIX: distributionUrl gak kebaca, skip')
+              sys.exit(0)
+
+          def vkey(v):
+              return [int(x) for x in v.split('.') if x.isdigit()]
+
+          cur = m.group(1)
+          if vkey(cur) >= vkey(min_ver):
+              print('GRADLE-FIX: Gradle ' + cur + ' >= min ' + min_ver + ', aman')
+          else:
+              url = 'https\\://services.gradle.org/distributions/gradle-' + min_ver + '-' + m.group(2) + '.zip'
+              content = re.sub(r'(?m)^distributionUrl\s*=.*$', lambda g: 'distributionUrl=' + url, content)
+              content = re.sub(r'(?m)^distributionSha256Sum\s*=.*\n?', '', content)
+              with open(path, 'w', encoding='utf-8') as f:
+                  f.write(content)
+              print('GRADLE-FIX: Gradle ' + cur + ' < min ' + min_ver + ' -> wrapper di-bump ke ' + min_ver)
+          PYGW
+          cat > /tmp/bldfix.py <<'PYBLD'
+          import os, re
+
+          err = os.environ.get('BLD_ERR', '')
+          applied = []
+          V = r'(\d+(?:\.\d+)*)'
+
+          def vkey(v):
+              return [int(x) for x in v.split('.') if x.isdigit()]
+
+          def patch(path, pat, tgt, label, count=1):
+              if not os.path.isfile(path) or not tgt:
+                  return
+              with open(path, encoding='utf-8') as f:
+                  content = f.read()
+              if count == 0:
+                  content2, n = re.subn(pat, lambda g: g.group(1) + tgt, content)
+                  if n == 0:
+                      return
+                  old = str(n) + ' lokasi'
+              else:
+                  mm = re.search(pat, content)
+                  if not mm:
+                      return
+                  old = mm.group(2)
+                  content2 = content[:mm.start(2)] + tgt + content[mm.end(2):]
+              with open(path, 'w', encoding='utf-8') as f:
+                  f.write(content2)
+              applied.append(label + ' ' + old + ' -> ' + tgt)
+
+          # 1) Gradle wrapper
+          m = re.search(r"Your project's Gradle version \((?:Gradle version )?" + V + r"\) is lower than Flutter's minimum supported version of (?:Gradle version )?" + V, err)
+          if m:
+              tgt = re.sub(r'\.0$', '', m.group(2))  # dist gradle gak ada X.Y.0
+              path = 'android/gradle/wrapper/gradle-wrapper.properties'
+              if os.path.isfile(path):
+                  with open(path, encoding='utf-8') as f:
+                      content = f.read()
+                  mm = re.search(r'distributionUrl\s*=\s*\S*gradle-' + V + r'-(bin|all)\.zip', content)
+                  if mm and vkey(mm.group(1)) < vkey(tgt):
+                      url = 'https\\://services.gradle.org/distributions/gradle-' + tgt + '-' + mm.group(2) + '.zip'
+                      content = re.sub(r'(?m)^distributionUrl\s*=.*$', lambda g: 'distributionUrl=' + url, content)
+                      content = re.sub(r'(?m)^distributionSha256Sum\s*=.*\n?', '', content)
+                      with open(path, 'w', encoding='utf-8') as f:
+                          f.write(content)
+                      applied.append('Gradle wrapper ' + mm.group(1) + ' -> ' + tgt)
+
+          # 2) Android Gradle Plugin
+          m = re.search(r"Your project's Android Gradle Plugin version \((?:Android Gradle Plugin version )?" + V + r"\) is lower than Flutter's minimum supported version of (?:Android Gradle Plugin version )?" + V, err)
+          if m:
+              tgt = m.group(2)
+              patch('android/settings.gradle', r'(?m)(id\s+["\']com\.android\.application["\']\s+version\s+["\'])([\d.]+)', tgt, 'AGP(settings.gradle)')
+              patch('android/settings.gradle.kts', r'(?m)(id\(\s*["\']com\.android\.application["\']\s*\)\s+version\s+["\'])([\d.]+)', tgt, 'AGP(settings.gradle.kts)')
+              patch('android/build.gradle', r'(com\.android\.tools\.build:gradle:)([\d.]+)', tgt, 'AGP(build.gradle)')
+              patch('android/build.gradle.kts', r'(com\.android\.tools\.build:gradle:)([\d.]+)', tgt, 'AGP(build.gradle.kts)')
+
+          # 3) Kotlin Gradle Plugin
+          m = re.search(r"Your project's Kotlin version \((?:Kotlin version )?" + V + r"\) is lower than Flutter's minimum supported version of (?:Kotlin version )?" + V, err)
+          if m:
+              tgt = m.group(2)
+              patch('android/settings.gradle', r'(?m)(id\s+["\']org\.jetbrains\.kotlin(?:\.android)?["\']\s+version\s+["\'])([\d.]+)', tgt, 'KGP(settings.gradle)')
+              patch('android/settings.gradle.kts', r'(?m)(id\(\s*["\']org\.jetbrains\.kotlin(?:\.android)?["\']\s*\)\s+version\s+["\'])([\d.]+)', tgt, 'KGP(settings.gradle.kts)')
+              patch('android/build.gradle', r'(org\.jetbrains\.kotlin:kotlin-gradle-plugin:)([\d.]+)', tgt, 'KGP(build.gradle)')
+              patch('android/build.gradle.kts', r'(org\.jetbrains\.kotlin:kotlin-gradle-plugin:)([\d.]+)', tgt, 'KGP(build.gradle.kts)')
+              patch('android/build.gradle', r'(?m)(ext\.kotlin_version\s*=\s*["\'])([\d.]+)', tgt, 'Kotlin(ext)')
+
+          # 4) minSdk (< 23 ditolak Flutter 3.47.2)
+          m = re.search(r"Your project's minimum Android SDK(?: \(flavor='[^']*'\))? version \((\d+)\) is lower than Flutter's minimum supported version of (\d+)", err)
+          if m:
+              tgt = m.group(2)
+              patch('android/app/build.gradle', r'(?m)(minSdkVersion\s+)(\d+)', tgt, 'minSdk(app/build.gradle)', count=0)
+              patch('android/app/build.gradle.kts', r'(?m)(minSdk\s*=\s*)(\d+)', tgt, 'minSdk(app/build.gradle.kts)', count=0)
+
+          # 5) v5.6: Android v1 EMBEDDING — android/ ada tapi isi-nya jaman batu
+          # (gak ada meta-data flutterEmbedding=2, MainActivity nge-import
+          # io.flutter.app.FlutterApplication era v1). Flutter >=3.35 nolak
+          # mentah-mentah: "Build failed due to use of deleted Android v1
+          # embedding." → migrasi minimal ke v2: inject meta-data flutterEmbedding
+          # + swap import FlutterActivity ke io.flutter.embedding.android + buang
+          # referensi FlutterApplication v1 dari <application>.
+          if 'deleted Android v1 embedding' in err:
+              mani = 'android/app/src/main/AndroidManifest.xml'
+              if os.path.isfile(mani):
+                  with open(mani, encoding='utf-8') as f:
+                      mtxt = f.read()
+                  morig = mtxt
+                  # v6.9: meta-data versi COMMENT dibuang dulu (guard string
+                  # lama bodoh — 'flutterEmbedding' di dalam comment dianggap
+                  # ada → insert ke-skip → error v1 mengulang terus, run #97).
+                  # Value jadul (bukan 2) dipaksa 2, urutan atribut bebas.
+                  mtxt = re.sub(r'<!--.*?flutterEmbedding.*?-->', '', mtxt, flags=re.S)
+                  def _force2(m):
+                      return re.sub(r'android:value="[^"]*"', 'android:value="2"', m.group(0))
+                  mtxt = re.sub(r'<meta-data\s+[^>]*android:name="flutterEmbedding"[^>]*/?>', _force2, mtxt)
+                  if not re.search(r'<meta-data\s+[^>]*android:name="flutterEmbedding"', mtxt):
+                      mtxt = re.sub(r'(<application\b[^>]*>)', r'\1\n        <meta-data android:name="flutterEmbedding" android:value="2" />', mtxt, count=1)
+                  mtxt = mtxt.replace('android:name="io.flutter.app.FlutterApplication"', '')
+                  if mtxt != morig:
+                      with open(mani, 'w', encoding='utf-8') as f:
+                          f.write(mtxt)
+                      applied.append('manifest v1->v2: meta-data flutterEmbedding=2 + FlutterApplication v1 dibuang')
+                  mdone = []
+                  for root, dirs, files in os.walk('android/app/src/main'):
+                      for fn in files:
+                          # v6.9: gak cuma MainActivity — class v1 bisa di file
+                          # manapun (custom Application, activity helper lama).
+                          if fn.endswith(('.java', '.kt')):
+                              p = os.path.join(root, fn)
+                              with open(p, encoding='utf-8') as f:
+                                  stxt = f.read()
+                              sorig = stxt
+                              stxt = stxt.replace('io.flutter.app.FlutterActivity', 'io.flutter.embedding.android.FlutterActivity')
+                              stxt = stxt.replace('io.flutter.app.FlutterApplication', 'android.app.Application')
+                              stxt = re.sub(r'\bFlutterApplication\b', 'Application', stxt)
+                              if stxt != sorig:
+                                  with open(p, 'w', encoding='utf-8') as f:
+                                      f.write(stxt)
+                                  mdone.append(p)
+                  if mdone:
+                      applied.append('swap class embedding v1 -> v2: ' + ', '.join(mdone))
+
+              # v6.9 NUKE: v1 error MUNCUL LAGI setelah light-fix (marker
+              # bldfix_v1_seen dari attempt sebelumnya) → android/ ZIP user
+              # rusak lebih dalem dari yang bisa di-patch → regenerate pake
+              # flutter create (v2 pasti). appid/label/perms di-reapply.
+              # Sekali per job (marker bldfix_v1_nuked).
+              if not os.path.exists('/tmp/bldfix_v1_nuked') and os.path.exists('/tmp/bldfix_v1_seen'):
+                  open('/tmp/bldfix_v1_nuked', 'w').write('ok')
+                  import subprocess as _spn, shutil as _shn
+                  _appid = None
+                  for _gp in ('android/app/build.gradle', 'android/app/build.gradle.kts'):
+                      if os.path.isfile(_gp):
+                          with open(_gp, encoding='utf-8', errors='replace') as f:
+                              _mm = re.search(r'(?m)applicationId\s*=?\s*["\']([\w.]+)["\']', f.read())
+                          if _mm:
+                              _appid = _mm.group(1)
+                              break
+                  _mani0 = 'android/app/src/main/AndroidManifest.xml'
+                  if _appid is None and os.path.isfile(_mani0):
+                      with open(_mani0, encoding='utf-8', errors='replace') as f:
+                          _mm = re.search(r'<manifest[^>]*\bpackage="([\w.]+)"', f.read())
+                      if _mm:
+                          _appid = _mm.group(1)
+                  _pkg = 'app'
+                  if os.path.isfile('pubspec.yaml'):
+                      with open('pubspec.yaml', encoding='utf-8', errors='replace') as f:
+                          _pm = re.search(r'(?m)^\s*name:\s*["\']?([a-zA-Z0-9_]+)', f.read())
+                      if _pm:
+                          _pkg = _pm.group(1)
+                  _shn.rmtree('android', ignore_errors=True)
+                  _spn.run(['flutter', 'create', '--platforms=android', '--org', 'com.dzrbuild', '--project-name', _pkg, '.'], capture_output=True, text=True, timeout=900)
+                  if not os.path.isdir('android'):
+                      applied.append('NUKE v1: flutter create gagal total — android/ hilang')
+                  else:
+                      _mani = 'android/app/src/main/AndroidManifest.xml'
+                      if os.path.isfile(_mani):
+                          with open(_mani, encoding='utf-8') as f:
+                              _mt = f.read()
+                          _label = re.sub(r'[^a-zA-Z0-9 .-]', '', os.environ.get('INPUT_APP_NAME', '') or '')
+                          if _label and _label != 'MyApp':
+                              _mt = re.sub(r'android:label="[^"]*"', 'android:label="' + _label + '"', _mt, count=1)
+                          _ins = ''
+                          for _rp in ('android.permission.INTERNET', 'android.permission.ACCESS_NETWORK_STATE', 'android.permission.ACCESS_WIFI_STATE'):
+                              if 'android:name="' + _rp + '"' not in _mt:
+                                  _ins += '    <uses-permission android:name="' + _rp + '" />\n'
+                          for _rp in (os.environ.get('INPUT_PERMS', '') or '').split(','):
+                              _rp = re.sub(r'[^a-zA-Z0-9._]', '', _rp.strip())
+                              if not _rp:
+                                  continue
+                              if not _rp.startswith('android.permission.'):
+                                  _rp = 'android.permission.' + _rp
+                              if 'android:name="' + _rp + '"' not in _mt:
+                                  _ins += '    <uses-permission android:name="' + _rp + '" />\n'
+                          if _ins:
+                              _mt = re.sub(r'(<application\b[^>]*>)', lambda _m2: _m2.group(1) + '\n' + _ins.rstrip('\n'), _mt, count=1)
+                          with open(_mani, 'w', encoding='utf-8') as f:
+                              f.write(_mt)
+                      if _appid:
+                          for _gp in ('android/app/build.gradle', 'android/app/build.gradle.kts'):
+                              if os.path.isfile(_gp):
+                                  with open(_gp, encoding='utf-8') as f:
+                                      _gt = f.read()
+                                  _gt2 = re.sub(r'(?m)(applicationId\s*=?\s*)["\'][\w.]+["\']', lambda _m3: _m3.group(1) + '"' + _appid + '"', _gt, count=1)
+                                  if _gt2 != _gt:
+                                      with open(_gp, 'w', encoding='utf-8') as f:
+                                          f.write(_gt2)
+                      applied.append('android/ NUKE-REGEN (flutter create) + label/perms/appid re-applied')
+
+          # 6) v5.6: compileSdk ke-rendah buat metadata AAR plugin (run #53
+          # project arshi): "Dependency ':flutter_plugin_android_lifecycle'
+          # requires ... compile against version 36 or later ... :file_picker
+          # is currently compiled against android-34." → bump compileSdk
+          # module yang ke-rendah: plugin di pub-cache, atau :app sendiri.
+          # Angka di build.gradle plugin bisa literal atau flutter.compileSdkVersion.
+          m = re.search(r"Dependency ':[\w.]+'.*?compile against version (\d+) or later of the\s+Android APIs\.\s*:?([\w.]+) is currently compiled against android-(\d+)", err, re.S)
+          if m:
+              import glob as _glob
+              seen_mods = set()
+              for mm in re.finditer(r"Dependency ':([\w.]+)'.*?compile against version (\d+) or later of the\s+Android APIs\.\s*:?([\w.]+) is currently compiled against android-(\d+)", err, re.S):
+                  mod, tgt = mm.group(3), mm.group(2)
+                  if mod in seen_mods:
+                      continue
+                  seen_mods.add(mod)
+                  tgti = int(tgt)
+                  paths = []
+                  if mod == 'app':
+                      for cand in ('android/app/build.gradle', 'android/app/build.gradle.kts'):
+                          if os.path.isfile(cand):
+                              paths.append(cand)
+                  else:
+                      paths = _glob.glob(os.path.expanduser('~/.pub-cache/hosted/pub.dev/' + mod + '-*/android/build.gradle')) + _glob.glob(os.path.expanduser('~/.pub-cache/hosted/pub.dev/' + mod + '-*/android/build.gradle.kts'))
+                  for path in paths:
+                      with open(path, encoding='utf-8') as f:
+                          g = f.read()
+
+                      def _bump_sdk(mmm):
+                          cur = mmm.group(2)
+                          if cur == 'flutter.compileSdkVersion' or int(cur) < tgti:
+                              return mmm.group(1) + tgt
+                          return mmm.group(0)
+
+                      g2 = re.sub(r'(?m)(compileSdk(?:Version)?\s*=?\s*)(\d+|flutter\.compileSdkVersion)', _bump_sdk, g)
+                      if g2 != g:
+                          with open(path, 'w', encoding='utf-8') as f:
+                              f.write(g2)
+                          applied.append('compileSdk ' + mod + ' -> ' + tgt)
+
+          # ── v5.8.5: "cannot find symbol: class <XyzPlugin>" di
+          # GeneratedPluginRegistrant = plugin artifacts gak sinkron abis
+          # dependency_overrides ganti versi plugin (run #88: pub get #1
+          # resolve file_picker 13.1.0 → R6 override 11.0.3 → registrant &
+          # settings gak regenerate total). Fix standar: flutter clean +
+          # pub get → regenerasi penuh. Sekali per build (gate marker),
+          # non-fatal.
+          if re.search(r'GeneratedPluginRegistrant\.java:\d+: error: cannot find symbol', err) and not os.path.exists('/tmp/bldfix_clean_done'):
+              import subprocess as _sp
+              try:
+                  _sp.run(['flutter', 'clean'], capture_output=True, text=True, timeout=240)
+                  _sp.run(['flutter', 'pub', 'get'], capture_output=True, text=True, timeout=420)
+                  applied.append('flutter clean + pub get (registrant basi abis override versi plugin)')
+                  open('/tmp/bldfix_clean_done', 'w').write('ok')
+              except Exception as _e:
+                  print('flutter clean skip (' + repr(_e)[:80] + ')')
+
+          # ── v6.9: "Gradle build failed to produce an .apk file" — project
+          # tulis-tangan/template-lawas pake layout build klasik, flutter tool
+          # nyari APK di <root>/build/app/outputs/flutter-apk → gak ketemu.
+          # Fix: inject blok relokasi build dir ala template baru (idempoten —
+          # cek marker buildDirectory/buildDir sebelum nulis).
+          if 'failed to produce an .apk file' in err:
+              _bdp = []
+              _kts, _gro = 'android/build.gradle.kts', 'android/build.gradle'
+              if os.path.isfile(_kts):
+                  with open(_kts, encoding='utf-8') as f:
+                      _gtxt = f.read()
+                  if '.layout.buildDirectory.value(' not in _gtxt:
+                      _blk = ('\nval newBuildDir: Directory = rootProject.layout.buildDirectory.dir("../../build").get()\n'
+                              'rootProject.layout.buildDirectory.value(newBuildDir)\n'
+                              'subprojects {\n'
+                              '    val newSubprojectBuildDir: Directory = newBuildDir.dir(project.name)\n'
+                              '    project.layout.buildDirectory.value(newSubprojectBuildDir)\n'
+                              '}\n')
+                      with open(_kts, 'w', encoding='utf-8') as f:
+                          f.write(_gtxt.rstrip() + '\n' + _blk)
+                      _bdp.append(_kts)
+              if os.path.isfile(_gro):
+                  with open(_gro, encoding='utf-8') as f:
+                      _gtxt = f.read()
+                  if 'rootProject.buildDir =' not in _gtxt:
+                      _blk = ('\nrootProject.buildDir = "../build"\n'
+                              'subprojects {\n'
+                              '    project.buildDir = "${rootProject.buildDir}/${project.name}"\n'
+                              '}\n')
+                      with open(_gro, 'w', encoding='utf-8') as f:
+                          f.write(_gtxt.rstrip() + '\n' + _blk)
+                      _bdp.append(_gro)
+              if _bdp:
+                  applied.append('relokasi build dir buat flutter tool: ' + ', '.join(_bdp))
+
+          if applied:
+              print('AUTO-FIX toolchain:', '; '.join(applied))
+              with open('/tmp/bldfix_applied', 'w') as f:
+                  f.write('; '.join(applied))
+          else:
+              print('AUTO-FIX: gak ada pola toolchain yang cocok buat dipatch')
+          PYBLD
+          echo "── v5.4 toolchain check: gradle wrapper vs min Flutter ──"
+          python3 /tmp/gradlefix.py "8.14.0" || true
+
+          # ── ⚙️ v5.7 TOOLCHAIN PROAKTIF: AGP + Kotlin vs minimum Flutter ──
+          # bldfix.py reaktif cuma jalan SETELAH build gagal — project bawaan
+          # toolchain tua buang 2 attempt gradle buat error yang 100%
+          # predictable (run #70: AGP 8.9.1 + Kotlin 2.1.0 ditolak Flutter
+          # 3.47.2, baru ke-bump di attempt 2/3). Sekarang di-bump SEBELUM
+          # build pertama; pola & target sama persis sama bldfix.py
+          # (Flutter 3.47.2 DependencyVersionChecker: AGP >= 8.11.1,
+          # Kotlin >= 2.2.20). Proyek yang udah memenuhi gak disentuh.
+          cat > /tmp/agpfix.py <<'PYAGP'
+          import os, re
+
+          MIN_AGP = '8.11.1'
+          MIN_KGP = '2.2.20'
+          applied = []
+
+          def vkey(v):
+              return [int(x) for x in v.split('.') if x.isdigit()]
+
+          def patch1(path, pat, tgt, label):
+              if not os.path.isfile(path):
+                  return
+              try:
+                  with open(path, encoding='utf-8') as f:
+                      src = f.read()
+              except Exception:
+                  return
+              m = re.search(pat, src, re.M)
+              if not m:
+                  return
+              cur = m.group(2)
+              if vkey(cur) >= vkey(tgt):
+                  return
+              src2 = src[:m.start(2)] + tgt + src[m.end(2):]
+              with open(path, 'w', encoding='utf-8') as f:
+                  f.write(src2)
+              applied.append(label + ' ' + cur + ' -> ' + tgt)
+
+          for base in ('android/settings.gradle', 'android/settings.gradle.kts'):
+              patch1(base, r'(id\s+["\']com\.android\.application["\']\s+version\s+["\'])([\d.]+)', MIN_AGP, 'AGP(' + os.path.basename(base) + ')')
+              patch1(base, r'(id\(\s*["\']com\.android\.application["\']\s*\)\s+version\s+["\'])([\d.]+)', MIN_AGP, 'AGP(' + os.path.basename(base) + ')')
+              patch1(base, r'(id\s+["\']org\.jetbrains\.kotlin(?:\.android)?["\']\s+version\s+["\'])([\d.]+)', MIN_KGP, 'KGP(' + os.path.basename(base) + ')')
+              patch1(base, r'(id\(\s*["\']org\.jetbrains\.kotlin(?:\.android)?["\']\s*\)\s+version\s+["\'])([\d.]+)', MIN_KGP, 'KGP(' + os.path.basename(base) + ')')
+          patch1('android/build.gradle', r'(com\.android\.tools\.build:gradle:)([\d.]+)', MIN_AGP, 'AGP(build.gradle)')
+          patch1('android/build.gradle.kts', r'(com\.android\.tools\.build:gradle:)([\d.]+)', MIN_AGP, 'AGP(build.gradle.kts)')
+          patch1('android/build.gradle', r'(org\.jetbrains\.kotlin:kotlin-gradle-plugin:)([\d.]+)', MIN_KGP, 'KGP(build.gradle)')
+          patch1('android/build.gradle.kts', r'(org\.jetbrains\.kotlin:kotlin-gradle-plugin:)([\d.]+)', MIN_KGP, 'KGP(build.gradle.kts)')
+          patch1('android/build.gradle', r'(?m)(ext\.kotlin_version\s*=\s*["\'])([\d.]+)', MIN_KGP, 'Kotlin(ext)')
+
+          if applied:
+              print('TOOLCHAIN-FIX (proaktif):', '; '.join(applied))
+          else:
+              print('TOOLCHAIN-FIX: AGP/Kotlin udah >= minimum Flutter, aman')
+          PYAGP
+          python3 /tmp/agpfix.py || true
+
+      - name: Write Dart Auto-Fix Helper + Patch Packages
+        run: |
+          # ── 🆕 v5.6: step pemisah kedua — GitHub Actions nolak run block
+          # > 21.000 char (max expression length), jadi dartfix + patch
+          # package dipisah dari helper toolchain di step "Write Auto-Fix
+          # Helpers + Toolchain Check".
+          # Isi: dartfix.py (heal error kompilasi Dart, R1-R7) + bump package
+          # gak kompatibel Flutter >=3.27 + patch source font_awesome 11.
+          # ── 🩹 v6.9 RES-DUP SHIELD helper — buang resource dobel (nama sama,
+          # ekstensi beda) di folder res. Penyebab klasik "Duplicate resources":
+          # project bawa ic_launcher.png + ic_launcher.jpg sekaligus (eksport
+          # generator icon) → task merge*Resources gradle mati. Idempoten.
+          cat > /tmp/resdedup.py <<'RESDEDUP'
+          #!/usr/bin/env python3
+          # RES-DUP SHIELD - buang resource duplikat (nama sama, ekstensi beda)
+          # di folder res project android. Android cuma boleh SATU file per nama
+          # resource per folder; png + jpg sekaligus = "Duplicate resources".
+          # Prioritas keep: .png > .webp > .jpg > .jpeg > lainnya.
+          # Idempoten: jalan berkali-kali hasilnya sama. Report: RES-DUP_REMOVED=<n>.
+          import os, sys
+
+          PRIO = {'.png': 0, '.webp': 1, '.jpg': 2, '.jpeg': 3}
+          OUT = '/tmp/resdedup_removed'
+          removed = []
+
+          roots = [r for r in ('android/app/src', 'app/src', 'src') if os.path.isdir(r)]
+          if not roots:
+              print('RES-DUP: gak ada folder src android - skip')
+              sys.exit(0)
+
+          for root in roots:
+              for dpath, dirs, files in os.walk(root):
+                  parts = dpath.replace(os.sep, '/').split('/')
+                  if 'build' in parts or '.git' in parts:
+                      dirs[:] = []
+                      continue
+                  groups = {}
+                  for f in files:
+                      if f.startswith('.') or '.' not in f:
+                          continue
+                      stem, ext = f.rsplit('.', 1)
+                      if not stem or not ext:
+                          continue
+                      groups.setdefault(stem, []).append((f, '.' + ext.lower()))
+                  for stem, fl in groups.items():
+                      exts = set(e for _, e in fl)
+                      if len(exts) < 2:
+                          continue
+                      fl.sort(key=lambda t: (PRIO.get(t[1], 9), t[0]))
+                      for f, _e in fl[1:]:
+                          try:
+                              os.remove(os.path.join(dpath, f))
+                              removed.append(os.path.relpath(os.path.join(dpath, f), root))
+                          except OSError:
+                              pass
+
+          try:
+              with open(OUT, 'w') as fh:
+                  fh.write('\n'.join(removed))
+          except OSError:
+              pass
+          print('RES-DUP_REMOVED=%d' % len(removed))
+          for r in removed[:10]:
+              print('  hapus: ' + r)
+          if len(removed) > 10:
+              print('  ... +%d file lagi' % (len(removed) - 10))
+
+          RESDEDUP
+          cat > /tmp/dartfix.py <<'PYDART'
+          import json, os, re, sys, urllib.request
+
+          # v5.5 DART-FIX: heal error kompilasi Dart setelah pub upgrade
+          # --major-versions naikin major package (API lama dihapus di kode
+          # user / di source package). SEMUA patch di sini ERROR-DRIVEN: cuma
+          # nge-patch file & pola yang beneran kena error di build_output.txt,
+          # jadi project yang aman gak akan tersentuh.
+          out_path = sys.argv[1] if len(sys.argv) > 1 else 'build_output.txt'
+          if not os.path.isfile(out_path):
+              sys.exit(0)
+          with open(out_path, encoding='utf-8', errors='replace') as f:
+              out = f.read()
+
+          applied = []
+          pubspec_changed = False
+          err_files = set(re.findall(r'(?:^|[\s>])((?:lib|test)/[\w./-]+\.dart):\d+:\d+: Error', out, re.M))
+
+          def read_f(p):
+              with open(p, encoding='utf-8') as f:
+                  return f.read()
+
+          def write_f(p, c):
+              with open(p, 'w', encoding='utf-8') as f:
+                  f.write(c)
+
+          def add_overrides(mapping):
+              global pubspec_changed
+              if not os.path.isfile('pubspec.yaml'):
+                  return
+              lines = read_f('pubspec.yaml').split('\n')
+              done = set()
+              res = []
+              sec = False
+              for ln in lines:
+                  if re.match(r'^dependency_overrides\s*:', ln):
+                      sec = True
+                      res.append(ln)
+                      continue
+                  if sec:
+                      if ln[:1] in (' ', '\t'):
+                          mm = re.match(r'^\s*([A-Za-z0-9_.-]+)\s*:', ln)
+                          if mm and mm.group(1) in mapping:
+                              res.append('  ' + mm.group(1) + ': ' + mapping[mm.group(1)])
+                              done.add(mm.group(1))
+                              continue
+                      elif ln.strip() and not ln.startswith('#'):
+                          sec = False
+                  res.append(ln)
+              if not any(re.match(r'^dependency_overrides\s*:', x) for x in lines):
+                  if res and res[-1].strip():
+                      res.append('')
+                  res.append('dependency_overrides:')
+              for pkg, ver in mapping.items():
+                  if pkg not in done:
+                      res.append('  ' + pkg + ': ' + ver)
+              newc = '\n'.join(res)
+              if newc != '\n'.join(lines):
+                  write_f('pubspec.yaml', newc)
+                  pubspec_changed = True
+
+          def latest_same_major(pkg, ver):
+              # rilis stabil terakhir di major yang sama (pub.dev API)
+              try:
+                  req = urllib.request.Request('https://pub.dev/api/packages/' + pkg, headers={'User-Agent': 'dzr-builder'})
+                  with urllib.request.urlopen(req, timeout=25) as r:
+                      data = json.load(r)
+                  maj = ver.split('.')[0]
+                  cands = []
+                  for v in data.get('versions', []):
+                      vv = v['version']
+                      if '+' in vv or '-' in vv or vv.split('.')[0] != maj:
+                          continue
+                      try:
+                          cands.append(tuple(int(x) for x in vv.split('.')))
+                      except ValueError:
+                          pass
+                  if not cands:
+                      return None
+                  return '.'.join(str(x) for x in max(cands))
+              except Exception:
+                  return None
+
+          fp12 = bool(re.search(r"Type 'FilePickerResult' not found|'FilePickerResult' isn't a type", out))
+          fp_done = os.path.exists('/tmp/dartfix_fp_done')
+
+          # R1: flutter_secure_storage >=11 hapus opsi encryptedSharedPreferences
+          for f in err_files:
+              if not os.path.isfile(f) or not re.search(re.escape(f) + r":\d+:\d+: Error: No named parameter with the name 'encryptedSharedPreferences'", out):
+                  continue
+              src = read_f(f)
+              src2 = re.sub(r'encryptedSharedPreferences\s*:\s*(?:true|false)\s*,?\s*', '', src)
+              src2 = re.sub(r'AndroidOptions\(\s*\)', 'AndroidOptions()', src2)
+              if src2 != src:
+                  write_f(f, src2)
+                  applied.append(f + ': encryptedSharedPreferences dibuang (flutter_secure_storage >=11)')
+
+          if fp12 and not fp_done:
+              # R6: file_picker >=12 ngerewrite total API-nya (FilePickerResult +
+              # FilePicker.platform dihapus) → refactor kode terlalu dalem buat
+              # di-regex. Balikin API lama via dependency_overrides ke 11.0.3
+              # (rilis terakhir sebelum rewrite 12.0.0). v5.8: JANGAN maksa
+              # win32 ^6 lagi — file_picker 11.0.3 pairs with win32 ^5.9.0
+              # (kode windows-nya pake API klasik COINIT/HRESULT) dan file
+              # file_picker_windows.dart DIKOMPIL di build Android (run #80:
+              # 30+ error "Member not found: 'COINIT...'" vs win32 6.4.0).
+              if not os.path.exists('/tmp/dartfix_fp_done'):
+                  add_overrides({'file_picker': '11.0.3'})
+                  applied.append('file_picker -> 11.0.3 via dependency_overrides (API lama dikembalikan; win32 gak diutak-atik — v5.8)')
+                  with open('/tmp/dartfix_fp_done', 'w') as f:
+                      f.write('ok')
+          else:
+              # R2/R3: file_picker >=12 API baru (semua static)
+              for f in err_files:
+                  if not os.path.isfile(f):
+                      continue
+                  src = read_f(f)
+                  src2 = re.sub(r'\bFilePicker(?:Windows|Linux|IO|MacOS|Web)\(\)\.', 'FilePicker.', src)
+                  src2 = re.sub(r'\bFilePicker\.platform\.', 'FilePicker.', src2)
+                  if src2 != src:
+                      write_f(f, src2)
+                      applied.append(f + ': API file_picker >=12 (FilePicker static)')
+
+          # R4: geocoding >=4 fungsi top-level dihapus → class Geocoding()
+          for f in err_files:
+              if not os.path.isfile(f) or not re.search(re.escape(f) + r":\d+:\d+: Error: The method '(?:placemarkFromCoordinates|locationFromAddress)' isn't defined", out):
+                  continue
+              src = read_f(f)
+              src2 = re.sub(r'(?<![\w.])placemarkFromCoordinates\(', 'Geocoding().placemarkFromCoordinates(', src)
+              src2 = re.sub(r'(?<![\w.])locationFromAddress\(', 'Geocoding().locationFromAddress(', src2)
+              if src2 != src:
+                  write_f(f, src2)
+                  applied.append(f + ': panggilan geocoding dipindah ke Geocoding().* (geocoding >=4)')
+
+          # R7: API WebView FIKTIF — kode hasil generator/AI kadang manggil
+          # callback yang GAK PERNAH ADA di flutter_inappwebview 6.x:
+          #   - onFileChooser (+ FileChooserParams/Result/Mode): gak ada di
+          #     package manapun; file chooser udah ditangani NATIVE oleh
+          #     InAppWebViewChromeClient.onShowFileChooser → param + method-nya
+          #     aman dibuang TANPA kehilangan fungsi (run #36/#40 project arshi).
+          #   - onDownloadRequested: nama salah; yang bener onDownloadStartRequest
+          #     (signature sama persis: (controller, DownloadStartRequest)).
+          #   - PermissionRequest.grant(): GAK ADA di 6.x — cara yang bener:
+          #     callback onPermissionRequest harus RETURN PermissionResponse(
+          #     resources: ..., action: PermissionResponseAction.GRANT).
+          phantom = re.search(r"No named parameter with the name '(?:onFileChooser|onDownloadRequested)'|'(?:FileChooserParams|FileChooserResult|FileChooserMode)' isn't defined|Method not found: 'FileChooser(?:Params|Result|Mode)'|The method 'grant' isn't defined for the type 'PermissionRequest'", out)
+          if phantom:
+              for f in err_files:
+                  if not os.path.isfile(f):
+                      continue
+                  src = read_f(f)
+                  # R7c: req.grant(req.resources) → return PermissionResponse(GRANT)
+                  src2 = re.sub(r"\b(\w+)\.grant\(\s*\1\.resources\s*\)\s*;",
+                                r"return PermissionResponse(resources: \1.resources, action: PermissionResponseAction.GRANT);", src)
+                  grant_fixed = src2 != src
+                  # R7b: onDownloadRequested -> onDownloadStartRequest
+                  src2b = re.sub(r'\bonDownloadRequested\s*:', 'onDownloadStartRequest:', src2)
+                  src2 = src2b
+                  dropped = []
+
+                  def _drop_param(mo):
+                      dropped.append(mo.group(1))
+                      return ''
+
+                  src2 = re.sub(r'(?m)^[ \t]*onFileChooser\s*:\s*([A-Za-z_]\w*)\s*,?[ \t]*\n', _drop_param, src2)
+                  for mname in sorted(set(dropped)):
+                      mm = re.search(r'(?m)^[ \t]*[A-Za-z_][\w<>,? \t]*[ \t]+' + re.escape(mname) + r'[ \t]*\(', src2)
+                      if not mm:
+                          continue
+                      mline = src2[mm.start():src2.find('\n', mm.start())]
+                      # jangan sampe nyasar ke call site (await X(..) / return X(..) / X = ...)
+                      if re.search(r'\b(?:await|return)\b', mline) or re.search(r'=\s*$', mline) or ('.' + mname) in mline:
+                          continue
+                      brace = src2.find('{', mm.end())
+                      if brace == -1:
+                          continue
+                      depth = 0
+                      end = -1
+                      for i in range(brace, len(src2)):
+                          if src2[i] == '{':
+                              depth += 1
+                          elif src2[i] == '}':
+                              depth -= 1
+                              if depth == 0:
+                                  end = i + 1
+                                  break
+                      if end == -1:
+                          continue
+                      line_start = src2.rfind('\n', 0, mm.start()) + 1
+                      note = '// [DZR dartfix] ' + mname + ' dihapus: callback onFileChooser gak ada di flutter_inappwebview 6.x (file chooser tetep jalan via native).\n'
+                      src2 = src2[:line_start] + note + src2[end:]
+                  if re.search(r'\bFileChooser(?:Params|Result|Mode)\b', src2):
+                      shim = (
+                          '\n// [DZR dartfix] shim: tipe FileChooser* gak ada di flutter_inappwebview 6.x\n'
+                          'enum FileChooserMode { OPEN, OPEN_MULTIPLE, OPEN_FOLDER, SAVE }\n\n'
+                          'class FileChooserParams {\n'
+                          '  final List<String> acceptTypes;\n'
+                          '  final bool isCaptureEnabled;\n'
+                          '  final FileChooserMode mode;\n'
+                          '  const FileChooserParams(\n'
+                          '      {this.acceptTypes = const <String>[],\n'
+                          '      this.isCaptureEnabled = false,\n'
+                          '      this.mode = FileChooserMode.OPEN});\n'
+                          '}\n\n'
+                          'class FileChooserResult {\n'
+                          '  final List<String> filePaths;\n'
+                          '  final FileChooserMode mode;\n'
+                          '  const FileChooserResult({required this.filePaths, required this.mode});\n'
+                          '}\n')
+                      ims = list(re.finditer(r'(?m)^import\s[^;]+;\s*$', src2))
+                      pos = ims[-1].end() if ims else 0
+                      src2 = src2[:pos] + shim + src2[pos:]
+                  if src2 != src:
+                      write_f(f, src2)
+                      r7_note = 'API WebView fiktif dibenerin ('
+                      if grant_fixed:
+                          r7_note += 'PermissionRequest.grant->PermissionResponse(GRANT), '
+                      r7_note += 'onDownloadRequested->onDownloadStartRequest, onFileChooser+method-nya dibuang)'
+                      applied.append(f + ': ' + r7_note)
+
+          # R5: error kompilasi DI DALAM source package pub-cache (package-nya
+          # sendiri gak kompatibel sama SDK) → override ke rilis terakhir
+          # major yang sama (semver-compatible, kode user gak perlu diubah)
+          m = re.search(r'\.pub-cache/hosted/pub\.dev/([a-z0-9_]+)-(\d+(?:\.\d+)*)/', out)
+          if m:
+              pkg, ver = m.group(1), m.group(2)
+              tag = pkg + ':' + ver
+              done_txt = ''
+              if os.path.exists('/tmp/dartfix_pkg_done'):
+                  with open('/tmp/dartfix_pkg_done', encoding='utf-8') as f:
+                      done_txt = f.read()
+              if tag not in done_txt:
+                  latest = latest_same_major(pkg, ver)
+                  if latest and latest != ver:
+                      add_overrides({pkg: latest})
+                      applied.append(pkg + ' ' + ver + ' -> ' + latest + ' (error di source package, override rilis terakhir major sama)')
+                  with open('/tmp/dartfix_pkg_done', 'a', encoding='utf-8') as f:
+                      f.write(tag + '\n')
+
+          # R8 (v5.7): jaring reaktif sisa FaIconData yang lolos migrasi
+          # FA11 — konstruksi eksotis yang gak ke-tangani P1-P5 & FA-NET gak
+          # kepasang. File yang kena error di-rewrite: (a) semua ref
+          # FontAwesomeIcons.X tanpa .data → dapet .data (proteksi FaIcon(
+          # & .data yang udah ada, idempotent), (b) referensi TIPE
+          # FaIconData → IconData.
+          fa_leak = re.search(r"The argument type 'FaIconData' can't be|A value of type 'FaIconData' can't be (?:assigned|returned|used)", out)
+          if fa_leak:
+              for f in err_files:
+                  if not os.path.isfile(f):
+                      continue
+                  src = read_f(f)
+                  if 'FontAwesomeIcons.' not in src and 'FaIconData' not in src:
+                      continue
+                  src2 = re.sub(r'(FaIcon\(\s*)FontAwesomeIcons\.(\w+)', r'\1<<PH8>>\2', src)
+                  src2 = re.sub(r'FontAwesomeIcons\.(\w+)\.data', r'<<PH8>>\1.data', src2)
+                  src2 = re.sub(r'FontAwesomeIcons\.(\w+)', r'FontAwesomeIcons.\1.data', src2)
+                  src2 = src2.replace('<<PH8>>', 'FontAwesomeIcons.')
+                  src2 = re.sub(r'\bFaIconData\b(?!\s*\()', 'IconData', src2)
+                  if src2 != src:
+                      write_f(f, src2)
+                      applied.append(f + ': sisa FaIconData dinetralin (.data + tipe -> IconData)')
+
+          # R9 (v5.7): import lupa — kode generator/AI sering pake prefix
+          # package (mis. http.get) tanpa nulis import-nya (run #72: "The
+          # getter 'http' isn't defined for the type '_DashboardPageState'").
+          # Kalau identifier = package yang udah ada di package_config.json
+          # → tambahin import alias. Kalau belum ada tapi masuk whitelist
+          # umum → tambahin ke pubspec dulu. Pola lain GAK disentuh.
+          def add_dependency(pkg, ver):
+              global pubspec_changed
+              if not os.path.isfile('pubspec.yaml'):
+                  return False
+              src = read_f('pubspec.yaml')
+              if re.search(r'(?m)^\s+' + re.escape(pkg) + r':', src):
+                  return True
+              m = re.search(r'(?m)^dependencies:\s*$', src)
+              if not m:
+                  return False
+              src2 = src[:m.end()] + '\n  ' + pkg + ': ' + ver + src[m.end():]
+              write_f('pubspec.yaml', src2)
+              pubspec_changed = True
+              return True
+
+          def add_import_prefix(f, ident, root_uri, verify=True):
+              src = read_f(f)
+              if re.search(r"^import\s+['\"]package:" + re.escape(ident) + r"/", src, re.M):
+                  return False
+              if re.search(r"\bimport\b[^;\n]*\bas\s+" + re.escape(ident) + r"\b", src):
+                  return False
+              if verify:
+                  root = (root_uri or '').replace('file://', '')
+                  if not root.startswith('/'):
+                      root = os.path.normpath(os.path.join('.dart_tool', root))
+                  hit = os.path.join(root, 'lib', ident + '.dart')
+                  if not os.path.isfile(hit):
+                      libdir = os.path.join(root, 'lib')
+                      if os.path.isdir(libdir):
+                          same = [x for x in sorted(os.listdir(libdir)) if x == ident + '.dart']
+                          hit = os.path.join(libdir, same[0]) if same else None
+                      else:
+                          hit = None
+                  if not hit:
+                      return False
+                  rel = os.path.relpath(hit, os.path.join(root, 'lib')).replace(os.sep, '/')
+              else:
+                  # dep baru ditambahin ke pubspec, belum ke-resolve — buat
+                  # whitelist, layout lib/<nama>.dart standar semua
+                  rel = ident + '.dart'
+              line = "import 'package:" + ident + "/" + rel + "' as " + ident + ";"
+              ms = list(re.finditer(r'(?m)^import\s[^;]+;\s*$', src))
+              if ms:
+                  src = src[:ms[-1].end()] + '\n' + line + src[ms[-1].end():]
+              else:
+                  src = line + '\n' + src
+              write_f(f, src)
+              return True
+
+          KNOWN_MISSING = {
+              'http': '^1.2.0', 'dio': '^5.4.0', 'intl': '^0.19.0',
+              'shared_preferences': '^2.2.0', 'url_launcher': '^6.2.0',
+              'path_provider': '^2.1.0',
+          }
+          pkgcfg = '.dart_tool/package_config.json'
+          deps = {}
+          if os.path.isfile(pkgcfg):
+              try:
+                  with open(pkgcfg, encoding='utf-8') as f:
+                      for p in json.load(f).get('packages', []):
+                          deps[p.get('name')] = p.get('rootUri', '')
+              except Exception:
+                  deps = {}
+          for ident in dict.fromkeys(re.findall(r"(?:lib|test)/[\w./-]+\.dart:\d+:\d+: Error: The (?:getter|method) '(\w+)' isn't defined", out)):
+              if ident in ('toString', 'hashCode', 'runtimeType', 'noSuchMethod'):
+                  continue
+              if ident not in deps and ident not in KNOWN_MISSING:
+                  continue
+              fresh = False
+              if ident not in deps:
+                  if not add_dependency(ident, KNOWN_MISSING[ident]):
+                      continue
+                  fresh = True
+              root_uri = deps.get(ident) if not fresh else None
+              added_imp = False
+              for f in err_files:
+                  if not os.path.isfile(f):
+                      continue
+                  if add_import_prefix(f, ident, root_uri, verify=not fresh):
+                      applied.append(f + ": import 'package:" + ident + "/' as " + ident + " ditambahin")
+                      added_imp = True
+              if added_imp and fresh:
+                  pubspec_changed = True
+
+          # ── 🩹 v5.8 R-FPI: file_picker dipake tanpa import (kode
+          # generatoran) — "Type 'FilePickerResult' not found" & kelas
+          # internal FilePickerWindows/Linux/IO manggil tanpa import. Path
+          # internal dicari DINAMIS di pub-cache (lokasi beda antar versi).
+          def _fp_pkg_root():
+              _u = deps.get('file_picker') if deps else None
+              if not _u:
+                  return None
+              _r = _u.replace('file://', '')
+              if not os.path.isabs(_r):
+                  _r = os.path.normpath(os.path.join('.dart_tool', _r))
+              return _r if os.path.isdir(_r) else None
+
+          _FP_ROOT = _fp_pkg_root()
+
+          def fp_class_import(cls):
+              if not _FP_ROOT:
+                  return None
+              _lib = os.path.join(_FP_ROOT, 'lib')
+              for _root, _dirs, _fs in os.walk(_lib):
+                  for _fn in _fs:
+                      if not _fn.endswith('.dart'):
+                          continue
+                      _p = os.path.join(_root, _fn)
+                      try:
+                          with open(_p, encoding='utf-8') as _fh:
+                              if re.search(r'\bclass\s+' + re.escape(cls) + r'\b', _fh.read()):
+                                  return 'package:file_picker/' + os.path.relpath(_p, _lib).replace(os.sep, '/')
+                      except Exception:
+                          pass
+              return None
+
+          def add_plain_import(f, uri):
+              src = read_f(f)
+              if ("'" + uri + "'" in src) or ('"' + uri + '"' in src):
+                  return False
+              line = "import '" + uri + "';"
+              _ms = list(re.finditer(r'(?m)^import\s[^;]+;\s*$', src))
+              if _ms:
+                  src = src[:_ms[-1].end()] + '\n' + line + src[_ms[-1].end():]
+              else:
+                  src = line + '\n' + src
+              write_f(f, src)
+              return True
+
+          for f in set(re.findall(r"((?:lib|test)/[\w./-]+\.dart):\d+:\d+: (?:Error|Warning): (?:Type 'FilePickerResult' not found|'FilePickerResult' isn't a type)", out)):
+              if os.path.isfile(f) and add_plain_import(f, 'package:file_picker/file_picker.dart'):
+                  applied.append(f + ": import 'package:file_picker/file_picker.dart' ditambahin")
+          for cls in dict.fromkeys(re.findall(r"(?:lib|test)/[\w./-]+\.dart:\d+:\d+: Error: The (?:method|getter) '(FilePicker[A-Z]\w*)' isn't defined", out)):
+              _uri = fp_class_import(cls)
+              if not _uri:
+                  continue
+              for f in set(re.findall(r"((?:lib|test)/[\w./-]+\.dart):\d+:\d+: Error: The (?:method|getter) '" + re.escape(cls) + r"' isn't defined", out)):
+                  if os.path.isfile(f) and add_plain_import(f, _uri):
+                      applied.append(f + ": import '" + _uri + "' ditambahin (kelas internal file_picker)")
+
+          # ── 🛡️ v5.8 R10: FA-NET reaktif — SDK fresh per job = IconData
+          # 'final' lagi sementara pub-cache bisa bawa FA 11 ter-patch
+          # (extends IconData, warisan cache run lain) → "The class 'IconData'
+          # can't be extended outside of its library". Juga arah balik:
+          # "argument type 'IconData' can't be assigned to ... 'FaIconData?'"
+          # (run #79: FaIcon(c.icon)). Fix: fanet2.py dipanggil ulang (sdk
+          # strip + patch + widen) + sweep anotasi FaIconData → IconData.
+          import glob as _g
+          if re.search(r"The class 'IconData' can't be extended outside of its library", out) or re.search(r"The argument type 'IconData\??' can't be assigned to the (?:parameter|variable) type 'FaIconData\??'", out):
+              if os.path.isfile('/tmp/fanet2.py'):
+                  import subprocess as _sp2
+                  _cands = []
+                  for _base in (os.environ.get('PUB_CACHE', ''), os.path.expanduser('~/.pub-cache')):
+                      if _base:
+                          _cands += _g.glob(os.path.join(_base, 'hosted', 'pub.dev', 'font_awesome_flutter-11*', 'lib', 'src', 'icon_data.dart'))
+                  _cmd = ['python3', '/tmp/fanet2.py'] + ([_cands[0]] if _cands else [])
+                  _rr = _sp2.run(_cmd, capture_output=True, text=True, timeout=120)
+                  _tail = ((_rr.stdout or '') + (_rr.stderr or '')).strip().splitlines()
+                  print('R10 FA-NET reaktif: ' + ' | '.join(_tail[-4:])[:300])
+              for f in err_files:
+                  if not os.path.isfile(f):
+                      continue
+                  _s = read_f(f)
+                  if 'FaIconData' not in _s:
+                      continue
+                  _s2 = re.sub(r'\bFaIconData\b(?!\s*\()', 'IconData', _s)
+                  if _s2 != _s:
+                      write_f(f, _s2)
+                      applied.append(f + ': anotasi FaIconData → IconData (R10)')
+
+          # ── 🧹 v5.8.4 R-BRI: import rusak dibuang — "Can't import
+          # '<path>'" / "Not found: 'package:...'" (self-inflicted siklus
+          # sebelumnya atau generatoran) → baris import-nya dihapus biar
+          # siklus berikutnya nyoba jalur yang bener (main lib).
+          for _b2 in dict.fromkeys(re.findall(r"((?:lib|test)/[\w./-]+\.dart):\d+:\d+: Error: Can't import '([^']+)'", out) + re.findall(r"((?:lib|test)/[\w./-]+\.dart):\d+:\d+: Error: Not found: '([^']+)'", out)):
+              _f2, _bad = _b2
+              if not os.path.isfile(_f2):
+                  continue
+              _s2 = read_f(_f2)
+              _cands = {_bad}
+              _mp = re.search(r'pub\.dev/([a-z0-9_]+)-\d[^/]*/(?:lib/)?(.+)$', _bad)
+              if _mp:
+                  _cands.add('package:' + _mp.group(1) + '/' + _mp.group(2))
+              _s3 = _s2
+              for _u in _cands:
+                  _s3 = re.sub(r'(?m)^import\s+[\'"]' + re.escape(_u) + r'[\'"]\s*;\s*\n', '', _s3)
+              if _s3 != _s2:
+                  write_f(_f2, _s3)
+                  applied.append(_f2 + ': import rusak dibuang (' + _bad[:70] + ') — R-BRI')
+
+          # ── 🔧 v5.8.3 R-SYN: kurung gak balans — kode generatoran
+          # kepotong di tengah widget tree → CFE "Can't find ')' to match
+          # '('" + cascade "Expected ';'" + "missing implementations
+          # State.build" (run #81 dashboard_page.dart _buildAccountInfo).
+          # v5.8.1/2 baca konteks baris pembuka pakai NOMOR BARIS CFE —
+          # RUNTUG: R-FPI nambahin import sebelum R-SYN → baris geser →
+          # separator ketuker → repair selalu revert (run #83: 0→0, run
+          # #85: 4→4). v5.8.3: stack kurung dihitung LANGSUNG dari file
+          # aktual (lexer mini, string + comment aware) — nomor baris CFE
+          # cuma buat trigger. Separator dari baris pembuka di file AKTIF
+          # (return/await/assignment → ';', lainnya ','). Tetap FAIL-SAFE:
+          # dart format --output=none before/after — gak jadi parse-able →
+          # revert.
+          import subprocess as _sp3
+
+          def _syn_count(path):
+              # 0 = file parse-able (exit 0, gak nulis apa-apa); else jumlah
+              # baris output yang nyebut file (>= 1).
+              try:
+                  _r = _sp3.run(['dart', 'format', '--output=none', path], capture_output=True, text=True, timeout=180)
+                  if _r.returncode == 0:
+                      return 0
+                  _txt = (_r.stdout or '') + (_r.stderr or '')
+                  _n = 0
+                  for _ln in _txt.splitlines():
+                      if path in _ln:
+                          _n += 1
+                  return max(_n, 1)
+              except Exception:
+                  return -1
+
+          def _unclosed_stack(src):
+              # lexer mini Dart: skip string ('..' / ".." + escape), comment
+              # // dan /* */ → stack delimiter yang gak ke-tutup (char,
+              # no_baris). Interpolation ${...} diperlakukan string biasa —
+              # kalau salah hitung, validasi dart format yang nolong.
+              _stk = []
+              _st = None
+              _esc = _lc = _bc = False
+              _prev = ''
+              _ln = 1
+              for _ch in src:
+                  if _ch == '\n':
+                      _ln += 1
+                      _lc = False
+                  if _lc:
+                      _prev = _ch
+                      continue
+                  if _bc:
+                      if _prev == '*' and _ch == '/':
+                          _bc = False
+                      _prev = _ch
+                      continue
+                  if _st:
+                      if _esc:
+                          _esc = False
+                      elif _ch == '\\':
+                          _esc = True
+                      elif _ch == _st:
+                          _st = None
+                      _prev = _ch
+                      continue
+                  if _ch == '/' and _prev == '/':
+                      _lc = True
+                      _prev = _ch
+                      continue
+                  if _ch == '*' and _prev == '/':
+                      _bc = True
+                      _prev = _ch
+                      continue
+                  if _ch in ('\'', '"'):
+                      _st = _ch
+                  elif _ch in '([{':
+                      _stk.append((_ch, _ln))
+                  elif _ch in ')]}':
+                      if _stk and _stk[-1][0] == {')': '(', ']': '[', '}': '{'}[_ch]:
+                          _stk.pop()
+                  _prev = _ch
+              return _stk
+
+          _syn_trig = dict.fromkeys(re.findall(r"((?:lib|test)/[\w./-]+\.dart):\d+:\d+: Error: (?:Can't find|Expected ';')", out))
+          if _syn_trig:
+              _stmt = re.compile(r'^\s*(?:return\b|await\b|[\w<>,?\[\] ]+\s+\w+\s*=\s*|\w+\s*=\s*)')
+              _closer = {'(': ')', '[': ']', '{': '}'}
+              for _f in _syn_trig:
+                  if not os.path.isfile(_f):
+                      continue
+                  _src = read_f(_f)
+                  _stk = _unclosed_stack(_src)
+                  if not _stk:
+                      continue
+                  _lines = _src.split('\n')
+                  _tail = []
+                  for _op, _ln in reversed(_stk):
+                      _oline = _lines[_ln - 1] if 0 < _ln <= len(_lines) else ''
+                      if _op in '([' and _stmt.match(_oline):
+                          _tail.append(_closer[_op] + ';')
+                      elif _op in '([':
+                          _tail.append(_closer[_op] + ',')
+                      else:
+                          _tail.append(_closer[_op])
+                  _base = _syn_count(_f)
+                  if _base < 0:
+                      continue
+                  _new = _src
+                  if not _new.endswith('\n'):
+                      _new += '\n'
+                  _new += '\n// [DZR dartfix R-SYN] kurung penutup auto\n' + '\n'.join(_tail) + '\n'
+                  write_f(_f, _new)
+                  _after = _syn_count(_f)
+                  if _after < 0 or _after >= _base:
+                      write_f(_f, _src)
+                      print('R-SYN: ' + _f + ' repair GAGAL validasi (' + str(_base) + '→' + str(_after) + '), di-revert')
+                  else:
+                      applied.append(_f + ': kurung penutup di-append di EOF (' + str(len(_tail)) + ' delimiter, parse error ' + str(_base) + '→' + str(_after) + ')')
+
+          # ── 🧩 v5.8 R-STUB: method/kelas GAK PERNAH didefinisi (kode
+          # generatoran kepotong) — run #81: NewsMedia(url: ...) &
+          # _getRoleColor(role) mati 5 percobaan. Dua jalur:
+          # (a) method di class project → sisipin stub dynamic di class itu;
+          # (b) constructor kelas yang gak ada sama sekali → stub
+          #     StatelessWidget (named params ditangkep dari call site).
+          # ── 📦 v5.8.1 R-PCI: kelas yang "isn't defined" sering kali cuma
+          # butuh IMPORT (kelasnya ada di package yang udah di-deps — run
+          # #83: FlutterSecureStorage ke-stub jadi widget gara-gara import
+          # flutter_secure_storage lupa ditulis). Cari kelas di lib/ SEMUA
+          # package deps; ketemu → import ditambahin, bukan di-stub.
+          _pci_cache = {}
+          # v5.8.2: batasi R-PCI ke DIRECT dependency pubspec + skip package
+          # project sendiri. Run #84: (a) stub NewsMedia yang nyasar dalam
+          # kurung rusak ke-import sbg 'package:fmedic2test/dashboard.dart'
+          # (self-import = kacau), (b) class dikejar ke package TRANSITIF
+          # (windows_file_picker / file_picker_platform_interface) yang ilang
+          # pas pub get berikutnya setelah dependency_overrides → import
+          # "Not found" bikin build makin rusak.
+          _PROJ_NAME = ''
+          _DIRECT_DEPS = set()
+          if os.path.isfile('pubspec.yaml'):
+              _psrc = read_f('pubspec.yaml')
+              _mn = re.search(r'(?m)^name:\s*(\S+)', _psrc)
+              if _mn:
+                  _PROJ_NAME = _mn.group(1)
+              _sec = None
+              for _ln2 in _psrc.splitlines():
+                  if re.match(r'^\S', _ln2):
+                      _sec = _ln2.split(':')[0].strip()
+                      continue
+                  if _sec in ('dependencies', 'dev_dependencies', 'dependency_overrides') and re.match(r'^ {2}[A-Za-z0-9_.-]+\s*:', _ln2):
+                      _DIRECT_DEPS.add(_ln2.strip().split(':')[0])
+
+          def pkg_class_import(cls):
+              if cls in _pci_cache:
+                  return _pci_cache[cls]
+              _out = None
+              for _pkg, _uri in (deps or {}).items():
+                  if _pkg == _PROJ_NAME:
+                      continue
+                  if _DIRECT_DEPS and _pkg not in _DIRECT_DEPS:
+                      continue
+                  _r = (_uri or '').replace('file://', '')
+                  if not os.path.isabs(_r):
+                      _r = os.path.normpath(os.path.join('.dart_tool', _r))
+                  _lib = os.path.join(_r, 'lib')
+                  if not os.path.isdir(_lib):
+                      continue
+                  _found = None
+                  try:
+                      for _root, _dirs, _fs in os.walk(_lib):
+                          for _fn in _fs:
+                              if not _fn.endswith('.dart'):
+                                  continue
+                              _p = os.path.join(_root, _fn)
+                              try:
+                                  with open(_p, encoding='utf-8') as _fh:
+                                      if re.search(r'\bclass\s+' + re.escape(cls) + r'\b', _fh.read()):
+                                          _found = _p
+                                          break
+                              except Exception:
+                                  pass
+                          if _found:
+                              break
+                  except Exception:
+                      pass
+                  if _found:
+                      # v5.8.5: kelas WAJIB ketemu di walk dulu (verifikasi),
+                      # baru balikin URI MAIN LIB (API publik — run #86: path
+                      # internal gak resolve di versi lain). Tanpa verifikasi
+                      # → bogus import buat kelas yang gak ada + R-STUB ke-
+                      # skip (run #87). Fallback: path internal hasil walk.
+                      _main = os.path.join(_lib, _pkg + '.dart')
+                      _out = ('package:' + _pkg + '/' + _pkg + '.dart'
+                              if os.path.isfile(_main)
+                              else 'package:' + _pkg + '/' + os.path.relpath(_found, _lib).replace(os.sep, '/'))
+                      break
+              _pci_cache[cls] = _out
+              return _out
+
+          _STUB_MAX = 30
+          _stub_done = set()
+
+          def _lib_files():
+              _acc = []
+              for _r2, _d2, _fs2 in os.walk('lib'):
+                  for _fn2 in _fs2:
+                      if _fn2.endswith('.dart'):
+                          _acc.append(os.path.join(_r2, _fn2))
+              return _acc
+
+          def _find_class_file(cls):
+              for _p in _lib_files():
+                  try:
+                      with open(_p, encoding='utf-8') as _fh:
+                          if re.search(r'\bclass\s+' + re.escape(cls) + r'\b', _fh.read()):
+                              return _p
+                  except Exception:
+                      pass
+              return None
+
+          def _class_close_pos(_src, cls):
+              _m = re.search(r'(?m)^(?:@\w+\s*\n\s*)*(?:abstract\s+|sealed\s+|base\s+|final\s+)*class\s+' + re.escape(cls) + r'\b[^{]*\{', _src)
+              if not _m:
+                  return None
+              _depth = 0
+              for _i in range(_m.end() - 1, len(_src)):
+                  if _src[_i] == '{':
+                      _depth += 1
+                  elif _src[_i] == '}':
+                      _depth -= 1
+                      if _depth == 0:
+                          return _i
+              return None
+
+          def _scan_calls(ident):
+              _named, _posc = [], 0
+              _pat = re.compile(r'(?<![\w.])' + re.escape(ident) + r'\(')
+              for _p in _lib_files():
+                  try:
+                      _src = read_f(_p)
+                  except Exception:
+                      continue
+                  for _m in _pat.finditer(_src):
+                      _seg = _src[_m.end():_m.end() + 500]
+                      _depth, _end = 1, -1
+                      for _i, _ch in enumerate(_seg):
+                          if _ch == '(':
+                              _depth += 1
+                          elif _ch == ')':
+                              _depth -= 1
+                              if _depth == 0:
+                                  _end = _i
+                                  break
+                      if _end < 0:
+                          continue
+                      _parts, _d, _cur = [], 0, ''
+                      for _ch in _seg[:_end]:
+                          if _ch in '([{':
+                              _d += 1
+                          elif _ch in ')]}':
+                              _d -= 1
+                          if _ch == ',' and _d == 0:
+                              _parts.append(_cur)
+                              _cur = ''
+                          else:
+                              _cur += _ch
+                      if _cur.strip():
+                          _parts.append(_cur)
+                      for _part in _parts:
+                          _nm = re.match(r'^\s*(\w+)\s*:\s', _part)
+                          if _nm:
+                              _named.append(_nm.group(1))
+                          elif _part.strip():
+                              _posc += 1
+              return list(dict.fromkeys(_named)), _posc
+
+          for _mm in re.finditer(r"(?:lib|test)/[\w./-]+\.dart:\d+:\d+: Error: The method '(\w+)' isn't defined for the type '(\w+)'", out):
+              _ident, _cls = _mm.group(1), _mm.group(2)
+              _key = _ident + '@' + _cls
+              if _key in _stub_done or len(_stub_done) >= _STUB_MAX:
+                  continue
+              if _ident in ('toString', 'hashCode', 'runtimeType', 'noSuchMethod', 'build', 'initState', 'dispose', 'didUpdateWidget', 'createState'):
+                  continue
+              _puri = fp_class_import(_ident) or pkg_class_import(_ident)
+              if _puri:
+                  # kelasnya cuma butuh import (R-PCI) — jangan di-stub
+                  _ef2 = re.search(r"((?:lib|test)/[\w./-]+\.dart):\d+:\d+: Error: The method '" + re.escape(_ident) + r"'", out)
+                  if _ef2 and os.path.isfile(_ef2.group(1)) and add_plain_import(_ef2.group(1), _puri):
+                      applied.append(_ef2.group(1) + ": import '" + _puri + "' ditambahin (kelas " + _ident + " dari package — R-PCI)")
+                  _stub_done.add(_key)
+                  continue
+              if _ident in deps or fp_class_import(_ident):
+                  continue
+              _cls_file = _find_class_file(_cls)
+              if not _cls_file:
+                  continue
+              if _find_class_file(_ident):
+                  continue
+              _named, _posc = _scan_calls(_ident)
+              if re.match(r'^[A-Z]', _ident):
+                  # (b) stub kelas widget
+                  _ef = re.search(r"((?:lib|test)/[\w./-]+\.dart):\d+:\d+: Error: The method '" + re.escape(_ident) + r"'", out)
+                  _tgt = _ef.group(1) if _ef and os.path.isfile(_ef.group(1)) else _cls_file
+                  _tsrc = read_f(_tgt)
+                  if _named:
+                      _sig = '{super.key, ' + ', '.join('this.' + n for n in _named) + '}'
+                      _fields = '\n'.join('  final dynamic %s;' % n for n in _named)
+                  elif _posc:
+                      _sig = '[' + ', '.join('this.p%d' % i for i in range(min(_posc, 4))) + ']'
+                      _fields = '\n'.join('  final dynamic p%d;' % i for i in range(min(_posc, 4)))
+                  else:
+                      _sig = '{super.key}'
+                      _fields = ''
+                  _stub = ('\n// [DZR dartfix R-STUB] stub kelas ' + _ident + ' (definisi gak ada di project)\n'
+                           'class ' + _ident + ' extends StatelessWidget {\n'
+                           '  const ' + _ident + '(' + _sig + ');\n'
+                           + (_fields + '\n' if _fields else '')
+                           + '  @override\n'
+                           '  Widget build(BuildContext context) => const SizedBox.shrink();\n'
+                           '}\n')
+                  if 'package:flutter/widgets.dart' not in _tsrc and 'package:flutter/material.dart' not in _tsrc:
+                      _tsrc = "import 'package:flutter/widgets.dart';\n" + _tsrc
+                  if not _tsrc.endswith('\n'):
+                      _tsrc += '\n'
+                  write_f(_tgt, _tsrc + _stub)
+                  applied.append(_tgt + ': stub kelas ' + _ident + ' extends StatelessWidget dibikin')
+                  _stub_done.add(_key)
+              else:
+                  # (a) stub method di class _cls
+                  _src = read_f(_cls_file)
+                  _bpos = _class_close_pos(_src, _cls)
+                  if _bpos is None:
+                      continue
+                  if _named:
+                      _params = '{' + ', '.join('dynamic ' + n for n in _named) + '}'
+                  elif _posc:
+                      _params = '[' + ', '.join('dynamic p%d' % i for i in range(min(_posc, 4))) + ']'
+                  else:
+                      _params = ''
+                  _stub = ('\n  // [DZR dartfix R-STUB] stub method ' + _ident + ' (definisi gak ada)\n'
+                           '  dynamic ' + _ident + '(' + _params + ') => null;\n')
+                  write_f(_cls_file, _src[:_bpos] + _stub + _src[_bpos:])
+                  applied.append(_cls_file + ': stub method ' + _ident + '() disisipin di class ' + _cls)
+                  _stub_done.add(_key)
+
+          if applied:
+              print('DART-FIX:', '; '.join(applied))
+              with open('/tmp/dartfix_applied', 'w') as f:
+                  f.write('; '.join(applied))
+              if pubspec_changed:
+                  with open('/tmp/dartfix_pubspec', 'w') as f:
+                      f.write('ok')
+          else:
+              print('DART-FIX: gak ada pola error Dart yang dikenali')
+          PYDART
+
+          # Auto-fix incompatible packages
+          FLUTTER_VER=$(flutter --version 2>/dev/null | head -1 | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "0.0.0")
+          FLUTTER_MAJOR=$(echo "$FLUTTER_VER" | cut -d. -f1)
+          FLUTTER_MINOR=$(echo "$FLUTTER_VER" | cut -d. -f2)
+          CHANGED=false
+          if [ "$FLUTTER_MAJOR" -ge 3 ] && [ "$FLUTTER_MINOR" -ge 27 ]; then
+            # ── 🆕 v5.6 FIX: sed lama 's/flutter_launcher_icons:.*$/.../' nge-match
+            # SEMUA baris yang ngandung pola — termasuk HEADER SECTION config
+            # `flutter_launcher_icons:` di root pubspec → header jadi
+            # `flutter_launcher_icons: ^0.14.0` → baris `image_path:` berikutnya
+            # dianggap lanjutan scalar → pubspec.yaml YAML INVALID → SEMUA
+            # perintah flutter mati "Error on line 31, column 13: Mapping
+            # values are not allowed here" (root cause gagal build run #36/#40
+            # project arshi). Sekarang cuma baris yang punya NOMOR VERSI di
+            # belakang titik dua (entri dev_dependencies) yang diganti; section
+            # header & komentar gak tersentuh.
+            if grep -qP "^\s*font_awesome_flutter:\s*[\"']?\^?10\." pubspec.yaml 2>/dev/null; then
+              sed -i "s/^\([[:space:]]*\)font_awesome_flutter:[[:space:]]*[\"']\{0,1\}\^\{0,1\}10\..*/\1font_awesome_flutter: ^11.0.0/" pubspec.yaml
+              CHANGED=true
+            fi
+            if grep -qP "^\s*flutter_launcher_icons:\s*[\"']?0\.(0|1|2|3|4|5|6|7|8|9|10|11|12|13)\." pubspec.yaml 2>/dev/null; then
+              sed -i "s/^\([[:space:]]*\)flutter_launcher_icons:[[:space:]]*[\"']\{0,1\}0\.[0-9][^#]*/\1flutter_launcher_icons: ^0.14.0/" pubspec.yaml
+              CHANGED=true
+            fi
+          fi
+          if [ "$CHANGED" = true ]; then
+            flutter pub get || true
+          fi
+
+          # Patch FA 11.0.0 source (unconditional)
+          if [ ! -d "lib" ]; then exit 0; fi
+          FA_USED=false
+          if grep -q 'font_awesome_flutter' pubspec.yaml 2>/dev/null; then FA_USED=true; fi
+          FA_IN_SRC=false
+          if grep -rq 'FontAwesomeIcons' lib/ 2>/dev/null; then FA_IN_SRC=true; fi
+          if [ "$FA_USED" != "true" ] && [ "$FA_IN_SRC" != "true" ]; then exit 0; fi
+
+          python3 - << 'PYSCRIPT'
+          import os, re, sys
+          PH = 'FAARG_DOT_'
+          def patch_file(filepath):
+              with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+                  content = f.read()
+              original = content
+              changes = []
+              # v5.7.4: migrasi FA11 dipesarkin — mekanisme .data (P2/P3) &
+              # const-strip (P4) DIHAPUS karena FA-NET bikin FaIconData
+              # extends IconData (subtype) → konstanta FA LANGSUNG valid
+              # buat semua param IconData? TANPA .data. Bonus: konteks const
+              # gak rusak lagi (P4 suka nyamber const constructor dalam
+              # radius 10 baris — E2E run #77: const OtaxApp({super.key})
+              # ke-strip → "Cannot invoke a non-'const' constructor").
+              # Net gagal terpasang → DART-FIX R8 yang nyembuhin reaktif.
+              new = re.sub(r'\bIcon\(FontAwesomeIcons\.', 'FaIcon(FontAwesomeIcons.', content)
+              if new != content: changes.append('P1'); content = new
+              if new != content: changes.append('P5'); content = new
+              # v5.8 P6: anotasi tipe FaIconData di kode project → IconData.
+              # FaIconData sekarang subtype IconData (FA-NET v2) tapi IconData
+              # GAK BISA di-assign ke var bertipe FaIconData (run #79:
+              # landing.dart:453 & #80 pasar_online_page.dart:1709 "argument
+              # type 'IconData' can't be assigned to ... 'FaIconData?'").
+              new = re.sub(r'\bFaIconData\b(?!\s*\()', 'IconData', content)
+              if new != content: changes.append('P6'); content = new
+              if content != original:
+                  with open(filepath, 'w', encoding='utf-8') as f: f.write(content)
+                  return True
+              return False
+          patched = 0
+          for root, dirs, files in os.walk('lib'):
+              for fname in files:
+                  if fname.endswith('.dart'):
+                      try:
+                          if patch_file(os.path.join(root, fname)): patched += 1
+                      except: pass
+          print(f'Patched: {patched}')
+          with open('/tmp/fa_cnt.txt', 'w') as f: f.write(str(patched))
+          PYSCRIPT
+          PC=$(cat /tmp/fa_cnt.txt 2>/dev/null || echo "0")
+          if [ "$PC" -gt 0 ] 2>/dev/null; then flutter pub get || true; fi
+
+          # ── 🛡️ v5.8 FA-NET v2: 3 langkah INDEPENDEN — GAK ADA
+          # early-return yang nge-skip langkah lain. BUG (run #79/#80/#81):
+          # pub-cache di-restore dari cache run sebelumnya (berisi FA 11
+          # TER-PATCH "extends IconData") → check idempotensi "udah extends"
+          # → sys.exit(0) → SDK final-strip GAK JALAN, padahal SDK Flutter
+          # dipasang FRESH tiap job (IconData 'final' lagi) → "The class
+          # 'IconData' can't be extended outside of its library" di attempt
+          # pertama, 5 percobaan tetap mati.
+          cat > /tmp/fanet2.py <<'PYFANET2'
+          import os, re, sys
+
+          def sdk_strip():
+              # (1) Flutter SDK: buang modifier 'final' dari class IconData
+              # (SDK ephemeral per job — dicek di SEMUA kasus FA, idempotent:
+              # cuma nyentuh kalau masih 'final class IconData').
+              try:
+                  import subprocess as _sp
+                  _sdk = os.environ.get('FLUTTER_ROOT', '')
+                  if not _sdk:
+                      _wf = _sp.check_output(['which', 'flutter']).decode().strip()
+                      _fl = _sp.check_output(['readlink', '-f', _wf]).decode().strip()
+                      _sdk = os.path.dirname(os.path.dirname(_fl))
+                  _ip = os.path.join(_sdk, 'packages', 'flutter', 'lib', 'src', 'widgets', 'icon_data.dart')
+                  if os.path.isfile(_ip):
+                      with open(_ip, encoding='utf-8') as f:
+                          _isrc = f.read()
+                      if 'final class IconData' in _isrc:
+                          _isrc2 = _isrc.replace('final class IconData', 'class IconData', 1)
+                          with open(_ip, 'w', encoding='utf-8') as f:
+                              f.write(_isrc2)
+                          print('FA-NET SDK: modifier final IconData dibuang → FaIconData extends legal (' + _sdk + ')')
+                      else:
+                          print('FA-NET SDK: IconData udah gak final, skip')
+                  else:
+                      print('FA-NET SDK: icon_data.dart SDK gak ketemu, skip')
+              except Exception as _e:
+                  print('FA-NET SDK: skip (' + repr(_e)[:80] + ')')
+
+          def patch_fa_pkg(p):
+              # (2) FA package: FaIconData extends IconData (+ super(0)
+              # const-safe) — idempotent; skip kalau cache udah ter-patch.
+              if not p or not os.path.isfile(p):
+                  print('FA-NET: icon_data.dart gak ada, skip')
+                  return
+              with open(p, encoding='utf-8') as f:
+                  src = f.read()
+              if 'class FaIconData extends IconData' in src:
+                  print('FA-NET: FaIconData udah extends IconData, skip')
+                  return
+              src2 = src.replace('final class FaIconData {', 'final class FaIconData extends IconData {', 1)
+              src2 = src2.replace('const FaIconData(this.data);', 'const FaIconData(this.data) : super(0);', 1)
+              if src2 == src or 'class FaIconData extends IconData' not in src2:
+                  print('FA-NET: pola source FA 11 gak dikenali, skip')
+                  return
+              with open(p, 'w', encoding='utf-8') as f:
+                  f.write(src2)
+              print('FA-NET: FaIconData extends IconData — konstanta FA valid buat param IconData?')
+
+          def widen_faicon(fa_root):
+              # (3) FaIcon nerima IconData? apa adanya (run #79:
+              # FaIcon(c.icon) dengan c.icon = IconData biasa mati
+              # "argument type 'IconData' can't be assigned to the parameter
+              # type 'FaIconData?'"). fa_icon.dart: field _icon + ctor param
+              # + getter override + local var di build().
+              if not fa_root or not os.path.isdir(fa_root):
+                  return
+              p = os.path.join(fa_root, 'lib', 'src', 'fa_icon.dart')
+              if not os.path.isfile(p):
+                  return
+              with open(p, encoding='utf-8') as f:
+                  src = f.read()
+              if 'FaIconData?' not in src:
+                  print('FA-NET WIDEN: FaIcon udah nerima IconData, skip')
+                  return
+              src2 = src.replace('final FaIconData? _icon;', 'final IconData? _icon;', 1)
+              src2 = re.sub(r'const FaIcon\(\s*FaIconData\? icon, \{', 'const FaIcon(\n    IconData? icon, {', src2, count=1)
+              src2 = src2.replace('IconData? get icon => _icon?.data;', 'IconData? get icon => _icon;', 1)
+              src2 = src2.replace('final IconData? icon = _icon?.data;', 'final IconData? icon = _icon;', 1)
+              if src2 != src:
+                  with open(p, 'w', encoding='utf-8') as f:
+                      f.write(src2)
+                  print('FA-NET WIDEN: FaIcon(param IconData?) — IconData & FaIconData dua-duanya diterima')
+              else:
+                  print('FA-NET WIDEN: pola fa_icon.dart gak dikenali, skip')
+
+          sdk_strip()
+          _p = sys.argv[1] if len(sys.argv) > 1 else ''
+          _fa_root = ''
+          if _p and os.path.isfile(_p):
+              # .../font_awesome_flutter-11.x.y/lib/src/icon_data.dart → root paket
+              _fa_root = os.path.dirname(os.path.dirname(os.path.dirname(_p)))
+              patch_fa_pkg(_p)
+          widen_faicon(_fa_root)
+          PYFANET2
+          FAICON_FILE=""
+          for CACHEDIR in "${PUB_CACHE:-$HOME/.pub-cache}" "$HOME/.pub-cache" "$HOME/.pub-cache/hosted/pub.dev"; do
+            FAICON_FILE=$(find "$CACHEDIR" -maxdepth 8 -path '*font_awesome_flutter-11*' -name 'icon_data.dart' 2>/dev/null | head -1)
+            [ -n "$FAICON_FILE" ] && break
+          done
+          if [ -n "$FAICON_FILE" ]; then
+            echo "── v5.8 FA-NET v2: $FAICON_FILE ──"
+            python3 /tmp/fanet2.py "$FAICON_FILE" || true
+          else
+            echo "FA-NET v2: icon_data.dart FA 11 gak ketemu di pub-cache, skip"
+          fi
+
+      # ── 🩺 v3.8.0: DOKTER ICON — input icon_url yang sejak awal nganggur
+      # sekarang DIPAKE: icon dari URL → dipasang ke semua mipmap. Gak ada
+      # URL + project gak bawa ic_launcher sama sekali → generate premium
+      # (gradient + inisial nama app, konsisten dgn auto-icon Web2APK v3.6).
+      # Icon yang udah ada di project user GAK disentuh. ──
+      - name: Doctor (icon fallback/auto-generate)
+        if: inputs.build_format == 'apk' || inputs.build_format == 'both'
+        env:
+          DOCTOR_ICON_URL: ${{ inputs.icon_url }}
+        run: |
+          if [ -n "$(find android -path '*res/mipmap*' -name 'ic_launcher*' -not -path '*/build/*' 2>/dev/null)" ]; then
+            echo "🩺 icon launcher udah ada di project — gak disentuh"
+            exit 0
+          fi
+          SRC=""
+          if [ -n "$DOCTOR_ICON_URL" ]; then
+            if curl -sL --max-time 20 -o /tmp/icon_src.bin "$DOCTOR_ICON_URL"; then
+              if file /tmp/icon_src.bin | grep -qiE 'image|bitmap'; then
+                SRC=/tmp/icon_src.bin
+                echo "🩺 icon dari icon_url ke-download ($(du -h /tmp/icon_src.bin | cut -f1))"
+              fi
+            fi
+          fi
+          python3 -c "import PIL" 2>/dev/null || pip3 install -q pillow || true
+          DOCTOR_ICON_SRC="$SRC" python3 << 'PILGEN'
+          import os
+
+          try:
+              from PIL import Image, ImageDraw, ImageFont
+          except Exception:
+              print('PILGEN: pillow gak tersedia — icon dilewat (non-fatal)')
+              raise SystemExit(0)
+
+          APP = os.environ.get('INPUT_APP_NAME', 'MyApp') or 'MyApp'
+          SRC = os.environ.get('DOCTOR_ICON_SRC', '')
+
+          sizes = {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96, 'xxhdpi': 144, 'xxxhdpi': 192}
+          base = 'android/app'
+          if SRC and os.path.isfile(SRC):
+              try:
+                  img = Image.open(SRC).convert('RGBA')
+                  for q, px in sizes.items():
+                      odir = os.path.join(base, 'res', 'mipmap-' + q)
+                      os.makedirs(odir, exist_ok=True)
+                      img.resize((px, px), Image.LANCZOS).save(os.path.join(odir, 'ic_launcher.png'))
+                  print('PILGEN: icon dari icon_url kepasang ke mipmap-*')
+                  raise SystemExit(0)
+              except SystemExit:
+                  raise
+              except Exception as e:
+                  print('PILGEN: icon_url gagal diproses (' + str(e) + ') → fallback generator')
+
+          import hashlib
+          h = int(hashlib.md5(APP.encode()).hexdigest(), 16)
+          hue1, hue2 = h % 360, (h % 360 + 55) % 360
+
+          def hsl(hdeg, s, l):
+              s /= 100; l /= 100
+              k = lambda n: (n + hdeg / 30) % 12
+              f = lambda n: l - s * min(l, 1 - l) * max(-1, min(k(n) - 3, 9 - k(n), 1))
+              return tuple(int(255 * x) for x in (f(0), f(8), f(4)))
+
+          c1, c2 = hsl(hue1, 72, 52), hsl(hue2, 70, 40)
+          S = 512
+          img = Image.new('RGB', (S, S))
+          d = ImageDraw.Draw(img)
+          for y in range(S):
+              t = y / (S - 1)
+              d.line([(0, y), (S, y)], fill=tuple(int(a + (b - a) * t) for a, b in zip(c1, c2)))
+          d.ellipse((-S * 0.25, S * 0.55, S * 0.9, S * 1.6), outline=(255, 255, 255), width=10)
+          words = [w for w in APP.split() if w][:2]
+          ini = ''.join(w[0] for w in words).upper() or 'AP'
+          font = None
+          for fp in ('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+                     '/usr/share/fonts/truetype/freefont/FreeSansBold.ttf'):
+              if os.path.isfile(fp):
+                  font = ImageFont.truetype(fp, 200)
+                  break
+          if font is None:
+              font = ImageFont.load_default()
+          tb = d.textbbox((0, 0), ini, font=font)
+          d.text(((S - (tb[2] - tb[0])) / 2 - tb[0], (S - (tb[3] - tb[1])) / 2 - tb[1]), ini,
+                 fill=(255, 255, 255), font=font)
+          for q, px in sizes.items():
+              odir = os.path.join(base, 'res', 'mipmap-' + q)
+              os.makedirs(odir, exist_ok=True)
+              img.resize((px, px), Image.LANCZOS).save(os.path.join(odir, 'ic_launcher.png'))
+          print('PILGEN: icon premium "' + ini + '" ke-generate ke android/app/res/mipmap-*')
+          PILGEN
+          # manifest gak punya android:icon → kasih (biar icon kepasang beneran)
+          MAN="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MAN" ] && ! grep -q "android:icon=" "$MAN"; then
+            sed -i 's|<application|<application android:icon="@mipmap/ic_launcher"|' "$MAN"
+            echo "🩺 android:icon=@mipmap/ic_launcher ke-inject ke manifest"
+          fi
+
+      # ── 🛡️ v4.3 BENTENG LISENSI — tulis helper guard (murah, selalu jalan) ──
+      - name: Write License Guard helper
+        run: |
+          cat > /tmp/dzr_license_guard.py <<'DZRGUARD'
+          #!/usr/bin/env python3
+          # -*- coding: utf-8 -*-
+          # 🛡️ DZR CloudBuilder v4.3.0 — BENTENG LISENSI (anti-repack guard installer)
+          # Jalan di GitHub Actions SEBELUM compile (step "Benteng Lisensi"):
+          #   1. ambil keystore per-user (terenkripsi di repo) → dekrip → SHA-256 cert
+          #      (keystore belum ada? generate + commit terenkripsi, race-guard —
+          #       identik pola signing block, biar signature konsisten)
+          #   2. tulis LicenseGuard.kt / .java (EXPECTED = sha cert) di package launcher
+          #   3. patch onCreate → LicenseGuard.check(this) SETELAH super.onCreate
+          # Runtime: app cek signature APK-nya sendiri; beda dari asli = layar merah
+          # "APK TIDAK SAH" + mati (fail-closed). Repack/re-sign orang lain = kekang.
+          # Env: GUARD_MODE=flutter|kotlin · INPUT_KEYSTORE_ID · GH_TOKEN · GH_REPO ·
+          #      KS_ENC_KEY · KS_PASS · KS_PASS_OLD · (GUARD_OFFLINE=1 utk test lokal)
+          import os, sys, json, base64, glob, re, subprocess, urllib.request, urllib.error
+
+          def fail(msg):
+              print("=== BUILD FAILED: " + msg + " ===")
+              sys.exit(1)
+
+          MODE = os.environ.get("GUARD_MODE", "flutter").strip()
+          GH_TOKEN = os.environ.get("GH_TOKEN", "")
+          GH_REPO = os.environ.get("GH_REPO", "")
+          KS_ENC_KEY = os.environ.get("KS_ENC_KEY", "")
+          KS_PASS = os.environ.get("KS_PASS", "")
+          KS_PASS_OLD = os.environ.get("KS_PASS_OLD", "")
+          KID = re.sub(r"[^a-zA-Z0-9]", "", os.environ.get("INPUT_KEYSTORE_ID", "") or "")
+          OFFLINE = os.environ.get("GUARD_OFFLINE", "") == "1"
+          API = "https://api.github.com/repos/" + GH_REPO + "/contents/"
+
+          KT_GUARD = """// 🛡️ Benteng Lisensi v4.3 — auto-generated oleh DZR CloudBuilder
+          // Verifikasi signature asli: app hasil repack / re-sign ilegal = nolak jalan.
+          package __PKG__
+
+          object LicenseGuard {
+              private const val EXPECTED = "__SHA__"
+
+              @JvmStatic
+              fun check(activity: android.app.Activity) {
+                  try {
+                      val pm = activity.packageManager
+                      val pi = pm.getPackageInfo(
+                          activity.packageName,
+                          android.content.pm.PackageManager.GET_SIGNATURES
+                      )
+                      val sigs = pi.signatures
+                      if (sigs == null || sigs.isEmpty()) { fail(activity); return }
+                      val md = java.security.MessageDigest.getInstance("SHA-256")
+                      val hex = md.digest(sigs[0].toByteArray())
+                          .joinToString("") { String.format("%02x", it) }
+                      if (!hex.equals(EXPECTED, ignoreCase = true)) fail(activity)
+                  } catch (t: Throwable) {
+                      fail(activity)
+                  }
+              }
+
+              private fun fail(a: android.app.Activity) {
+                  try {
+                      val pad = android.widget.LinearLayout(a)
+                      pad.orientation = android.widget.LinearLayout.VERTICAL
+                      pad.gravity = android.view.Gravity.CENTER
+                      pad.setBackgroundColor(0xFFB00020.toInt())
+                      val tv = android.widget.TextView(a)
+                      tv.text = "APK TIDAK SAH\\n\\nBuild ini bukan rilis resmi —\\naplikasi sudah dimodifikasi tanpa izin.\\n\\nSilakan install versi asli dari pengembang."
+                      tv.setTextColor(-1)
+                      tv.textSize = 16f
+                      tv.gravity = android.view.Gravity.CENTER
+                      tv.setPadding(64, 64, 64, 64)
+                      pad.addView(tv)
+                      a.setContentView(pad)
+                  } catch (_: Throwable) {
+                  }
+                  try { a.finishAffinity() } catch (_: Throwable) {
+                  }
+                  android.os.Process.killProcess(android.os.Process.myPid())
+              }
+          }
+          """
+
+          JAVA_GUARD = """// 🛡️ Benteng Lisensi v4.3 — auto-generated oleh DZR CloudBuilder
+          // Verifikasi signature asli: app hasil repack / re-sign ilegal = nolak jalan.
+          package __PKG__;
+
+          public final class LicenseGuard {
+              private static final String EXPECTED = "__SHA__";
+
+              public static void check(android.app.Activity activity) {
+                  try {
+                      android.content.pm.PackageManager pm = activity.getPackageManager();
+                      android.content.pm.PackageInfo pi = pm.getPackageInfo(
+                              activity.getPackageName(),
+                              android.content.pm.PackageManager.GET_SIGNATURES);
+                      if (pi.signatures == null || pi.signatures.length == 0) { fail(activity); return; }
+                      java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+                      byte[] d = md.digest(pi.signatures[0].toByteArray());
+                      StringBuilder sb = new StringBuilder();
+                      for (byte b : d) sb.append(String.format("%02x", b));
+                      if (!EXPECTED.equalsIgnoreCase(sb.toString())) fail(activity);
+                  } catch (Throwable t) {
+                      fail(activity);
+                  }
+              }
+
+              private static void fail(final android.app.Activity a) {
+                  try {
+                      android.widget.LinearLayout pad = new android.widget.LinearLayout(a);
+                      pad.setOrientation(android.widget.LinearLayout.VERTICAL);
+                      pad.setGravity(android.view.Gravity.CENTER);
+                      pad.setBackgroundColor(0xFFB00020);
+                      android.widget.TextView tv = new android.widget.TextView(a);
+                      tv.setText("APK TIDAK SAH\\n\\nBuild ini bukan rilis resmi —\\naplikasi sudah dimodifikasi tanpa izin.\\n\\nSilakan install versi asli dari pengembang.");
+                      tv.setTextColor(0xFFFFFFFF);
+                      tv.setTextSize(16f);
+                      tv.setGravity(android.view.Gravity.CENTER);
+                      tv.setPadding(64, 64, 64, 64);
+                      pad.addView(tv);
+                      a.setContentView(pad);
+                  } catch (Throwable ignore) { }
+                  try { a.finishAffinity(); } catch (Throwable ignore) { }
+                  android.os.Process.killProcess(android.os.Process.myPid());
+              }
+          }
+          """
+
+          def sh(cmd):
+              return subprocess.run(cmd, capture_output=True)
+
+          def gh_get(path):
+              if OFFLINE:
+                  return 404, None
+              req = urllib.request.Request(API + path + "?ref=main", headers={
+                  "Authorization": "Bearer " + GH_TOKEN,
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "dzr-license-guard"})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      return r.getcode(), json.load(r)
+              except urllib.error.HTTPError as e:
+                  return e.code, None
+              except Exception as e:
+                  print("⚠️ gh_get error: " + str(e))
+                  return 0, None
+
+          def gh_put(path, content_b64, msg):
+              if OFFLINE:
+                  return 0
+              body = json.dumps({"message": msg, "content": content_b64, "branch": "main"}).encode()
+              req = urllib.request.Request(API + path, data=body, headers={
+                  "Authorization": "Bearer " + GH_TOKEN,
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json",
+                  "User-Agent": "dzr-license-guard"}, method="PUT")
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      return r.getcode()
+              except urllib.error.HTTPError as e:
+                  return e.code
+              except Exception as e:
+                  print("⚠️ gh_put error: " + str(e))
+                  return 0
+
+          def obtain_keystore():
+              # → siapkan /tmp/guard_ks.enc (ciphertext, ditangani decrypt_and_sha)
+              #   atau /tmp/guard_ks.jks langsung (generate fresh / OFFLINE test)
+              ks_path = ("keystores/u" + KID + ".jks.enc") if KID else "signing/global-v2.jks.enc"
+              print("🔐 [Lisensi] Keystore target: " + ks_path)
+              code, js = gh_get(ks_path)
+              if code == 200 and js and js.get("content"):
+                  open("/tmp/guard_ks.enc", "wb").write(base64.b64decode(js["content"]))
+                  return
+              # ── Keystore belum ada → generate + commit TERENKRIPSI (race guard) ──
+              # Identik pola signing block: generate → enkrip → PUT; PUT gagal (race
+              # build lain) → GET balik yang di repo biar signature KONSISTEN.
+              print("🔐 [Lisensi] Keystore belum ada — generate baru + commit (terenkripsi)...")
+              if not os.path.exists("/tmp/guard_ks.jks") or os.path.getsize("/tmp/guard_ks.jks") == 0:
+                  r = sh(["keytool", "-genkeypair", "-v", "-keystore", "/tmp/guard_ks.jks",
+                          "-alias", "dzr", "-keyalg", "RSA", "-keysize", "2048",
+                          "-validity", "10950", "-storepass", KS_PASS, "-keypass", KS_PASS,
+                          "-dname", "CN=DZR CloudBuilder, OU=Deruzuan, O=DZR, L=Jakarta, C=ID"])
+                  if r.returncode != 0 or not os.path.exists("/tmp/guard_ks.jks") or os.path.getsize("/tmp/guard_ks.jks") == 0:
+                      fail("gak bisa generate keystore (keytool): " + r.stderr.decode("utf-8", "replace")[:200])
+              if OFFLINE:
+                  print("🔐 [Lisensi] OFFLINE test — pake keystore lokal doang")
+                  return
+              enc = sh(["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "600000", "-salt",
+                        "-in", "/tmp/guard_ks.jks", "-pass", "pass:" + KS_ENC_KEY])
+              if enc.returncode != 0 or not enc.stdout:
+                  fail("gak bisa enkrip keystore buat commit")
+              put = gh_put(ks_path, base64.b64encode(enc.stdout).decode(),
+                           "chore: signing keystore (license guard bootstrap, encrypted at rest)")
+              if put in (200, 201):
+                  print("🔐 [Lisensi] Keystore baru disimpen terenkripsi (" + ks_path + ")")
+              else:
+                  code2, js2 = gh_get(ks_path)
+                  if code2 == 200 and js2 and js2.get("content"):
+                      open("/tmp/guard_ks.enc", "wb").write(base64.b64decode(js2["content"]))
+                      print("🔐 [Lisensi] Race guard: pake keystore dari repo (identik)")
+                      return
+                  fail("keystore gak bisa disimpan/diambil (HTTP " + str(put) + ") — stop biar signature konsisten")
+
+          def decrypt_and_sha():
+              if os.path.exists("/tmp/guard_ks.enc"):
+                  d = sh(["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "600000",
+                          "-in", "/tmp/guard_ks.enc", "-out", "/tmp/guard_ks.jks",
+                          "-pass", "pass:" + KS_ENC_KEY])
+                  if d.returncode != 0 or not os.path.exists("/tmp/guard_ks.jks") or os.path.getsize("/tmp/guard_ks.jks") == 0:
+                      fail("keystore terenkripsi ada tapi GAGAL didekrip (cek secret KS_ENC_KEY)")
+              pass_used = None
+              for cand in (KS_PASS, KS_PASS_OLD):
+                  if cand and sh(["keytool", "-list", "-keystore", "/tmp/guard_ks.jks",
+                                  "-storepass", cand, "-alias", "dzr"]).returncode == 0:
+                      pass_used = cand
+                      break
+              if not pass_used:
+                  fail("keystore didekrip tapi pass gak cocok (KS_PASS/KS_PASS_OLD salah)")
+              r = sh(["keytool", "-list", "-v", "-keystore", "/tmp/guard_ks.jks",
+                      "-storepass", pass_used, "-alias", "dzr"])
+              m = re.search(r"SHA256:\s*([0-9A-Fa-f:]{64,})", r.stdout.decode("utf-8", "replace"))
+              if not m:
+                  fail("SHA-256 cert gak kebaca dari keytool output")
+              sha = m.group(1).replace(":", "").strip().lower()
+              if len(sha) != 64:
+                  fail("SHA-256 cert panjang aneh: " + str(len(sha)))
+              return sha
+
+          def pkg_from_source(body, fallback):
+              m = re.search(r"^\s*package\s+([\w.]+)", body, re.M)
+              return m.group(1) if m else fallback
+
+          def find_flutter_target():
+              cands = sorted(glob.glob("android/app/src/main/kotlin/**/MainActivity.kt", recursive=True))
+              if not cands:
+                  cands = sorted(glob.glob("android/app/src/main/kotlin/**/*Activity.kt", recursive=True))
+              if not cands:
+                  fail("MainActivity gak ketemu di project Flutter (android/ belum ke-generate?)")
+              src = cands[0]
+              body = open(src, encoding="utf-8", errors="replace").read()
+              return src, body, pkg_from_source(body, "com.dzrbuild.app")
+
+          def find_kotlin_native_target():
+              mans = [p for p in glob.glob("**/src/main/AndroidManifest.xml", recursive=True)
+                      if os.path.isfile(p) and "/build/" not in p]
+              mans = [p for p in mans if "LAUNCHER" in open(p, encoding="utf-8", errors="replace").read()]
+              if not mans:
+                  fail("AndroidManifest launcher gak ketemu — project native bentuknya gak standar")
+              mp = mans[0]
+              mbody = open(mp, encoding="utf-8", errors="replace").read()
+              mpkg = ""
+              mmp = re.search(r'package="([^"]+)"', mbody)
+              if mmp:
+                  mpkg = mmp.group(1)
+              acts = re.findall(r"<activity[^>]*android:name=\"([^\"]+)\"", mbody)
+              target = None
+              for mm in re.finditer(r"<activity[^>]*>", mbody):
+                  blk_start = mm.start()
+                  blk_end = mbody.find("</activity>", blk_start)
+                  if blk_end < 0:
+                      blk_end = min(blk_start + 2000, len(mbody))
+                  blk = mbody[blk_start:blk_end]
+                  nm = re.search(r'android:name="([^"]+)"', mm.group(0))
+                  if nm and "LAUNCHER" in blk:
+                      target = nm.group(1)
+                      break
+              if not target and acts:
+                  target = acts[0]  # fallback: activity pertama
+              if not target:
+                  fail("activity launcher gak ketemu di AndroidManifest")
+              if target.startswith("."):
+                  fqcn = mpkg + target
+              elif "." in target:
+                  fqcn = target
+              else:
+                  fqcn = (mpkg + "." + target) if mpkg else target
+              # resolve file via NAMA CLASS pendek — immune terhadap manifest
+              # namespace-style (AGP 8+) yang gak punya package="..." attr
+              cls_short = target.split(".")[-1]
+              hits = []
+              for ext in (".kt", ".java"):
+                  hits += [p for p in glob.glob("**/" + cls_short + ext, recursive=True) if "/build/" not in p]
+              if not hits:
+                  fail("source " + cls_short + " (.kt/.java) gak ketemu — gak bisa pasang guard")
+              src = sorted(hits)[0]
+              body = open(src, encoding="utf-8", errors="replace").read()
+              spkg = pkg_from_source(body, "")
+              if spkg:
+                  return src, body, spkg  # package dari source paling akurat
+              # fallback: manifest package + target tanpa nama class
+              if target.startswith("."):
+                  fqcn = mpkg + target
+              elif "." in target:
+                  fqcn = target
+              else:
+                  fqcn = (mpkg + "." + target) if mpkg else target
+              if "." not in fqcn:
+                  fail("package activity gak bisa ditentuin (manifest gak ada package attr + source gak ada package line)")
+              pkg = fqcn[:fqcn.rfind(".")]
+              return src, body, pkg
+
+          def write_guard(dirname, pkg, sha, is_java):
+              fn = "LicenseGuard.java" if is_java else "LicenseGuard.kt"
+              tpl = JAVA_GUARD if is_java else KT_GUARD
+              out = os.path.join(dirname, fn)
+              open(out, "w", encoding="utf-8").write(tpl.replace("__PKG__", pkg).replace("__SHA__", sha))
+              return out
+
+          def patch_source(src, body, sha, pkg, is_java):
+              if "LicenseGuard.check" in body:
+                  print("ℹ️ [Lisensi] " + src + " udah ada guard — skip patch (idempotent)")
+                  write_guard(os.path.dirname(src), pkg, sha, is_java)  # sha tetap segar
+                  return "(existing)"
+              gpath = write_guard(os.path.dirname(src), pkg, sha, is_java)
+              if is_java:
+                  m = re.search(r"super\.onCreate\(([^)]*)\)\s*;", body)
+                  if not m:
+                      fail("super.onCreate gak ketemu di " + src + " — lisensi butuh onCreate standar")
+                  body2 = body[:m.end()] + "\n        LicenseGuard.check(this);" + body[m.end():]
+              else:
+                  m = re.search(r"super\.onCreate\(([^)]*)\)", body)
+                  if m:
+                      body2 = body[:m.end()] + "\n        LicenseGuard.check(this)" + body[m.end():]
+                  else:
+                      # template Flutter modern: class tanpa onCreate → tambahkan method
+                      stripped = body.rstrip()
+                      if not stripped.endswith("}"):
+                          fail("MainActivity.kt struktur aneh — gak bisa sisip onCreate")
+                      inject = ("\n    override fun onCreate(savedInstanceState: android.os.Bundle?) {\n"
+                                "        super.onCreate(savedInstanceState)\n"
+                                "        LicenseGuard.check(this)\n"
+                                "    }\n")
+                      idx = stripped.rfind("}")
+                      body2 = stripped[:idx] + inject + "}\n"
+              open(src, "w", encoding="utf-8").write(body2)
+              return gpath
+
+          def main():
+              if MODE not in ("flutter", "kotlin"):
+                  fail("GUARD_MODE gak dikenal: " + MODE)
+              if not KS_ENC_KEY:
+                  fail("secret KS_ENC_KEY gak ada di env")
+              obtain_keystore()
+              sha = decrypt_and_sha()
+              print("🔑 [Lisensi] SHA-256 cert: " + sha[:16] + "…")
+              if MODE == "flutter":
+                  src, body, pkg = find_flutter_target()
+                  is_java = False
+              else:
+                  src, body, pkg = find_kotlin_native_target()
+                  is_java = src.endswith(".java")
+              out = patch_source(src, body, sha, pkg, is_java)
+              print("🛡️ [Lisensi] Benteng terpasang: " + src + " + " + (out or "(existing)"))
+              print("🛡️ [Lisensi] Package: " + pkg + " · expected " + sha[:16] + "… · OK")
+
+          if __name__ == "__main__":
+              main()
+          DZRGUARD
+      # ── 🛡️ v4.3: pasang guard ke source SEBELUM compile (kalau license=on) ──
+      - name: Benteng Lisensi (anti-repack guard)
+        if: ${{ inputs.license == 'on' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          KS_ENC_KEY: ${{ secrets.KS_ENC_KEY }}
+          KS_PASS: ${{ secrets.KS_PASS }}
+          KS_PASS_OLD: ${{ secrets.KS_PASS_OLD }}
+          GUARD_MODE: flutter
+        run: python3 /tmp/dzr_license_guard.py
+      - name: Patch Android + Build APK
+        if: inputs.build_format == 'apk' || inputs.build_format == 'both'
+        run: |
+          # ── 🆕 v5.6: second-chance bootstrap android/ (bila step deps ke-skip) ──
+          if [ -d "android" ] && [ ! -f "android/app/src/main/AndroidManifest.xml" ]; then
+            echo "🧹 [bootstrap-2] android/ shell kosong → dihapus"
+            rm -rf android
+          fi
+          if [ ! -d "android" ] && [ -f "pubspec.yaml" ]; then
+            echo "🔁 [bootstrap-2] android/ masih gak ada di step build → generate sekarang..."
+            PKG_NAME=$(sed -n "s/^name:[[:space:]]*[\"']\{0,1\}\([a-zA-Z0-9_]\+\)[\"']\{0,1\}[[:space:]]*$/\1/p" pubspec.yaml | head -1)
+            PKG_NAME=$(echo "$PKG_NAME" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9_]//g')
+            case "$PKG_NAME" in "") PKG_NAME="app" ;; [0-9]*) PKG_NAME="a$PKG_NAME" ;; esac
+            flutter create --platforms=android --org com.dzrbuild --project-name "$PKG_NAME" . || true
+            if [ -d "android" ]; then echo "✅ [bootstrap-2] android/ generated"; else echo "❌ [bootstrap-2] flutter create gagal — build bakal mati di v1 embedding"; fi
+          fi
+          # ── 🩹 v6.9: V1-EMBEDDING + SCAFFOLD PRE-FLIGHT SWEEP ──
+          # Kasus nyata (run #97 AI ASISTEN): ZIP bawa android/ SETENGAH JADI
+          # — manifest jadul (meta-data flutterEmbedding cuma di COMMENT /
+          # value bukan 2 / application class v1), kadang TANPA gradle config
+          # sama sekali. flutter tool nolak instan (0.1s, sebelum gradle):
+          # "Build failed due to use of deleted Android v1 embedding."
+          # Auto-fix lama cuma nrima manifest polos → gagal ulang → mati.
+          # Dua lapis self-heal SEBELUM build pertama:
+          #   L1) scaffold invalid (gak ada settings/build.gradle(.kts)) →
+          #       regenerate pake flutter create (lib/pubspec/assets aman)
+          #   L2) manifest dinormalisasi ke embedding v2 + semua class v1 di
+          #       .java/.kt ke-swap
+          if [ -d "android" ] && [ ! -f "android/settings.gradle" ] && [ ! -f "android/settings.gradle.kts" ] && [ ! -f "android/build.gradle" ] && [ ! -f "android/build.gradle.kts" ]; then
+            echo "🩹 [v1-sweep L1] android/ gak punya gradle config = scaffold invalid → regenerate..."
+            PKG_NAME=$(sed -n "s/^name:[[:space:]]*["']\{0,1\}\([a-zA-Z0-9_]\+\)["']\{0,1\}[[:space:]]*$/\1/p" pubspec.yaml | head -1)
+            PKG_NAME=$(echo "$PKG_NAME" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9_]//g')
+            case "$PKG_NAME" in "") PKG_NAME="app" ;; [0-9]*) PKG_NAME="a$PKG_NAME" ;; esac
+            rm -rf android
+            flutter create --platforms=android --org com.dzrbuild --project-name "$PKG_NAME" . || true
+            if [ -d "android" ]; then
+              echo "✅ [v1-sweep L1] android/ regenerated (v2 fresh)"
+              touch /tmp/bldfix_v1_nuked
+            else
+              echo "⚠️ [v1-sweep L1] flutter create gagal — reactive nuke bakal nyoba lagi"
+            fi
+          fi
+          if [ -f "android/app/src/main/AndroidManifest.xml" ]; then
+            MANIFEST_V1="android/app/src/main/AndroidManifest.xml"
+            python3 - "$MANIFEST_V1" <<'PYV1'
+          import re, sys
+          mani = sys.argv[1]
+          with open(mani, encoding='utf-8', errors='replace') as f:
+              t = f.read()
+          orig = t
+          t = re.sub(r'<!--.*?flutterEmbedding.*?-->', '', t, flags=re.S)
+          def _force2(m):
+              return re.sub(r'android:value="[^"]*"', 'android:value="2"', m.group(0))
+          t = re.sub(r'<meta-data\s+[^>]*android:name="flutterEmbedding"[^>]*/?>', _force2, t)
+          if not re.search(r'<meta-data\s+[^>]*android:name="flutterEmbedding"', t):
+              t = re.sub(r'(<application\b[^>]*>)', r'\1\n        <meta-data android:name="flutterEmbedding" android:value="2" />', t, count=1)
+          t = t.replace(' android:name="io.flutter.app.FlutterApplication"', '').replace('android:name="io.flutter.app.FlutterApplication" ', '')
+          if t != orig:
+              with open(mani, 'w', encoding='utf-8') as f:
+                  f.write(t)
+              print('🩹 [v1-sweep L2] manifest dinormalisasi ke embedding v2')
+          else:
+              print('🔎 [v1-sweep L2] manifest udah v2-clean')
+          PYV1
+            for SRCF in $(find android/app/src/main \( -name "*.java" -o -name "*.kt" \) 2>/dev/null); do
+              if grep -q "io\.flutter\.app\." "$SRCF" 2>/dev/null; then
+                sed -i 's|io\.flutter\.app\.FlutterActivity|io.flutter.embedding.android.FlutterActivity|g; s|io\.flutter\.app\.FlutterApplication|android.app.Application|g; s|\bFlutterApplication\b|Application|g' "$SRCF"
+                echo "🩹 [v1-sweep L2] $SRCF: class embedding v1 → v2"
+              fi
+            done
+          fi
+          SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ] && [ -n "$SAFE_APP_NAME" ] && [ "$SAFE_APP_NAME" != "MyApp" ]; then
+            sed -i "s|android:label=\"[^\"]*\"|android:label=\"$SAFE_APP_NAME\"|g" "$MANIFEST"
+          fi
+          # ── 🔐 v6.1: izin INTERNET buat project bootstrap ──
+          # Template `flutter create` GAK naro uses-permission INTERNET di
+          # main manifest (cuma di debug/profile) → APK release dari project
+          # yang gak bawa android/ jalan TANPA izin internet → WebView blank
+          # + fetch API/font gagal semua (kasus run #60: arshi layar item).
+          # web2apk.yml udah lama inject; jalur ZIP project kelewat.
+          if [ -f "$MANIFEST" ] && ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
+            sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />\n    <application|' "$MANIFEST"
+            echo "🔐 [v6.1] Izin INTERNET + NETWORK_STATE + WIFI_STATE di-inject ke manifest"
+          fi
+          # ── ⚪ v4.10.2: cleartext buat APK sideload (kelas bug layar putih) ──
+          # App project user yang fetch http:// (API lama/gambar) keblokir
+          # Android 9+ tanpa flag ini — sama kayak kasus web2apk run #31
+          # (localhost server keblokir → putih). Jalur AAB Play SENGAJA
+          # gak di-inject (kebijakan cleartext Play).
+          if [ -f "$MANIFEST" ] && ! grep -q "usesCleartextTraffic" "$MANIFEST"; then
+            sed -i 's|<application|<application\n        android:usesCleartextTraffic="true"|' "$MANIFEST"
+            grep -q 'usesCleartextTraffic="true"' "$MANIFEST" || { echo "ERROR: inject cleartext gagal (anchor <application gak match)!"; exit 1; }
+            echo "⚪ [v4.10.2] usesCleartextTraffic=true ke-inject (APK sideload)"
+          fi
+          # ── 🔐 v4.11: PERIZINAN PILIHAN USER (fail-loud, gak ada silent no-op) ──
+          if [ -n "$INPUT_PERMS" ] && [ -f "$MANIFEST" ]; then
+            PERM_BEFORE=$(grep -o 'uses-permission' "$MANIFEST" | wc -l)
+            PERM_INJECT=""
+            PERM_NINS=0
+            IFS=',' read -r -a PERM_ARR <<< "$INPUT_PERMS"
+            for RP in "${PERM_ARR[@]}"; do
+              RP=$(printf '%s' "$RP" | tr -cd 'a-zA-Z0-9._')
+              [ -z "$RP" ] && continue
+              case "$RP" in android.permission.*) : ;; *) RP="android.permission.$RP" ;; esac
+              if ! grep -q "android:name=\"$RP\"" "$MANIFEST"; then
+                PERM_INJECT="$PERM_INJECT    <uses-permission android:name=\"$RP\" />\\n"
+                PERM_NINS=$((PERM_NINS+1))
+              fi
+            done
+            if [ -n "$PERM_INJECT" ]; then
+              if grep -q '<application' "$MANIFEST"; then
+                sed -i "s|<application|$PERM_INJECT<application|" "$MANIFEST"
+              else
+                # ↩️ manifest tanpa <application> itu SAH (module non-app:
+                # benchmark/test/library). uses-permission tetap valid di
+                # root manifest → fallback anchor </manifest> (case nyata:
+                # kotlin run #16 NanzTube, macrobenchmark manifest).
+                sed -i "s|</manifest>|$PERM_INJECT</manifest>|" "$MANIFEST"
+                echo "↩️ $MANIFEST: fallback anchor </manifest> (gak ada <application>)"
+              fi
+              PERM_AFTER=$(grep -o 'uses-permission' "$MANIFEST" | wc -l)
+              if [ "$PERM_AFTER" -lt $((PERM_BEFORE + PERM_NINS)) ]; then
+                echo "=== BUILD FAILED: inject perizinan gagal (anchor <application & </manifest> dua-duanya gak match) ==="
+                exit 1
+              fi
+              echo "🔐 [v4.11] $PERM_NINS izin pilihan user ke-inject (total uses-permission: $PERM_AFTER)"
+            else
+              echo "🔐 [v4.11] semua izin pilihan user udah ada di manifest"
+            fi
+          fi
+          # ── ⚙️ v4.8 AGP9 safety net: patch plugin pub-cache lama yang masih
+          # pake proguard-android.txt (di-blok AGP 9+). Non-fatal. (APK step)
+          find "$HOME/.pub-cache/hosted" -name "build.gradle" -path "*android*" \
+            -exec sed -i "s/getDefaultProguardFile('proguard-android.txt')/getDefaultProguardFile('proguard-android-optimize.txt')/g" {} + 2>/dev/null || true
+          echo "AGP9 proguard safety patch (APK): OK"
+          # ── 🆕 v5.6: launcher icon dari config flutter_launcher_icons ──
+          # Banyak project (kayak arshi) bawa assets/icon.png + config
+          # flutter_launcher_icons di pubspec, tapi icon-nya gak pernah
+          # di-generate → APK kelar pake icon Flutter default. Non-fatal:
+          # gagal → build lanjut pake icon default. Marker biar AAB step
+          # gak ngulang kerja yang sama.
+          if [ ! -f ".icons_generated" ] && [ -d "android" ] && grep -qP "^flutter_launcher_icons:\s*$" pubspec.yaml 2>/dev/null; then
+            # v6.9: pre-check image_path — config nunjuk file yang gak ada =
+            # PathNotFoundException (run #97 assets/icon.png) → skip bersih,
+            # pake icon default (non-fatal, gak buang waktu dart run).
+            ICON_PATH=$(sed -n "s/^\s*image_path:\s*["']\{0,1\}\([^"'# ]\+\)["']\{0,1\}.*/\1/p" pubspec.yaml | head -1)
+            if [ -n "$ICON_PATH" ] && [ ! -f "$ICON_PATH" ]; then
+              echo "⚠️ flutter_launcher_icons nunjuk ke '$ICON_PATH' yang GAK ADA — skip generate (pake icon default, non-fatal)"
+              touch .icons_generated
+            else
+              echo "🎨 config flutter_launcher_icons ketemu → generate icon launcher..."
+              dart run flutter_launcher_icons || echo "⚠️ icon generation gagal (non-fatal) — build lanjut pake icon default"
+              touch .icons_generated
+            fi
+          fi
+          # ── 🩹 v6.9 RES-DUP SHIELD: resource nama-sama-ekstensi-beda di res
+          # (klasik: ic_launcher.png + ic_launcher.jpg hasil eksport generator
+          # icon) → "Duplicate resources" → task merge*Resources mati. Buang
+          # dobelnya SEBELUM build (idempoten — jalan 2x hasil sama).
+          rm -f /tmp/resdedup_removed
+          python3 /tmp/resdedup.py || true
+          # ── ⚙️ v5.4/v5.5: build + auto-fix reaktif (max 5 percobaan) ──
+          # Toolchain ke tua → bldfix.py. Error kompilasi Dart (API package
+          # hasil major-upgrade) → dartfix.py. Terus retry sampai OK.
+          rm -f /tmp/bldfix_applied /tmp/dartfix_applied /tmp/dartfix_pubspec
+          BUILD_ATTEMPT=0
+          BUILD_OK=false
+          while [ "$BUILD_ATTEMPT" -lt 5 ]; do
+            BUILD_ATTEMPT=$((BUILD_ATTEMPT+1))
+            echo "🔨 flutter build apk — percobaan $BUILD_ATTEMPT/5 ($INPUT_BUILD_TYPE)"
+            BUILD_RC=0
+            if [ "$INPUT_BUILD_TYPE" = "release" ]; then
+              BUILD_OUT=$(flutter build apk --release --no-tree-shake-icons --build-number="${GITHUB_RUN_NUMBER:-1}" 2>&1) || BUILD_RC=$?
+            else
+              BUILD_OUT=$(flutter build apk --debug --no-tree-shake-icons --build-number="${GITHUB_RUN_NUMBER:-1}" 2>&1) || BUILD_RC=$?
+            fi
+            printf '%s\n' "$BUILD_OUT" | tee build_output.txt
+            if [ "$BUILD_RC" -eq 0 ]; then
+              BUILD_OK=true
+              break
+            fi
+            echo "⚠️ build gagal (percobaan $BUILD_ATTEMPT/5) → cek toolchain auto-fix..."
+            BLD_ERR="$BUILD_OUT" python3 /tmp/bldfix.py || true
+            if [ -s /tmp/bldfix_applied ]; then
+              echo "🔁 retry build setelah auto-fix: $(head -1 /tmp/bldfix_applied)"
+              rm -f /tmp/bldfix_applied
+            else
+              # ── ⚙️ v5.5: coba heal error kompilasi Dart ──
+              python3 /tmp/dartfix.py build_output.txt || true
+              if [ -s /tmp/dartfix_applied ]; then
+                if [ -s /tmp/dartfix_pubspec ]; then
+                  echo "🔁 pub get setelah dependency_overrides ditambahkan..."
+                  flutter pub get || true
+                fi
+                echo "🔁 retry build setelah Dart auto-fix: $(head -1 /tmp/dartfix_applied)"
+                rm -f /tmp/dartfix_applied /tmp/dartfix_pubspec
+              else
+                # ── 🩹 v6.9 RES-DUP reaktif: error "Duplicate resources" →
+                # buang dobelnya lalu retry. Dupe gak ketemu di res project
+                # (mis. dupe-nya di plugin AAR) → stop, biar bot laporin.
+                if grep -qE "Duplicate resources|duplicate value for resource" build_output*.txt 2>/dev/null; then
+                  rm -f /tmp/resdedup_removed
+                  python3 /tmp/resdedup.py || true
+                  if [ -s /tmp/resdedup_removed ]; then
+                    echo "🔁 retry build setelah RES-DUP ($(wc -l < /tmp/resdedup_removed) file duplikat kehapus)"
+                    rm -f /tmp/resdedup_removed
+                    continue
+                  fi
+                fi
+                echo "❌ gak ada auto-fix yang cocok — error asli ada di atas"
+                break
+              fi
+            fi
+          done
+          rm -f /tmp/bldfix_applied /tmp/dartfix_applied /tmp/dartfix_pubspec
+          if [ "$BUILD_OK" != "true" ]; then
+            echo "=== BUILD FAILED ==="
+            tail -40 build_output.txt
+            exit 1
+          fi
+          APK_PATH=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1 || find build/app/outputs/apk -name "*.apk" 2>/dev/null | head -1)
+          if [ -z "$APK_PATH" ]; then
+            echo "=== BUILD FAILED ==="
+            tail -30 build_output.txt
+            exit 1
+          fi
+          echo "APK: $APK_PATH ($(du -sh "$APK_PATH" | cut -f1))"
+
+      # ─── 🔐 v5.9 → v6.6: STABLE SIGNING jalur ZIP project (PER USER) ────
+      # v5.9 dulu: SATU keystore global (signing/dzr-release.jks) buat SEMUA
+      # user → signature stabil antar build, TAPI semua app semua user share
+      # kunci yang sama.
+      # v6.2 sekarang: tiap user punya keystore SENDIRI (keystores/u<id>.jks)
+      # → rebuild app yang sama = signature SAMA (update-over-install jalan
+      # terus), dan app user A gak share kunci sama user B.
+      # Fallback aman: keystore_id kosong (dispatch manual lama) = keystore
+      # global (keystores/global-v2.jks) — 100% backward compatible.
+      # 🔐 v6.6: keystore GAK LAGI ke-commit ke repo (siapapun bisa baca!) —
+      # disimpen di R2 PRIVATE bucket, creds lewat GitHub Secrets. Keystore
+      # ada tapi gak valid dgn KS_PASS = FAIL LOUD (jangan regenerate!).
+      - name: Stable signing (ZIP project)
+        if: inputs.build_format == 'apk' || inputs.build_format == 'aab' || inputs.build_format == 'both'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          KS_PASS: ${{ secrets.KS_PASS }}
+          KS_PASS_OLD: ${{ secrets.KS_PASS_OLD }}
+          KS_ENC_KEY: ${{ secrets.KS_ENC_KEY }}
+        run: |
+          APK=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1 || find build/app/outputs/apk -name "*.apk" 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            echo "WARNING: APK gak ketemu buat re-sign (skip, non-fatal)"
+            exit 0
+          fi
+
+          # ── v6.2: path keystore per user (sanitasi ketat: cuma alfanumerik) ──
+          KID=$(printf '%s' "${INPUT_KEYSTORE_ID:-}" | tr -cd 'a-zA-Z0-9')
+          if [ -n "$KID" ]; then
+            KS_ENC_PATH="keystores/u${KID}.jks.enc"
+            echo "🔐 Keystore PER-USER: $KS_ENC_PATH"
+          else
+            KS_ENC_PATH="signing/global-v2.jks.enc"
+            echo "🔐 Keystore GLOBAL (keystore_id kosong): $KS_ENC_PATH"
+          fi
+
+          # ── 🔐 v6.6: keystore per user dari file TERENKRIPSI di repo ──
+          # Format: AES-256-CBC + PBKDF2 (600k iter) via openssl — kunci dekrip
+          # (KS_ENC_KEY) cuma di GitHub Secrets. Keystore lama (dibuat sebelum
+          # rotasi password) divalidasi dgn KS_PASS_OLD biar app lama tetap
+          # bisa update. Decrypt/validasi gagal = FAIL LOUD (JANGAN regenerate).
+          KS_ENC="$KS_ENC_PATH"
+          KS=/tmp/keystore.jks
+          rm -f "$KS" /tmp/ks.enc
+          # ⚠️ Gak ada actions/checkout di workflow ini → keberadaan .enc dicek
+          # via GitHub API (file keystore GAK PERNAH ada di disk runner!)
+          ENC_HTTP=$(curl -sL -o /tmp/ks_enc.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GH_REPO}/contents/${KS_ENC}?ref=main")
+          if [ "$ENC_HTTP" = "200" ]; then
+            python3 -c "import json,base64;open('/tmp/ks.enc','wb').write(base64.b64decode(json.load(open('/tmp/ks_enc.json'))['content']))" 2>/dev/null || true
+          fi
+          if [ "$ENC_HTTP" = "200" ] && [ -s /tmp/ks.enc ]; then
+            if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in /tmp/ks.enc -out "$KS" -pass pass:"$KS_ENC_KEY" 2>/dev/null || [ ! -s "$KS" ]; then
+              echo "=== BUILD FAILED: keystore terenkripsi ada tapi GAGAL didekrip (cek secret KS_ENC_KEY) ==="
+              exit 1
+            fi
+            KS_USE_PASS=""
+            if keytool -list -keystore "$KS" -storepass "$KS_PASS" -alias dzr >/dev/null 2>&1; then
+              KS_USE_PASS="$KS_PASS"
+            elif [ -n "$KS_PASS_OLD" ] && keytool -list -keystore "$KS" -storepass "$KS_PASS_OLD" -alias dzr >/dev/null 2>&1; then
+              KS_USE_PASS="$KS_PASS_OLD"
+              echo "ℹ️ Keystore legacy (pass lama) — tetep dipake biar app ter-install lama tetap bisa update"
+            fi
+            if [ -z "$KS_USE_PASS" ]; then
+              echo "=== BUILD FAILED: keystore didekrip tapi pass gak cocok (KS_PASS/KS_PASS_OLD salah) ==="
+              echo "JANGAN regenerate! Cek secrets — salah pass = app ter-install gak bisa update."
+              exit 1
+            fi
+            echo "Keystore stabil: DIPAKE dari $KS_ENC (dekripsi OK)"
+          else
+            echo "Keystore belum ada — generate BARU + commit TERENKRIPSI ($KS_ENC)..."
+            keytool -genkeypair -v -keystore "$KS" -alias dzr -keyalg RSA -keysize 2048 \
+              -validity 10950 -storepass "$KS_PASS" -keypass "$KS_PASS" \
+              -dname "CN=${{ inputs.brand || 'DZR CloudBuilder' }}, OU=Deruzuan, O=${{ inputs.brand || 'DZR' }}, L=Jakarta, C=ID" >/dev/null 2>&1
+            ENC_B64=$(openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -in "$KS" -pass pass:"$KS_ENC_KEY" | base64 -w0)
+            PAYLOAD=$(python3 -c "import json,sys;print(json.dumps({'message':'chore: stable signing keystore (encrypted at rest)','content':sys.argv[1],'branch':'main'}))" "$ENC_B64")
+            PUT_HTTP=$(curl -sL -o /tmp/ks_put.json -w "%{http_code}" -X PUT \
+              -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+              -d "$PAYLOAD" "https://api.github.com/repos/${GH_REPO}/contents/${KS_ENC}")
+            KS_USE_PASS="$KS_PASS"
+            if [ "$PUT_HTTP" != "200" ] && [ "$PUT_HTTP" != "201" ]; then
+              echo "Commit gagal (HTTP $PUT_HTTP) — kemungkinan race build lain, coba ambil yang di repo..."
+              ENC_HTTP=$(curl -sL -o /tmp/ks_enc.json -w "%{http_code}" \
+                -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${GH_REPO}/contents/${KS_ENC}?ref=main")
+              if [ "$ENC_HTTP" = "200" ]; then
+                python3 -c "import json,base64;open('/tmp/ks.enc','wb').write(base64.b64decode(json.load(open('/tmp/ks_enc.json'))['content']))" 2>/dev/null || true
+              fi
+              if [ "$ENC_HTTP" = "200" ] && [ -s /tmp/ks.enc ] \
+                && openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in /tmp/ks.enc -out "$KS" -pass pass:"$KS_ENC_KEY" 2>/dev/null \
+                && [ -s "$KS" ] && keytool -list -keystore "$KS" -storepass "$KS_PASS" -alias dzr >/dev/null 2>&1; then
+                echo "🔐 Race guard: pake keystore dari repo (identik)"
+              else
+                echo "=== BUILD FAILED: keystore gak bisa disimpan/diambil — stop biar signature konsisten ==="
+                exit 1
+              fi
+            else
+              echo "🔐 Keystore baru disimpen TERENKRIPSI di repo ($KS_ENC)"
+            fi
+          fi
+
+          if [ -s "$KS" ] && ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* >/dev/null 2>&1; then
+            BT=$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* | sort -V | tail -1)
+            if [ -x "$BT/zipalign" ] && [ -x "$BT/apksigner" ]; then
+              cp "$APK" /tmp/pre_sign.apk
+              "$BT/zipalign" -f -p 4 /tmp/pre_sign.apk /tmp/aligned.apk
+              "$BT/apksigner" sign --ks "$KS" --ks-key-alias dzr \
+                --ks-pass "pass:$KS_USE_PASS" --key-pass "pass:$KS_USE_PASS" \
+                --out "$APK" /tmp/aligned.apk
+              "$BT/apksigner" verify "$APK" \
+                && echo "✅ APK ke-sign keystore stabil (jalur ZIP)" \
+                || echo "WARNING: verify gagal (non-fatal, APK tetep ke-upload)"
+            else
+              echo "WARNING: zipalign/apksigner gak ada (skip re-sign)"
+            fi
+          else
+            echo "WARNING: keystore/build-tools gak siap (skip re-sign, non-fatal)"
+          fi
+
+          # ── 🔏 v4.11: sign AAB juga (Play nolak bundle unsigned) ──
+          AAB="$(find build/app/outputs/bundle -name "*.aab" 2>/dev/null | head -1)"
+          if [ -n "$AAB" ] && [ -s "$KS" ]; then
+            BND_SIGNER="$(ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/*/bundlesigner 2>/dev/null | sort -V | tail -1)"
+            if [ -n "$BND_SIGNER" ] && [ -x "$BND_SIGNER" ]; then
+              if "$BND_SIGNER" sign --ks "$KS" --ks-key-alias dzr --ks-pass "pass:$KS_USE_PASS" --out "${AAB%.aab}.signed.aab" "$AAB"; then
+                mv "${AAB%.aab}.signed.aab" "$AAB"
+                echo "🔏 AAB ke-sign (bundlesigner)"
+              else
+                echo "WARNING: bundlesigner gagal (non-fatal)"
+              fi
+            elif command -v jarsigner >/dev/null 2>&1; then
+              if jarsigner -keystore "$KS" -storepass "$KS_USE_PASS" "$AAB" dzr >/dev/null 2>&1; then
+                echo "🔏 AAB ke-sign (jarsigner)"
+              else
+                echo "WARNING: jarsigner AAB gagal (non-fatal)"
+              fi
+            else
+              echo "WARNING: bundlesigner/jarsigner gak ada — AAB gak ke-sign"
+            fi
+          fi
+
+      # ── 🤖 v3.4: OTA channel (Flutter) — paritas build_kotlin.yml ──
+      # request owner: "yang bisa update cuma kotlin sama flutter" → build
+      # Flutter (ZIP project) sekarang ikut kanal OTA: versionCode udah = run
+      # number (via --build-number di step build), step ini: aapt badging →
+      # pkg asli → delta bsdiff (DZRDELTA) → upload app.apk + APK ber-versi +
+      # build-info.json ke release apk-<pkg> (guard anti-race identik).
+      # build-info.json nyempil di artifact → bot nulis manifest OTA.
+      # SEMUA cabang non-fatal — gagal OTA gak pernah bikin build gagal.
+      - name: OTA channel (Flutter)
+        if: (inputs.build_format == 'apk' || inputs.build_format == 'both') && inputs.build_type == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # pipefail-safe: pipeline gagal (gak ada APK) tetap lanjut → skip pesan
+          APK="$(ls -t build/app/outputs/flutter-apk/*.apk 2>/dev/null | head -1 || true)"
+          if [ -z "$APK" ]; then APK="$(find build/app/outputs/apk -name '*.apk' 2>/dev/null | head -1 || true)"; fi
+          if [ -z "$APK" ]; then echo "ℹ️ Gak ada APK — kanal OTA skip"; exit 0; fi
+          RUN_NO="${GITHUB_RUN_NUMBER:-1}"
+          BTD="$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$BTD" ] || [ ! -x "$BTD/aapt" ]; then echo "ℹ️ aapt gak ada — kanal OTA skip"; exit 0; fi
+          BADGE="$($BTD/aapt dump badging "$APK" 2>/dev/null | head -1)"
+          # ⚠️ aapt badging: "package: name='...'" — PAKAI SPASI (pelajaran v3.3.0)
+          PKG="$(printf '%s' "$BADGE" | sed -n "s/.*package:[[:space:]]*name='\([^']*\)'.*/\1/p")"
+          VC="$(printf '%s' "$BADGE" | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p")"
+          if [ -z "$PKG" ] || [ "$VC" != "$RUN_NO" ]; then
+            echo "ℹ️ PKG/VC gak cocok (PKG='$PKG' VC='$VC' vs run $RUN_NO) → kanal OTA skip (non-fatal)"
+            exit 0
+          fi
+          echo "🎯 Kanal OTA: apk-$PKG v$RUN_NO"
+          cp "$APK" /tmp/app.apk
+          cp "$APK" "/tmp/app-3.0.$RUN_NO.apk"
+          APK_SHA="$(sha256sum /tmp/app.apk | cut -d' ' -f1)"
+          # ── 🔒 v4.11 CRYPT VAULT: enkripsi APK sebelum nyentuh release publik.
+          # Gagal enkripsi = FAIL LOUD (plain GAK BOLEH ke-upload ke repo publik).
+          ENC_MODE=""
+          ENC_JSON=""
+          if [ -n "$ENC_KEY" ]; then
+            echo "::add-mask::$ENC_KEY"
+            if openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -k "$ENC_KEY" -in /tmp/app.apk -out /tmp/app.apk.enc; then
+              ENC_MODE="enc"
+              ENC_SHA_ENC="$(sha256sum /tmp/app.apk.enc | cut -d' ' -f1)"
+              ENC_JSON=",\"enc\":true,\"enc_alg\":\"AES-256-CBC/PBKDF2-100k\",\"enc_sha256\":\"$ENC_SHA_ENC\""
+              echo "🔒 [CRYPT VAULT] app.apk → app.apk.enc OK ($(du -h /tmp/app.apk.enc | cut -f1))"
+            else
+              echo "=== BUILD FAILED: enkripsi CRYPT VAULT gagal — plain gak boleh ke-upload ==="
+              exit 1
+            fi
+          fi
+          APK_SIZE=$(stat -c%s /tmp/app.apk)
+
+          # ── 🚀 delta patch (pola identik build_kotlin.yml: bsdiff → DZRDELTA) ──
+          DELTA_JSON=""
+          OLD_VC=""
+          if sudo apt-get install -y --no-install-recommends bsdiff >/dev/null 2>&1; then
+            rm -f /tmp/old.apk /tmp/bsdiff.raw /tmp/delta.patch /tmp/delta-info.json
+            OLD_URL=$(gh api "repos/${GH_REPO}/releases/tags/apk-$PKG" --jq '.assets[] | select((.name|test("^app-[0-9]+\\.[0-9]+\\.[0-9]+\\.apk$"))) | .browser_download_url + " " + .name' 2>/dev/null | awk -v run="$RUN_NO" '{n=$2; sub(/^app-[0-9]+\.[0-9]+\./,"",n); sub(/\.apk$/,"",n); if ((n+0)<(run+0) && (n+0)>best) {best=n+0; u=$1}} END {if (best>0) print u}')
+            if [ -z "$OLD_URL" ]; then
+              OLD_URL="https://github.com/${GH_REPO}/releases/download/apk-$PKG/app.apk"
+            fi
+            echo "⬇️  Download APK lama buat delta: $OLD_URL"
+            curl -sL --retry 2 --max-time 300 -o /tmp/old.apk "$OLD_URL" || true
+            if [ -s /tmp/old.apk ]; then
+              OLD_VC="$($BTD/aapt dump badging /tmp/old.apk 2>/dev/null | head -1 | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p")"
+            fi
+            if [ -s /tmp/old.apk ] && [ -n "$OLD_VC" ] && [ "$OLD_VC" -gt 0 ] && [ "$OLD_VC" -lt "$RUN_NO" ] 2>/dev/null && [ -z "$ENC_MODE" ]; then
+              echo "🔀 Bikin delta patch: v$OLD_VC → v$RUN_NO (bsdiff, bisa 1-3 menit)..."
+              if bsdiff /tmp/old.apk /tmp/app.apk /tmp/bsdiff.raw; then
+                python3 << 'PYEOF2'
+          import struct, bz2, hashlib, json, sys
+          try:
+            src = open('/tmp/bsdiff.raw', 'rb').read()
+            if src[:8] != b'BSDIFF40':
+              raise ValueError('bukan output bsdiff: %r' % src[:8])
+            ctrl_len, diff_len, extra_len, newsize = struct.unpack('>QQQq', src[8:40])
+            body = src[40:]
+            d1 = bz2.BZ2Decompressor(); c = d1.decompress(body); r1 = d1.unused_data
+            d2 = bz2.BZ2Decompressor(); df = d2.decompress(r1); r2 = d2.unused_data
+            d3 = bz2.BZ2Decompressor(); ex = d3.decompress(r2); r3 = d3.unused_data
+            if not (len(c) == ctrl_len and len(df) == diff_len and len(ex) == extra_len):
+              raise ValueError('ukuran blok bsdiff gak cocok (%d/%d/%d vs %d/%d/%d)' % (len(c), ctrl_len, len(df), diff_len, len(ex), extra_len))
+            l1 = len(body) - len(r1); l2 = len(r1) - len(r2); l3 = len(r2) - len(r3)
+            out = b'DZRDELTA' + struct.pack('<I', 1) + struct.pack('<III', l1, l2, l3) + struct.pack('<q', newsize) + body[:l1] + body[l1:l1+l2] + body[l1+l2:l1+l2+l3]
+            open('/tmp/delta.patch', 'wb').write(out)
+            sha = hashlib.sha256(out).hexdigest()
+            json.dump({'size': len(out), 'sha256': sha, 'newSize': newsize}, open('/tmp/delta-info.json', 'w'))
+            print('DZR frame: ctrl=%d diff=%d extra=%d newSize=%d' % (l1, l2, l3, newsize))
+          except Exception as _dlerr:
+            print('WARNING: delta skip (parser bsdiff: %s)' % _dlerr)
+            if 'src' in dir():
+              print('diag: raw=%d B, hdr=%r' % (len(src), src[:40]))
+            sys.exit(0)
+          PYEOF2
+              else
+                echo "WARNING: bsdiff gagal — delta skip (non-fatal)"
+              fi
+            else
+              echo "ℹ️ APK lama gak ketemu/gak valid — delta skip (build pertama kanal ini normal)"
+            fi
+            if [ -s /tmp/delta.patch ] && [ -s /tmp/delta-info.json ] && [ -n "$OLD_VC" ] && [ -z "$ENC_MODE" ]; then
+              DELTA_SIZE=$(stat -c%s /tmp/delta.patch)
+              if [ "$DELTA_SIZE" -lt $((APK_SIZE * 75 / 100)) ]; then
+                DELTA_SHA=$(python3 -c "import json;print(json.load(open('/tmp/delta-info.json'))['sha256'])")
+                DELTA_JSON=",\"delta\":{\"base\":$OLD_VC,\"url\":\"https://github.com/${GH_REPO}/releases/download/apk-$PKG/delta-${OLD_VC}-${RUN_NO}.patch\",\"sha256\":\"$DELTA_SHA\",\"size\":$DELTA_SIZE}"
+                echo "🚀 Delta worth-it: $DELTA_SIZE byte = $((DELTA_SIZE * 100 / APK_SIZE))% dari penuh"
+              else
+                echo "ℹ️ Delta gak worth-it ($DELTA_SIZE byte) — skip, user unduh penuh"
+                rm -f /tmp/delta.patch /tmp/delta-info.json
+              fi
+            fi
+          else
+            echo "WARNING: bsdiff gak ke-install — delta skip (non-fatal, update penuh tetap jalan)"
+          fi
+
+          printf '{"package":"%s","versionCode":%s,"versionName":"3.0.%s","sha256":"%s","builtAt":"%s","size":%s%s%s}\n' \
+            "$PKG" "$RUN_NO" "$RUN_NO" "$APK_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$APK_SIZE" "$ENC_JSON" "$DELTA_JSON" > /tmp/build-info.json
+          mkdir -p apk_out
+          cp /tmp/build-info.json apk_out/build-info.json
+          echo "🔧 build-info.json: v3.0.$RUN_NO sha256=$APK_SHA (nyempil di artifact buat bot)"
+
+          # ── 🛡️ guard anti-race (identik build_kotlin.yml v3.3) ──
+          CUR_VC=$(curl -sL --max-time 30 "https://github.com/${GH_REPO}/releases/download/apk-$PKG/build-info.json" 2>/dev/null | python3 -c "import json,sys;print(int(json.load(sys.stdin).get('versionCode',0)))" 2>/dev/null || echo 0)
+          OTA_FRESH=1
+          if [ "$CUR_VC" -ge "$RUN_NO" ] 2>/dev/null && [ "$CUR_VC" -gt 0 ]; then
+            OTA_FRESH=0
+            echo "⏭️ Kanal OTA udah di v$CUR_VC (>= run ini $RUN_NO) — build stale/rerun, kanal GAK disentuh"
+          fi
+          if [ "$OTA_FRESH" = "1" ] && gh release view "apk-$PKG" >/dev/null 2>&1; then
+            if [ -n "$ENC_MODE" ]; then
+              # 🔒 CRYPT VAULT: upload .enc + purge asset plain/delta lama
+              gh release upload "apk-$PKG" /tmp/app.apk.enc --clobber \
+                && echo "🔒 Kanal OTA updated: apk-$PKG → app.apk.enc (TERENKRIPSI)" \
+                || echo "WARNING: gh upload .enc gagal (non-fatal)"
+              gh api "repos/${GH_REPO}/releases/tags/apk-$PKG" --jq '.assets[] | select(.name == "app.apk" or (.name|test("^app-[0-9]+\\.[0-9]+\\.[0-9]+\\.apk$")) or (.name|test("^delta-"))) | [.id,.name] | @tsv' 2>/dev/null | \
+              while IFS=$'\t' read -r vaid vname; do
+                gh api -X DELETE "repos/${GH_REPO}/releases/assets/$vaid" >/dev/null 2>&1 || true
+                echo "🧹 [CRYPT VAULT] asset plain dibuang: $vname"
+              done
+            else
+            gh release upload "apk-$PKG" /tmp/app.apk --clobber \
+              && echo "🔄 Kanal OTA updated: apk-$PKG → app.apk" \
+              || echo "WARNING: gh upload gagal (non-fatal)"
+            gh release upload "apk-$PKG" "/tmp/app-3.0.$RUN_NO.apk" --clobber \
+              && echo "🗂️ APK ber-versi: app-3.0.$RUN_NO.apk (riwayat/rollback)" \
+              || echo "WARNING: upload APK ber-versi gagal (non-fatal)"
+            if [ -s /tmp/delta.patch ]; then
+              gh release upload "apk-$PKG" /tmp/delta.patch --clobber \
+                && echo "🚀 Delta asset: delta-${OLD_VC}-${RUN_NO}.patch" \
+                || echo "WARNING: upload delta gagal (non-fatal)"
+            fi
+            fi
+            gh release upload "apk-$PKG" /tmp/build-info.json --clobber \
+              && echo "🔧 build-info.json ter-upload (bot pake ini buat manifest OTA)" \
+              || echo "WARNING: upload build-info gagal (non-fatal)"
+            if [ -n "$OLD_VC" ]; then
+              gh api "repos/${GH_REPO}/releases/tags/apk-$PKG" --jq '.assets[] | select((.name|test("^delta-[0-9]+-[0-9]+\\.patch$"))) | [.id, .name] | @tsv' 2>/dev/null | \
+              while IFS=$'\t' read -r aid aname; do
+                if [ "$aname" != "delta-${OLD_VC}-${RUN_NO}.patch" ]; then
+                  gh api -X DELETE "repos/${GH_REPO}/releases/assets/$aid" >/dev/null 2>&1 || true
+                  echo "🧹 Delta lama dibuang: $aname"
+                fi
+              done
+            fi
+          elif [ "$OTA_FRESH" = "1" ]; then
+            if [ -n "$ENC_MODE" ]; then
+              gh release create "apk-$PKG" /tmp/app.apk.enc /tmp/build-info.json \
+                --title "OTA $PKG" --notes "Build terbaru — kanal auto-update (terenkripsi CRYPT VAULT)" \
+                && echo "🔒 Kanal OTA dibuat: apk-$PKG (app.apk.enc + build-info)" \
+                || echo "WARNING: gh create gagal (non-fatal)"
+            else
+              gh release create "apk-$PKG" /tmp/app.apk "/tmp/app-3.0.$RUN_NO.apk" /tmp/build-info.json \
+                --title "OTA $PKG" --notes "Build terbaru — kanal auto-update (Flutter)" \
+                && echo "🔄 Kanal OTA dibuat: apk-$PKG (+ APK ber-versi + build-info)" \
+                || echo "WARNING: gh create gagal (non-fatal)"
+            fi
+          fi
+
+      - name: Patch Android + Build AAB
+        if: inputs.build_format == 'aab' || inputs.build_format == 'both'
+        run: |
+          # ── 🆕 v5.6: second-chance bootstrap android/ (idempoten) ──
+          if [ -d "android" ] && [ ! -f "android/app/src/main/AndroidManifest.xml" ]; then
+            echo "🧹 [bootstrap-2] android/ shell kosong → dihapus"
+            rm -rf android
+          fi
+          if [ ! -d "android" ] && [ -f "pubspec.yaml" ]; then
+            echo "🔁 [bootstrap-2] android/ masih gak ada di step AAB → generate sekarang..."
+            PKG_NAME=$(sed -n "s/^name:[[:space:]]*[\"']\{0,1\}\([a-zA-Z0-9_]\+\)[\"']\{0,1\}[[:space:]]*$/\1/p" pubspec.yaml | head -1)
+            PKG_NAME=$(echo "$PKG_NAME" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9_]//g')
+            case "$PKG_NAME" in "") PKG_NAME="app" ;; [0-9]*) PKG_NAME="a$PKG_NAME" ;; esac
+            flutter create --platforms=android --org com.dzrbuild --project-name "$PKG_NAME" . || true
+            if [ -d "android" ]; then echo "✅ [bootstrap-2] android/ generated"; else echo "❌ [bootstrap-2] flutter create gagal"; fi
+          fi
+          # ── 🩹 v6.9: V1-EMBEDDING + SCAFFOLD PRE-FLIGHT SWEEP ──
+          # Kasus nyata (run #97 AI ASISTEN): ZIP bawa android/ SETENGAH JADI
+          # — manifest jadul (meta-data flutterEmbedding cuma di COMMENT /
+          # value bukan 2 / application class v1), kadang TANPA gradle config
+          # sama sekali. flutter tool nolak instan (0.1s, sebelum gradle):
+          # "Build failed due to use of deleted Android v1 embedding."
+          # Auto-fix lama cuma nrima manifest polos → gagal ulang → mati.
+          # Dua lapis self-heal SEBELUM build pertama:
+          #   L1) scaffold invalid (gak ada settings/build.gradle(.kts)) →
+          #       regenerate pake flutter create (lib/pubspec/assets aman)
+          #   L2) manifest dinormalisasi ke embedding v2 + semua class v1 di
+          #       .java/.kt ke-swap
+          if [ -d "android" ] && [ ! -f "android/settings.gradle" ] && [ ! -f "android/settings.gradle.kts" ] && [ ! -f "android/build.gradle" ] && [ ! -f "android/build.gradle.kts" ]; then
+            echo "🩹 [v1-sweep L1] android/ gak punya gradle config = scaffold invalid → regenerate..."
+            PKG_NAME=$(sed -n "s/^name:[[:space:]]*["']\{0,1\}\([a-zA-Z0-9_]\+\)["']\{0,1\}[[:space:]]*$/\1/p" pubspec.yaml | head -1)
+            PKG_NAME=$(echo "$PKG_NAME" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9_]//g')
+            case "$PKG_NAME" in "") PKG_NAME="app" ;; [0-9]*) PKG_NAME="a$PKG_NAME" ;; esac
+            rm -rf android
+            flutter create --platforms=android --org com.dzrbuild --project-name "$PKG_NAME" . || true
+            if [ -d "android" ]; then
+              echo "✅ [v1-sweep L1] android/ regenerated (v2 fresh)"
+              touch /tmp/bldfix_v1_nuked
+            else
+              echo "⚠️ [v1-sweep L1] flutter create gagal — reactive nuke bakal nyoba lagi"
+            fi
+          fi
+          if [ -f "android/app/src/main/AndroidManifest.xml" ]; then
+            MANIFEST_V1="android/app/src/main/AndroidManifest.xml"
+            python3 - "$MANIFEST_V1" <<'PYV1'
+          import re, sys
+          mani = sys.argv[1]
+          with open(mani, encoding='utf-8', errors='replace') as f:
+              t = f.read()
+          orig = t
+          t = re.sub(r'<!--.*?flutterEmbedding.*?-->', '', t, flags=re.S)
+          def _force2(m):
+              return re.sub(r'android:value="[^"]*"', 'android:value="2"', m.group(0))
+          t = re.sub(r'<meta-data\s+[^>]*android:name="flutterEmbedding"[^>]*/?>', _force2, t)
+          if not re.search(r'<meta-data\s+[^>]*android:name="flutterEmbedding"', t):
+              t = re.sub(r'(<application\b[^>]*>)', r'\1\n        <meta-data android:name="flutterEmbedding" android:value="2" />', t, count=1)
+          t = t.replace(' android:name="io.flutter.app.FlutterApplication"', '').replace('android:name="io.flutter.app.FlutterApplication" ', '')
+          if t != orig:
+              with open(mani, 'w', encoding='utf-8') as f:
+                  f.write(t)
+              print('🩹 [v1-sweep L2] manifest dinormalisasi ke embedding v2')
+          else:
+              print('🔎 [v1-sweep L2] manifest udah v2-clean')
+          PYV1
+            for SRCF in $(find android/app/src/main \( -name "*.java" -o -name "*.kt" \) 2>/dev/null); do
+              if grep -q "io\.flutter\.app\." "$SRCF" 2>/dev/null; then
+                sed -i 's|io\.flutter\.app\.FlutterActivity|io.flutter.embedding.android.FlutterActivity|g; s|io\.flutter\.app\.FlutterApplication|android.app.Application|g; s|\bFlutterApplication\b|Application|g' "$SRCF"
+                echo "🩹 [v1-sweep L2] $SRCF: class embedding v1 → v2"
+              fi
+            done
+          fi
+          SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ] && [ -n "$SAFE_APP_NAME" ] && [ "$SAFE_APP_NAME" != "MyApp" ]; then
+            sed -i "s|android:label=\"[^\"]*\"|android:label=\"$SAFE_APP_NAME\"|g" "$MANIFEST"
+          fi
+          # ── 🔐 v6.1: izin INTERNET buat project bootstrap ──
+          # Template `flutter create` GAK naro uses-permission INTERNET di
+          # main manifest (cuma di debug/profile) → APK release dari project
+          # yang gak bawa android/ jalan TANPA izin internet → WebView blank
+          # + fetch API/font gagal semua (kasus run #60: arshi layar item).
+          # web2apk.yml udah lama inject; jalur ZIP project kelewat.
+          if [ -f "$MANIFEST" ] && ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
+            sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />\n    <application|' "$MANIFEST"
+            echo "🔐 [v6.1] Izin INTERNET + NETWORK_STATE + WIFI_STATE di-inject ke manifest"
+          fi
+          # ── 🔐 v4.11: PERIZINAN PILIHAN USER (fail-loud, gak ada silent no-op) ──
+          if [ -n "$INPUT_PERMS" ] && [ -f "$MANIFEST" ]; then
+            PERM_BEFORE=$(grep -o 'uses-permission' "$MANIFEST" | wc -l)
+            PERM_INJECT=""
+            PERM_NINS=0
+            IFS=',' read -r -a PERM_ARR <<< "$INPUT_PERMS"
+            for RP in "${PERM_ARR[@]}"; do
+              RP=$(printf '%s' "$RP" | tr -cd 'a-zA-Z0-9._')
+              [ -z "$RP" ] && continue
+              case "$RP" in android.permission.*) : ;; *) RP="android.permission.$RP" ;; esac
+              if ! grep -q "android:name=\"$RP\"" "$MANIFEST"; then
+                PERM_INJECT="$PERM_INJECT    <uses-permission android:name=\"$RP\" />\\n"
+                PERM_NINS=$((PERM_NINS+1))
+              fi
+            done
+            if [ -n "$PERM_INJECT" ]; then
+              if grep -q '<application' "$MANIFEST"; then
+                sed -i "s|<application|$PERM_INJECT<application|" "$MANIFEST"
+              else
+                # ↩️ manifest tanpa <application> itu SAH (module non-app:
+                # benchmark/test/library). uses-permission tetap valid di
+                # root manifest → fallback anchor </manifest> (case nyata:
+                # kotlin run #16 NanzTube, macrobenchmark manifest).
+                sed -i "s|</manifest>|$PERM_INJECT</manifest>|" "$MANIFEST"
+                echo "↩️ $MANIFEST: fallback anchor </manifest> (gak ada <application>)"
+              fi
+              PERM_AFTER=$(grep -o 'uses-permission' "$MANIFEST" | wc -l)
+              if [ "$PERM_AFTER" -lt $((PERM_BEFORE + PERM_NINS)) ]; then
+                echo "=== BUILD FAILED: inject perizinan gagal (anchor <application & </manifest> dua-duanya gak match) ==="
+                exit 1
+              fi
+              echo "🔐 [v4.11] $PERM_NINS izin pilihan user ke-inject (total uses-permission: $PERM_AFTER)"
+            else
+              echo "🔐 [v4.11] semua izin pilihan user udah ada di manifest"
+            fi
+          fi
+          # ── ⚙️ v4.8 AGP9 safety net (AAB step) — sama kayak step APK.
+          find "$HOME/.pub-cache/hosted" -name "build.gradle" -path "*android*" \
+            -exec sed -i "s/getDefaultProguardFile('proguard-android.txt')/getDefaultProguardFile('proguard-android-optimize.txt')/g" {} + 2>/dev/null || true
+          echo "AGP9 proguard safety patch (AAB): OK"
+          # ── 🆕 v5.6: launcher icon (idempoten — di-skip kalo APK step udah) ──
+          if [ ! -f ".icons_generated" ] && [ -d "android" ] && grep -qP "^flutter_launcher_icons:\s*$" pubspec.yaml 2>/dev/null; then
+            # v6.9: pre-check image_path — config nunjuk file yang gak ada =
+            # PathNotFoundException (run #97 assets/icon.png) → skip bersih,
+            # pake icon default (non-fatal, gak buang waktu dart run).
+            ICON_PATH=$(sed -n "s/^\s*image_path:\s*["']\{0,1\}\([^"'# ]\+\)["']\{0,1\}.*/\1/p" pubspec.yaml | head -1)
+            if [ -n "$ICON_PATH" ] && [ ! -f "$ICON_PATH" ]; then
+              echo "⚠️ flutter_launcher_icons nunjuk ke '$ICON_PATH' yang GAK ADA — skip generate (pake icon default, non-fatal)"
+              touch .icons_generated
+            else
+              echo "🎨 config flutter_launcher_icons ketemu → generate icon launcher..."
+              dart run flutter_launcher_icons || echo "⚠️ icon generation gagal (non-fatal) — build lanjut pake icon default"
+              touch .icons_generated
+            fi
+          fi
+          # ── 🩹 v6.9 RES-DUP SHIELD: resource nama-sama-ekstensi-beda di res
+          # (klasik: ic_launcher.png + ic_launcher.jpg hasil eksport generator
+          # icon) → "Duplicate resources" → task merge*Resources mati. Buang
+          # dobelnya SEBELUM build (idempoten — jalan 2x hasil sama).
+          rm -f /tmp/resdedup_removed
+          python3 /tmp/resdedup.py || true
+          # ── ⚙️ v5.4/v5.5: build AAB + auto-fix reaktif (max 5 percobaan) ──
+          # Sama kayak step APK: toolchain ke tua → bldfix.py, error Dart →
+          # dartfix.py, terus retry.
+          rm -f /tmp/bldfix_applied /tmp/dartfix_applied /tmp/dartfix_pubspec
+          BUILD_ATTEMPT=0
+          BUILD_OK=false
+          while [ "$BUILD_ATTEMPT" -lt 5 ]; do
+            BUILD_ATTEMPT=$((BUILD_ATTEMPT+1))
+            echo "🔨 flutter build appbundle — percobaan $BUILD_ATTEMPT/5 ($INPUT_BUILD_TYPE)"
+            BUILD_RC=0
+            if [ "$INPUT_BUILD_TYPE" = "release" ]; then
+              BUILD_OUT=$(flutter build appbundle --release --no-tree-shake-icons --build-number="${GITHUB_RUN_NUMBER:-1}" 2>&1) || BUILD_RC=$?
+            else
+              BUILD_OUT=$(flutter build appbundle --debug --no-tree-shake-icons --build-number="${GITHUB_RUN_NUMBER:-1}" 2>&1) || BUILD_RC=$?
+            fi
+            printf '%s\n' "$BUILD_OUT" | tee build_output_aab.txt
+            if [ "$BUILD_RC" -eq 0 ]; then
+              BUILD_OK=true
+              break
+            fi
+            echo "⚠️ build AAB gagal (percobaan $BUILD_ATTEMPT/5) → cek toolchain auto-fix..."
+            BLD_ERR="$BUILD_OUT" python3 /tmp/bldfix.py || true
+            if [ -s /tmp/bldfix_applied ]; then
+              echo "🔁 retry build setelah auto-fix: $(head -1 /tmp/bldfix_applied)"
+              rm -f /tmp/bldfix_applied
+            else
+              # ── ⚙️ v5.5: coba heal error kompilasi Dart ──
+              python3 /tmp/dartfix.py build_output_aab.txt || true
+              if [ -s /tmp/dartfix_applied ]; then
+                if [ -s /tmp/dartfix_pubspec ]; then
+                  echo "🔁 pub get setelah dependency_overrides ditambahkan..."
+                  flutter pub get || true
+                fi
+                echo "🔁 retry build setelah Dart auto-fix: $(head -1 /tmp/dartfix_applied)"
+                rm -f /tmp/dartfix_applied /tmp/dartfix_pubspec
+              else
+                # ── 🩹 v6.9 RES-DUP reaktif: error "Duplicate resources" →
+                # buang dobelnya lalu retry. Dupe gak ketemu di res project
+                # (mis. dupe-nya di plugin AAR) → stop, biar bot laporin.
+                if grep -qE "Duplicate resources|duplicate value for resource" build_output*.txt 2>/dev/null; then
+                  rm -f /tmp/resdedup_removed
+                  python3 /tmp/resdedup.py || true
+                  if [ -s /tmp/resdedup_removed ]; then
+                    echo "🔁 retry build setelah RES-DUP ($(wc -l < /tmp/resdedup_removed) file duplikat kehapus)"
+                    rm -f /tmp/resdedup_removed
+                    continue
+                  fi
+                fi
+                echo "❌ gak ada auto-fix yang cocok — error asli ada di atas"
+                break
+              fi
+            fi
+          done
+          rm -f /tmp/bldfix_applied /tmp/dartfix_applied /tmp/dartfix_pubspec
+          if [ "$BUILD_OK" != "true" ]; then
+            echo "=== AAB BUILD FAILED ==="
+            tail -40 build_output_aab.txt
+            exit 1
+          fi
+          AAB_PATH=$(find build/app/outputs/bundle -name "*.aab" 2>/dev/null | head -1)
+          if [ -z "$AAB_PATH" ]; then
+            echo "AAB FAILED!"; exit 1
+          fi
+
+      # ── 🔒 v4.11 CRYPT VAULT — enkripsi artifact (APK/AAB yang nyisa di disk).
+      # Kanal OTA udah ngurus release (upload .enc); step ini nyisa-nyisain
+      # file plain di build dir → dienkripsi in-place (.enc), plain DIHAPUS.
+      - name: Crypt Vault (artifact)
+        env:
+          ENC_KEY: ${{ inputs.enc_key }}
+        run: |
+          if [ -z "$ENC_KEY" ]; then
+            echo "🔓 ENC_KEY kosong — artifact plain (mode lama, backward compat)"
+            exit 0
+          fi
+          echo "::add-mask::$ENC_KEY"
+          ENC_N=0
+          while IFS= read -r -d '' VF; do
+            if openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -k "$ENC_KEY" -in "$VF" -out "${VF}.enc"; then
+              rm -f "$VF"
+              ENC_N=$((ENC_N+1))
+              echo "🔒 $(basename "$VF") → $(basename "$VF").enc"
+            else
+              echo "=== BUILD FAILED: enkripsi artifact gagal buat $VF ==="
+              exit 1
+            fi
+          done < <(find build/app/outputs apk_out -type f \( -name "*.apk" -o -name "*.aab" \) -print0 2>/dev/null)
+          echo "🔒 [CRYPT VAULT] $ENC_N artifact dienkripsi"
+      - name: Upload APK
+        if: inputs.build_format == 'apk' || inputs.build_format == 'both'
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-output
+          path: |
+            build/app/outputs/flutter-apk/*.apk
+            build/app/outputs/flutter-apk/*.apk.enc
+            apk_out/build-info.json
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload AAB
+        if: inputs.build_format == 'aab' || inputs.build_format == 'both'
+        uses: actions/upload-artifact@v4
+        with:
+          name: aab-output
+          path: |
+            build/app/outputs/bundle/**/*.aab
+            build/app/outputs/bundle/**/*.aab.enc
+          retention-days: 7
+
+      # NOTE: "Send to Telegram" step DIHAPUS — bot (index.js) yang handle kirim APK
+      # ke user via client.sendFile() dengan format caption yang lebih informatif.
+      # Workflow cuma upload artifact, bot yang deliver.
+      # Ini mencegah DOUBLE APK (workflow kirim + bot kirim = user kirim 2x).
+
+      # NOTE: "Notify Failure" step DIHAPUS — bot (index.js) yang handle error
+      # notification ke user dengan detail error log + file attachment.
+      # Workflow cuma build + upload artifact, bot yang handle semua notifikasi.
+      # Ini mencegah DOUBLE error message (workflow kirim + bot kirim).
