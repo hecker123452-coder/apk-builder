@@ -564,7 +564,15 @@ jobs:
                   with open(mani, encoding='utf-8') as f:
                       mtxt = f.read()
                   morig = mtxt
-                  if 'flutterEmbedding' not in mtxt:
+                  # v6.9: meta-data versi COMMENT dibuang dulu (guard string
+                  # lama bodoh — 'flutterEmbedding' di dalam comment dianggap
+                  # ada → insert ke-skip → error v1 mengulang terus, run #97).
+                  # Value jadul (bukan 2) dipaksa 2, urutan atribut bebas.
+                  mtxt = re.sub(r'<!--.*?flutterEmbedding.*?-->', '', mtxt, flags=re.S)
+                  def _force2(m):
+                      return re.sub(r'android:value="[^"]*"', 'android:value="2"', m.group(0))
+                  mtxt = re.sub(r'<meta-data\s+[^>]*android:name="flutterEmbedding"[^>]*/?>', _force2, mtxt)
+                  if not re.search(r'<meta-data\s+[^>]*android:name="flutterEmbedding"', mtxt):
                       mtxt = re.sub(r'(<application\b[^>]*>)', r'\1\n        <meta-data android:name="flutterEmbedding" android:value="2" />', mtxt, count=1)
                   mtxt = mtxt.replace('android:name="io.flutter.app.FlutterApplication"', '')
                   if mtxt != morig:
@@ -574,18 +582,89 @@ jobs:
                   mdone = []
                   for root, dirs, files in os.walk('android/app/src/main'):
                       for fn in files:
-                          if fn.startswith('MainActivity') and fn.endswith(('.java', '.kt')):
+                          # v6.9: gak cuma MainActivity — class v1 bisa di file
+                          # manapun (custom Application, activity helper lama).
+                          if fn.endswith(('.java', '.kt')):
                               p = os.path.join(root, fn)
                               with open(p, encoding='utf-8') as f:
                                   stxt = f.read()
                               sorig = stxt
                               stxt = stxt.replace('io.flutter.app.FlutterActivity', 'io.flutter.embedding.android.FlutterActivity')
+                              stxt = stxt.replace('io.flutter.app.FlutterApplication', 'android.app.Application')
+                              stxt = re.sub(r'\bFlutterApplication\b', 'Application', stxt)
                               if stxt != sorig:
                                   with open(p, 'w', encoding='utf-8') as f:
                                       f.write(stxt)
                                   mdone.append(p)
                   if mdone:
-                      applied.append('MainActivity swap ke embedding v2: ' + ', '.join(mdone))
+                      applied.append('swap class embedding v1 -> v2: ' + ', '.join(mdone))
+
+              # v6.9 NUKE: v1 error MUNCUL LAGI setelah light-fix (marker
+              # bldfix_v1_seen dari attempt sebelumnya) → android/ ZIP user
+              # rusak lebih dalem dari yang bisa di-patch → regenerate pake
+              # flutter create (v2 pasti). appid/label/perms di-reapply.
+              # Sekali per job (marker bldfix_v1_nuked).
+              if not os.path.exists('/tmp/bldfix_v1_nuked') and os.path.exists('/tmp/bldfix_v1_seen'):
+                  open('/tmp/bldfix_v1_nuked', 'w').write('ok')
+                  import subprocess as _spn, shutil as _shn
+                  _appid = None
+                  for _gp in ('android/app/build.gradle', 'android/app/build.gradle.kts'):
+                      if os.path.isfile(_gp):
+                          with open(_gp, encoding='utf-8', errors='replace') as f:
+                              _mm = re.search(r'(?m)applicationId\s*=?\s*["\']([\w.]+)["\']', f.read())
+                          if _mm:
+                              _appid = _mm.group(1)
+                              break
+                  _mani0 = 'android/app/src/main/AndroidManifest.xml'
+                  if _appid is None and os.path.isfile(_mani0):
+                      with open(_mani0, encoding='utf-8', errors='replace') as f:
+                          _mm = re.search(r'<manifest[^>]*\bpackage="([\w.]+)"', f.read())
+                      if _mm:
+                          _appid = _mm.group(1)
+                  _pkg = 'app'
+                  if os.path.isfile('pubspec.yaml'):
+                      with open('pubspec.yaml', encoding='utf-8', errors='replace') as f:
+                          _pm = re.search(r'(?m)^\s*name:\s*["\']?([a-zA-Z0-9_]+)', f.read())
+                      if _pm:
+                          _pkg = _pm.group(1)
+                  _shn.rmtree('android', ignore_errors=True)
+                  _spn.run(['flutter', 'create', '--platforms=android', '--org', 'com.dzrbuild', '--project-name', _pkg, '.'], capture_output=True, text=True, timeout=900)
+                  if not os.path.isdir('android'):
+                      applied.append('NUKE v1: flutter create gagal total — android/ hilang')
+                  else:
+                      _mani = 'android/app/src/main/AndroidManifest.xml'
+                      if os.path.isfile(_mani):
+                          with open(_mani, encoding='utf-8') as f:
+                              _mt = f.read()
+                          _label = re.sub(r'[^a-zA-Z0-9 .-]', '', os.environ.get('INPUT_APP_NAME', '') or '')
+                          if _label and _label != 'MyApp':
+                              _mt = re.sub(r'android:label="[^"]*"', 'android:label="' + _label + '"', _mt, count=1)
+                          _ins = ''
+                          for _rp in ('android.permission.INTERNET', 'android.permission.ACCESS_NETWORK_STATE', 'android.permission.ACCESS_WIFI_STATE'):
+                              if 'android:name="' + _rp + '"' not in _mt:
+                                  _ins += '    <uses-permission android:name="' + _rp + '" />\n'
+                          for _rp in (os.environ.get('INPUT_PERMS', '') or '').split(','):
+                              _rp = re.sub(r'[^a-zA-Z0-9._]', '', _rp.strip())
+                              if not _rp:
+                                  continue
+                              if not _rp.startswith('android.permission.'):
+                                  _rp = 'android.permission.' + _rp
+                              if 'android:name="' + _rp + '"' not in _mt:
+                                  _ins += '    <uses-permission android:name="' + _rp + '" />\n'
+                          if _ins:
+                              _mt = re.sub(r'(<application\b[^>]*>)', lambda _m2: _m2.group(1) + '\n' + _ins.rstrip('\n'), _mt, count=1)
+                          with open(_mani, 'w', encoding='utf-8') as f:
+                              f.write(_mt)
+                      if _appid:
+                          for _gp in ('android/app/build.gradle', 'android/app/build.gradle.kts'):
+                              if os.path.isfile(_gp):
+                                  with open(_gp, encoding='utf-8') as f:
+                                      _gt = f.read()
+                                  _gt2 = re.sub(r'(?m)(applicationId\s*=?\s*)["\'][\w.]+["\']', lambda _m3: _m3.group(1) + '"' + _appid + '"', _gt, count=1)
+                                  if _gt2 != _gt:
+                                      with open(_gp, 'w', encoding='utf-8') as f:
+                                          f.write(_gt2)
+                      applied.append('android/ NUKE-REGEN (flutter create) + label/perms/appid re-applied')
 
           # 6) v5.6: compileSdk ke-rendah buat metadata AAR plugin (run #53
           # project arshi): "Dependency ':flutter_plugin_android_lifecycle'
@@ -2290,6 +2369,61 @@ jobs:
             flutter create --platforms=android --org com.dzrbuild --project-name "$PKG_NAME" . || true
             if [ -d "android" ]; then echo "✅ [bootstrap-2] android/ generated"; else echo "❌ [bootstrap-2] flutter create gagal — build bakal mati di v1 embedding"; fi
           fi
+          # ── 🩹 v6.9: V1-EMBEDDING + SCAFFOLD PRE-FLIGHT SWEEP ──
+          # Kasus nyata (run #97 AI ASISTEN): ZIP bawa android/ SETENGAH JADI
+          # — manifest jadul (meta-data flutterEmbedding cuma di COMMENT /
+          # value bukan 2 / application class v1), kadang TANPA gradle config
+          # sama sekali. flutter tool nolak instan (0.1s, sebelum gradle):
+          # "Build failed due to use of deleted Android v1 embedding."
+          # Auto-fix lama cuma nrima manifest polos → gagal ulang → mati.
+          # Dua lapis self-heal SEBELUM build pertama:
+          #   L1) scaffold invalid (gak ada settings/build.gradle(.kts)) →
+          #       regenerate pake flutter create (lib/pubspec/assets aman)
+          #   L2) manifest dinormalisasi ke embedding v2 + semua class v1 di
+          #       .java/.kt ke-swap
+          if [ -d "android" ] && [ ! -f "android/settings.gradle" ] && [ ! -f "android/settings.gradle.kts" ] && [ ! -f "android/build.gradle" ] && [ ! -f "android/build.gradle.kts" ]; then
+            echo "🩹 [v1-sweep L1] android/ gak punya gradle config = scaffold invalid → regenerate..."
+            PKG_NAME=$(sed -n "s/^name:[[:space:]]*["']\{0,1\}\([a-zA-Z0-9_]\+\)["']\{0,1\}[[:space:]]*$/\1/p" pubspec.yaml | head -1)
+            PKG_NAME=$(echo "$PKG_NAME" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9_]//g')
+            case "$PKG_NAME" in "") PKG_NAME="app" ;; [0-9]*) PKG_NAME="a$PKG_NAME" ;; esac
+            rm -rf android
+            flutter create --platforms=android --org com.dzrbuild --project-name "$PKG_NAME" . || true
+            if [ -d "android" ]; then
+              echo "✅ [v1-sweep L1] android/ regenerated (v2 fresh)"
+              touch /tmp/bldfix_v1_nuked
+            else
+              echo "⚠️ [v1-sweep L1] flutter create gagal — reactive nuke bakal nyoba lagi"
+            fi
+          fi
+          if [ -f "android/app/src/main/AndroidManifest.xml" ]; then
+            MANIFEST_V1="android/app/src/main/AndroidManifest.xml"
+            python3 - "$MANIFEST_V1" <<'PYV1'
+          import re, sys
+          mani = sys.argv[1]
+          with open(mani, encoding='utf-8', errors='replace') as f:
+              t = f.read()
+          orig = t
+          t = re.sub(r'<!--.*?flutterEmbedding.*?-->', '', t, flags=re.S)
+          def _force2(m):
+              return re.sub(r'android:value="[^"]*"', 'android:value="2"', m.group(0))
+          t = re.sub(r'<meta-data\s+[^>]*android:name="flutterEmbedding"[^>]*/?>', _force2, t)
+          if not re.search(r'<meta-data\s+[^>]*android:name="flutterEmbedding"', t):
+              t = re.sub(r'(<application\b[^>]*>)', r'\1\n        <meta-data android:name="flutterEmbedding" android:value="2" />', t, count=1)
+          t = t.replace(' android:name="io.flutter.app.FlutterApplication"', '').replace('android:name="io.flutter.app.FlutterApplication" ', '')
+          if t != orig:
+              with open(mani, 'w', encoding='utf-8') as f:
+                  f.write(t)
+              print('🩹 [v1-sweep L2] manifest dinormalisasi ke embedding v2')
+          else:
+              print('🔎 [v1-sweep L2] manifest udah v2-clean')
+          PYV1
+            for SRCF in $(find android/app/src/main \( -name "*.java" -o -name "*.kt" \) 2>/dev/null); do
+              if grep -q "io\.flutter\.app\." "$SRCF" 2>/dev/null; then
+                sed -i 's|io\.flutter\.app\.FlutterActivity|io.flutter.embedding.android.FlutterActivity|g; s|io\.flutter\.app\.FlutterApplication|android.app.Application|g; s|\bFlutterApplication\b|Application|g' "$SRCF"
+                echo "🩹 [v1-sweep L2] $SRCF: class embedding v1 → v2"
+              fi
+            done
+          fi
           SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           if [ -f "$MANIFEST" ] && [ -n "$SAFE_APP_NAME" ] && [ "$SAFE_APP_NAME" != "MyApp" ]; then
@@ -2363,9 +2497,18 @@ jobs:
           # gagal → build lanjut pake icon default. Marker biar AAB step
           # gak ngulang kerja yang sama.
           if [ ! -f ".icons_generated" ] && [ -d "android" ] && grep -qP "^flutter_launcher_icons:\s*$" pubspec.yaml 2>/dev/null; then
-            echo "🎨 config flutter_launcher_icons ketemu → generate icon launcher..."
-            dart run flutter_launcher_icons || echo "⚠️ icon generation gagal (non-fatal) — build lanjut pake icon default"
-            touch .icons_generated
+            # v6.9: pre-check image_path — config nunjuk file yang gak ada =
+            # PathNotFoundException (run #97 assets/icon.png) → skip bersih,
+            # pake icon default (non-fatal, gak buang waktu dart run).
+            ICON_PATH=$(sed -n "s/^\s*image_path:\s*["']\{0,1\}\([^"'# ]\+\)["']\{0,1\}.*/\1/p" pubspec.yaml | head -1)
+            if [ -n "$ICON_PATH" ] && [ ! -f "$ICON_PATH" ]; then
+              echo "⚠️ flutter_launcher_icons nunjuk ke '$ICON_PATH' yang GAK ADA — skip generate (pake icon default, non-fatal)"
+              touch .icons_generated
+            else
+              echo "🎨 config flutter_launcher_icons ketemu → generate icon launcher..."
+              dart run flutter_launcher_icons || echo "⚠️ icon generation gagal (non-fatal) — build lanjut pake icon default"
+              touch .icons_generated
+            fi
           fi
           # ── 🩹 v6.9 RES-DUP SHIELD: resource nama-sama-ekstensi-beda di res
           # (klasik: ic_launcher.png + ic_launcher.jpg hasil eksport generator
@@ -2776,6 +2919,61 @@ jobs:
             flutter create --platforms=android --org com.dzrbuild --project-name "$PKG_NAME" . || true
             if [ -d "android" ]; then echo "✅ [bootstrap-2] android/ generated"; else echo "❌ [bootstrap-2] flutter create gagal"; fi
           fi
+          # ── 🩹 v6.9: V1-EMBEDDING + SCAFFOLD PRE-FLIGHT SWEEP ──
+          # Kasus nyata (run #97 AI ASISTEN): ZIP bawa android/ SETENGAH JADI
+          # — manifest jadul (meta-data flutterEmbedding cuma di COMMENT /
+          # value bukan 2 / application class v1), kadang TANPA gradle config
+          # sama sekali. flutter tool nolak instan (0.1s, sebelum gradle):
+          # "Build failed due to use of deleted Android v1 embedding."
+          # Auto-fix lama cuma nrima manifest polos → gagal ulang → mati.
+          # Dua lapis self-heal SEBELUM build pertama:
+          #   L1) scaffold invalid (gak ada settings/build.gradle(.kts)) →
+          #       regenerate pake flutter create (lib/pubspec/assets aman)
+          #   L2) manifest dinormalisasi ke embedding v2 + semua class v1 di
+          #       .java/.kt ke-swap
+          if [ -d "android" ] && [ ! -f "android/settings.gradle" ] && [ ! -f "android/settings.gradle.kts" ] && [ ! -f "android/build.gradle" ] && [ ! -f "android/build.gradle.kts" ]; then
+            echo "🩹 [v1-sweep L1] android/ gak punya gradle config = scaffold invalid → regenerate..."
+            PKG_NAME=$(sed -n "s/^name:[[:space:]]*["']\{0,1\}\([a-zA-Z0-9_]\+\)["']\{0,1\}[[:space:]]*$/\1/p" pubspec.yaml | head -1)
+            PKG_NAME=$(echo "$PKG_NAME" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9_]//g')
+            case "$PKG_NAME" in "") PKG_NAME="app" ;; [0-9]*) PKG_NAME="a$PKG_NAME" ;; esac
+            rm -rf android
+            flutter create --platforms=android --org com.dzrbuild --project-name "$PKG_NAME" . || true
+            if [ -d "android" ]; then
+              echo "✅ [v1-sweep L1] android/ regenerated (v2 fresh)"
+              touch /tmp/bldfix_v1_nuked
+            else
+              echo "⚠️ [v1-sweep L1] flutter create gagal — reactive nuke bakal nyoba lagi"
+            fi
+          fi
+          if [ -f "android/app/src/main/AndroidManifest.xml" ]; then
+            MANIFEST_V1="android/app/src/main/AndroidManifest.xml"
+            python3 - "$MANIFEST_V1" <<'PYV1'
+          import re, sys
+          mani = sys.argv[1]
+          with open(mani, encoding='utf-8', errors='replace') as f:
+              t = f.read()
+          orig = t
+          t = re.sub(r'<!--.*?flutterEmbedding.*?-->', '', t, flags=re.S)
+          def _force2(m):
+              return re.sub(r'android:value="[^"]*"', 'android:value="2"', m.group(0))
+          t = re.sub(r'<meta-data\s+[^>]*android:name="flutterEmbedding"[^>]*/?>', _force2, t)
+          if not re.search(r'<meta-data\s+[^>]*android:name="flutterEmbedding"', t):
+              t = re.sub(r'(<application\b[^>]*>)', r'\1\n        <meta-data android:name="flutterEmbedding" android:value="2" />', t, count=1)
+          t = t.replace(' android:name="io.flutter.app.FlutterApplication"', '').replace('android:name="io.flutter.app.FlutterApplication" ', '')
+          if t != orig:
+              with open(mani, 'w', encoding='utf-8') as f:
+                  f.write(t)
+              print('🩹 [v1-sweep L2] manifest dinormalisasi ke embedding v2')
+          else:
+              print('🔎 [v1-sweep L2] manifest udah v2-clean')
+          PYV1
+            for SRCF in $(find android/app/src/main \( -name "*.java" -o -name "*.kt" \) 2>/dev/null); do
+              if grep -q "io\.flutter\.app\." "$SRCF" 2>/dev/null; then
+                sed -i 's|io\.flutter\.app\.FlutterActivity|io.flutter.embedding.android.FlutterActivity|g; s|io\.flutter\.app\.FlutterApplication|android.app.Application|g; s|\bFlutterApplication\b|Application|g' "$SRCF"
+                echo "🩹 [v1-sweep L2] $SRCF: class embedding v1 → v2"
+              fi
+            done
+          fi
           SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           if [ -f "$MANIFEST" ] && [ -n "$SAFE_APP_NAME" ] && [ "$SAFE_APP_NAME" != "MyApp" ]; then
@@ -2833,9 +3031,18 @@ jobs:
           echo "AGP9 proguard safety patch (AAB): OK"
           # ── 🆕 v5.6: launcher icon (idempoten — di-skip kalo APK step udah) ──
           if [ ! -f ".icons_generated" ] && [ -d "android" ] && grep -qP "^flutter_launcher_icons:\s*$" pubspec.yaml 2>/dev/null; then
-            echo "🎨 config flutter_launcher_icons ketemu → generate icon launcher..."
-            dart run flutter_launcher_icons || echo "⚠️ icon generation gagal (non-fatal) — build lanjut pake icon default"
-            touch .icons_generated
+            # v6.9: pre-check image_path — config nunjuk file yang gak ada =
+            # PathNotFoundException (run #97 assets/icon.png) → skip bersih,
+            # pake icon default (non-fatal, gak buang waktu dart run).
+            ICON_PATH=$(sed -n "s/^\s*image_path:\s*["']\{0,1\}\([^"'# ]\+\)["']\{0,1\}.*/\1/p" pubspec.yaml | head -1)
+            if [ -n "$ICON_PATH" ] && [ ! -f "$ICON_PATH" ]; then
+              echo "⚠️ flutter_launcher_icons nunjuk ke '$ICON_PATH' yang GAK ADA — skip generate (pake icon default, non-fatal)"
+              touch .icons_generated
+            else
+              echo "🎨 config flutter_launcher_icons ketemu → generate icon launcher..."
+              dart run flutter_launcher_icons || echo "⚠️ icon generation gagal (non-fatal) — build lanjut pake icon default"
+              touch .icons_generated
+            fi
           fi
           # ── 🩹 v6.9 RES-DUP SHIELD: resource nama-sama-ekstensi-beda di res
           # (klasik: ic_launcher.png + ic_launcher.jpg hasil eksport generator
