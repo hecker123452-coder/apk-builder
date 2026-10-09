@@ -3579,7 +3579,12 @@ jobs:
                   "-keep class io.flutter.** { *; }\n"
                   "-keep class io.flutter.plugins.** { *; }\n"
                   "-keepattributes *Annotation*, Signature, InnerClasses, EnclosingMethod\n"
-                  "-dontwarn org.apache.commons.compress.**\n")
+                  "-dontwarn org.apache.commons.compress.**\n"
+                  # R8 Flutter klasik: embedding nyangkut play.core (opsional, gak dibundle)
+                  "-dontwarn com.google.android.play.core.**\n"
+                  "-dontwarn com.google.errorprone.annotations.**\n"
+                  "-dontwarn javax.annotation.**\n"
+                  "-dontwarn org.codehaus.mojo.animal_sniffer.**\n")
               created.append(pg)
               return pg
 
@@ -4396,7 +4401,7 @@ jobs:
           path: |
             **/build/app/outputs/flutter-apk/*.apk
             **/build/app/outputs/flutter-apk/*.apk.enc
-            opt_report.json
+            **/opt_report.json
           retention-days: 7
           if-no-files-found: error
 
