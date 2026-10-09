@@ -63,6 +63,10 @@ on:
         description: '🔐 v4.11 Perizinan: daftar izin Android dipisah koma (mis. CAMERA,RECORD_AUDIO). Kosong = tanpa tambahan.'
         required: false
         default: ''
+      optimize:
+        description: '⚡ v4.40 Optimasi build: scan dulu + R8/shrink + obfuscate + tree-shake (true/false)'
+        required: false
+        default: 'false'
 
 jobs:
   build:
@@ -87,6 +91,7 @@ jobs:
       INPUT_KEYSTORE_ID: ${{ inputs.keystore_id }}
       ENC_KEY: ${{ inputs.enc_key }}
       INPUT_PERMS: ${{ inputs.perms }}
+      INPUT_OPTIMIZE: ${{ inputs.optimize }}
 
     steps:
       - name: Setup JDK
@@ -478,7 +483,263 @@ jobs:
                   f.write(content)
               print('GRADLE-FIX: Gradle ' + cur + ' < min ' + min_ver + ' -> wrapper di-bump ke ' + min_ver)
           PYGW
-          cat > /tmp/bldfix.py <<'PYBLD'
+          # ── ⚡ v4.40.0 OPTIMASI: helper python (scan dulu → apply → laporan) ──
+          cat > /tmp/optscan.py <<'OPTSCAN'
+          #!/usr/bin/env python3
+          # OPT-SCAN v4.40.0 — scan project SEBELUM build optimasi (baca doang, non-destruktif).
+          # Output: /tmp/opt_scan.json + log ringkas. Jenis project ke-detect otomatis.
+          import glob, json, os, re
+          
+          SKIP = {".git", "build", ".dart_tool", ".gradle", "node_modules", ".idea", "buildSrc", "gradle"}
+          files = []
+          total = 0
+          for root, dirs, fns in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in SKIP]
+              for f in fns:
+                  p = os.path.join(root, f)
+                  try:
+                      s = os.path.getsize(p)
+                  except OSError:
+                      continue
+                  total += s
+                  files.append((s, p.replace(os.sep, "/")))
+          files.sort(reverse=True)
+          dart = sum(1 for _, p in files if p.endswith(".dart"))
+          native = sum(1 for _, p in files if p.endswith((".kt", ".java")))
+          resf = sum(1 for _, p in files if "/res/" in p)
+          big = [{"path": p, "mb": round(s / 1048576, 2)} for s, p in files[:5] if s >= 1048576]
+          sc = {"files": len(files), "totalMB": round(total / 1048576, 1), "dartFiles": dart,
+                "nativeFiles": native, "resFiles": resf, "bigFiles": big}
+          acts = perms = 0
+          dbg = False
+          for mpath in glob.glob("*/src/main/AndroidManifest.xml") + glob.glob("android/app/src/main/AndroidManifest.xml"):
+              try:
+                  mt = open(mpath, encoding="utf-8", errors="replace").read()
+              except OSError:
+                  continue
+              acts += len(re.findall(r"<activity[ >]", mt))
+              perms += len(re.findall(r"<uses-permission", mt))
+              if 'android:debuggable="true"' in mt:
+                  dbg = True
+          sc.update({"activities": acts, "permissions": perms, "debuggable": dbg})
+          json.dump({"scan": sc}, open("/tmp/opt_scan.json", "w"), indent=1)
+          print("OPT-SCAN:", json.dumps(sc)[:360])
+          
+          OPTSCAN
+          cat > /tmp/optgradle.py <<'OPTGRADLE'
+          #!/usr/bin/env python3
+          # OPT-GRADLE v4.40.0 — apply/undo optimasi gradle (R8 minify + shrinkResources +
+          # proguard optimize + buang debuggable). Idempoten (marker). undo = restore byte
+          # persis dari backup -> self-heal aman. Kotlin/Flutter ke-detect otomatis.
+          import glob, json, os, re, sys
+
+          MARK = "/tmp/opt_gradle_active"
+          BAKG = "/tmp/opt_gradle_bak.json"
+          RPT = "/tmp/opt_gradle.json"
+          mode = sys.argv[1] if len(sys.argv) > 1 else "apply"
+
+          def gradle_files():
+              pats = ["android/app/build.gradle", "android/app/build.gradle.kts",
+                      "app/build.gradle", "app/build.gradle.kts",
+                      "*/app/build.gradle", "*/app/build.gradle.kts",
+                      "*/build.gradle", "*/build.gradle.kts"]
+              seen = []
+              for pat in pats:
+                  for p in sorted(glob.glob(pat)):
+                      if not os.path.isfile(p) or p in seen:
+                          continue
+                      try:
+                          t = open(p, encoding="utf-8", errors="replace").read()
+                      except OSError:
+                          continue
+                      if "com.android.application" in t:
+                          seen.append(p)
+              return seen[:1]
+
+          def release_region(lines):
+              start = None
+              for i, ln in enumerate(lines):
+                  if re.match(r'^\s*release\s*\{', ln) or re.match(r'^\s*getByName("release")\s*\{', ln) or re.match(r"^\s*named('release')\s*\{", ln) or re.match(r'^\s*named("release")\s*\{', ln):
+                      start = i
+                      break
+              if start is None:
+                  return None
+              bal = 0
+              for j in range(start, len(lines)):
+                  bal += lines[j].count("{") - lines[j].count("}")
+                  if bal == 0:
+                      return (start, j)
+              return None
+
+          def apply_gradle(p, applied, notes):
+              t = open(p, encoding="utf-8").read()
+              kts = p.endswith(".kts")
+              lines = t.split("\n")
+              reg = release_region(lines)
+              if reg is None:
+                  notes.append(p + ": release block gak ketemu — skip R8")
+                  return t
+              s, e = reg
+              seg = lines[s:e + 1]
+              # AGP 9 KTS: nama properti isMinifyEnabled/isShrinkResources (minifyEnabled
+              # polos = Unresolved reference). Groovy lama: minifyEnabled true.
+              def sub(seg, groovy_name, kts_name, kts):
+                  rx_false = re.compile(r'^\s*(?:' + groovy_name + r'|' + kts_name + r')\s*(=\s*)?false\s*$')
+                  rx_any = re.compile(r'^\s*(?:' + groovy_name + r'|' + kts_name + r')\b')
+                  has_false = False
+                  has_any = False
+                  for ln in seg:
+                      if rx_any.match(ln):
+                          has_any = True
+                          if rx_false.match(ln):
+                              has_false = True
+                  val = (kts_name + " = true") if kts else (groovy_name + " true")
+                  if has_false:
+                      for i, ln in enumerate(seg):
+                          if rx_false.match(ln):
+                              seg[i] = rx_false.sub(val, ln)
+                              applied.append(kts_name + " -> true (" + ("R8/resource dibuang" if "Minify" in kts_name else "resource dibuang") + ")")
+                      return seg, True
+                  if not has_any:
+                      seg.insert(1, "            " + val)
+                      applied.append(kts_name + " true disisip ke release")
+                      return seg, True
+                  return seg, False
+              changed = False
+              seg, c = sub(seg, "minifyEnabled", "isMinifyEnabled", kts)
+              changed = changed or c
+              seg, c = sub(seg, "shrinkResources", "isShrinkResources", kts)
+              changed = changed or c
+              segtxt = "\n".join(seg)
+              if "proguardFiles" not in segtxt and "getDefaultProguardFile" not in segtxt:
+                  line = ('proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")'
+                          if kts else
+                          "proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'")
+                  seg.insert(1, "            " + line)
+                  applied.append("proguardFiles optimize + rules disisip")
+                  changed = True
+              lines[s:e + 1] = seg
+              return "\n".join(lines) if changed else t
+
+          def strip_debuggable(applied):
+              out = {}
+              for mpath in glob.glob("*/src/main/AndroidManifest.xml") + glob.glob("android/app/src/main/AndroidManifest.xml"):
+                  try:
+                      mt = open(mpath, encoding="utf-8").read()
+                  except OSError:
+                      continue
+                  if 'android:debuggable="true"' in mt:
+                      out[mpath] = mt
+                      mt = mt.replace(' android:debuggable="true"', "")
+                      open(mpath, "w", encoding="utf-8").write(mt)
+                      applied.append("manifest: debuggable=true dibuang")
+              return out
+
+          def write_proguard(grad_path, created):
+              pg = os.path.join(os.path.dirname(grad_path), "proguard-rules.pro")
+              if os.path.exists(pg):
+                  return None
+              open(pg, "w", encoding="utf-8").write(
+                  "# DZR OPTIMASI (v4.40.0) — keep set konservatif (Flutter & native)\n"
+                  "-keep class io.flutter.** { *; }\n"
+                  "-keep class io.flutter.plugins.** { *; }\n"
+                  "-keepattributes *Annotation*, Signature, InnerClasses, EnclosingMethod\n"
+                  "-dontwarn org.apache.commons.compress.**\n"
+                  # R8 Flutter klasik: embedding nyangkut play.core (opsional, gak dibundle)
+                  "-dontwarn com.google.android.play.core.**\n"
+                  "-dontwarn com.google.errorprone.annotations.**\n"
+                  "-dontwarn javax.annotation.**\n"
+                  "-dontwarn org.codehaus.mojo.animal_sniffer.**\n")
+              created.append(pg)
+              return pg
+
+          if mode == "apply":
+              if os.path.exists(MARK):
+                  print("OPT-GRADLE: udah applied (marker) — no-op")
+                  sys.exit(0)
+              gs = gradle_files()
+              applied = []
+              notes = []
+              if not gs:
+                  notes.append("build.gradle app gak ketemu — optimasi gradle skip")
+                  json.dump({"applied": applied, "notes": notes}, open(RPT, "w"), indent=1)
+                  print("OPT-GRADLE_APPLIED=0")
+                  sys.exit(0)
+              bak = {"files": {}, "proguard": [], "manifests": {}}
+              n = 0
+              for p in gs:
+                  orig = open(p, encoding="utf-8").read()
+                  new = apply_gradle(p, applied, notes)
+                  if new != orig:
+                      bak["files"][p] = orig
+                      open(p, "w", encoding="utf-8").write(new)
+                      n += 1
+                      pg = write_proguard(p, bak["proguard"])
+                      if pg:
+                          applied.append("proguard-rules.pro ditulis (keep set aman)")
+              bak["manifests"] = strip_debuggable(applied)
+              json.dump({"applied": applied, "notes": notes}, open(RPT, "w"), indent=1)
+              if n > 0 or bak["manifests"]:
+                  json.dump(bak, open(BAKG, "w"))
+                  open(MARK, "w").write("1")
+              print("OPT-GRADLE_APPLIED=" + str(len(applied)))
+              for a in applied:
+                  print("  + " + a)
+              for x in notes:
+                  print("  - " + x)
+          else:
+              if not os.path.exists(BAKG):
+                  print("OPT-GRADLE_UNDO=0 (gak ada backup)")
+                  sys.exit(0)
+              bak = json.load(open(BAKG))
+              for p, orig in (bak.get("files") or {}).items():
+                  try:
+                      open(p, "w", encoding="utf-8").write(orig)
+                  except OSError:
+                      pass
+              for p in (bak.get("proguard") or []):
+                  try:
+                      os.remove(p)
+                  except OSError:
+                      pass
+              for p, orig in (bak.get("manifests") or {}).items():
+                  try:
+                      open(p, "w", encoding="utf-8").write(orig)
+                  except OSError:
+                      pass
+              os.remove(BAKG)
+              if os.path.exists(MARK):
+                  os.remove(MARK)
+              print("OPT-GRADLE_UNDO=1")
+
+          OPTGRADLE
+          cat > /tmp/optreport.py <<'OPTREPORT'
+          #!/usr/bin/env python3
+          # OPT-REPORT v4.40.0 — gabung hasil scan + applied optimasi + size APK final.
+          # opt_report.json ikut artifact -> bot bacain laporannya ke user (bukti jalan).
+          import glob, json, os
+          
+          rep = {}
+          for f, k in (("/tmp/opt_scan.json", "scan"), ("/tmp/opt_gradle.json", "gradle")):
+              try:
+                  d = json.load(open(f))
+                  # flatten: opt_scan.json bentuknya {"scan": {...}} -> ambil isinya langsung
+                  rep[k] = d.get(k, d) if isinstance(d, dict) else d
+              except Exception:
+                  pass
+          apks = glob.glob("build/app/outputs/flutter-apk/*.apk") + glob.glob("apk_out/*.apk")
+          if not apks:
+              apks = glob.glob("**/build/app/outputs/flutter-apk/*.apk", recursive=True)
+          if apks:
+              p = max(apks, key=os.path.getsize)
+              rep["apkMB"] = round(os.path.getsize(p) / 1048576, 2)
+          rep["rolledBack"] = os.path.exists("/tmp/opt_gradle_undone") or os.path.exists("/tmp/opt_rolledback")
+          rep["ver"] = "4.40.0"
+          json.dump(rep, open("opt_report.json", "w"), indent=1)
+          print("OPT-REPORT OK — rolledBack=" + str(rep["rolledBack"]))
+          
+          OPTREPORT
+                    cat > /tmp/bldfix.py <<'PYBLD'
           import os, re
 
           err = os.environ.get('BLD_ERR', '')
@@ -2525,6 +2786,11 @@ jobs:
           # ── ⚙️ v5.4/v5.5: build + auto-fix reaktif (max 5 percobaan) ──
           # Toolchain ke tua → bldfix.py. Error kompilasi Dart (API package
           # hasil major-upgrade) → dartfix.py. Terus retry sampai OK.
+          # ── ⚡ v4.40 OPTIMASI: scan dulu → apply R8/shrink (idempoten) ──
+          if [ "$INPUT_OPTIMIZE" = "true" ]; then
+            python3 /tmp/optscan.py || true
+            python3 /tmp/optgradle.py apply || true
+          fi
           rm -f /tmp/bldfix_applied /tmp/dartfix_applied /tmp/dartfix_pubspec
           BUILD_ATTEMPT=0
           BUILD_OK=false
@@ -2533,7 +2799,12 @@ jobs:
             echo "🔨 flutter build apk — percobaan $BUILD_ATTEMPT/5 ($INPUT_BUILD_TYPE)"
             BUILD_RC=0
             if [ "$INPUT_BUILD_TYPE" = "release" ]; then
-              BUILD_OUT=$(flutter build apk --release --no-tree-shake-icons --build-number="${GITHUB_RUN_NUMBER:-1}" 2>&1) || BUILD_RC=$?
+              if [ "$INPUT_OPTIMIZE" = "true" ] && [ ! -f /tmp/opt_gradle_undone ]; then
+                echo "⚡ Optimasi ON — flutter build apk (obfuscate + tree-shake, percobaan $BUILD_ATTEMPT/5)"
+                BUILD_OUT=$(flutter build apk --release --tree-shake-icons --obfuscate --split-debug-info=/tmp/dzr-symbols --build-number="${GITHUB_RUN_NUMBER:-1}" 2>&1) || BUILD_RC=$?
+              else
+                BUILD_OUT=$(flutter build apk --release --no-tree-shake-icons --build-number="${GITHUB_RUN_NUMBER:-1}" 2>&1) || BUILD_RC=$?
+              fi
             else
               BUILD_OUT=$(flutter build apk --debug --no-tree-shake-icons --build-number="${GITHUB_RUN_NUMBER:-1}" 2>&1) || BUILD_RC=$?
             fi
@@ -2543,6 +2814,13 @@ jobs:
               break
             fi
             echo "⚠️ build gagal (percobaan $BUILD_ATTEMPT/5) → cek toolchain auto-fix..."
+            # ⚡ OPT-SELFHEAL v4.40: gagal pas optimasi aktif → rollback + retry polos
+            if [ "$INPUT_OPTIMIZE" = "true" ] && [ ! -f /tmp/opt_gradle_undone ]; then
+              echo "⚡ SELF-HEAL optimasi: rollback R8/shrink/tree-shake → retry tanpa optimasi"
+              touch /tmp/opt_gradle_undone
+              python3 /tmp/optgradle.py undo || true
+              continue
+            fi
             BLD_ERR="$BUILD_OUT" python3 /tmp/bldfix.py || true
             if [ -s /tmp/bldfix_applied ]; then
               echo "🔁 retry build setelah auto-fix: $(head -1 /tmp/bldfix_applied)"
@@ -2588,6 +2866,10 @@ jobs:
             exit 1
           fi
           echo "APK: $APK_PATH ($(du -sh "$APK_PATH" | cut -f1))"
+          # ⚡ v4.40: laporan optimasi masuk artifact → bot bacain ke user
+          if [ "$INPUT_OPTIMIZE" = "true" ]; then
+            python3 /tmp/optreport.py || true
+          fi
 
       # ─── 🔐 v5.9 → v6.6: STABLE SIGNING jalur ZIP project (PER USER) ────
       # v5.9 dulu: SATU keystore global (signing/dzr-release.jks) buat SEMUA
@@ -3062,6 +3344,11 @@ jobs:
           # ── ⚙️ v5.4/v5.5: build AAB + auto-fix reaktif (max 5 percobaan) ──
           # Sama kayak step APK: toolchain ke tua → bldfix.py, error Dart →
           # dartfix.py, terus retry.
+          # ── ⚡ v4.40 OPTIMASI: scan dulu → apply R8/shrink (idempoten) ──
+          if [ "$INPUT_OPTIMIZE" = "true" ]; then
+            python3 /tmp/optscan.py || true
+            python3 /tmp/optgradle.py apply || true
+          fi
           rm -f /tmp/bldfix_applied /tmp/dartfix_applied /tmp/dartfix_pubspec
           BUILD_ATTEMPT=0
           BUILD_OK=false
@@ -3070,7 +3357,12 @@ jobs:
             echo "🔨 flutter build appbundle — percobaan $BUILD_ATTEMPT/5 ($INPUT_BUILD_TYPE)"
             BUILD_RC=0
             if [ "$INPUT_BUILD_TYPE" = "release" ]; then
-              BUILD_OUT=$(flutter build appbundle --release --no-tree-shake-icons --build-number="${GITHUB_RUN_NUMBER:-1}" 2>&1) || BUILD_RC=$?
+              if [ "$INPUT_OPTIMIZE" = "true" ] && [ ! -f /tmp/opt_gradle_undone ]; then
+                echo "⚡ Optimasi ON — flutter build appbundle (obfuscate + tree-shake, percobaan $BUILD_ATTEMPT/5)"
+                BUILD_OUT=$(flutter build appbundle --release --tree-shake-icons --obfuscate --split-debug-info=/tmp/dzr-symbols --build-number="${GITHUB_RUN_NUMBER:-1}" 2>&1) || BUILD_RC=$?
+              else
+                BUILD_OUT=$(flutter build appbundle --release --no-tree-shake-icons --build-number="${GITHUB_RUN_NUMBER:-1}" 2>&1) || BUILD_RC=$?
+              fi
             else
               BUILD_OUT=$(flutter build appbundle --debug --no-tree-shake-icons --build-number="${GITHUB_RUN_NUMBER:-1}" 2>&1) || BUILD_RC=$?
             fi
@@ -3080,6 +3372,13 @@ jobs:
               break
             fi
             echo "⚠️ build AAB gagal (percobaan $BUILD_ATTEMPT/5) → cek toolchain auto-fix..."
+            # ⚡ OPT-SELFHEAL v4.40: gagal pas optimasi aktif → rollback + retry polos
+            if [ "$INPUT_OPTIMIZE" = "true" ] && [ ! -f /tmp/opt_gradle_undone ]; then
+              echo "⚡ SELF-HEAL optimasi: rollback R8/shrink/tree-shake → retry tanpa optimasi"
+              touch /tmp/opt_gradle_undone
+              python3 /tmp/optgradle.py undo || true
+              continue
+            fi
             BLD_ERR="$BUILD_OUT" python3 /tmp/bldfix.py || true
             if [ -s /tmp/bldfix_applied ]; then
               echo "🔁 retry build setelah auto-fix: $(head -1 /tmp/bldfix_applied)"
@@ -3156,6 +3455,7 @@ jobs:
             build/app/outputs/flutter-apk/*.apk
             build/app/outputs/flutter-apk/*.apk.enc
             apk_out/build-info.json
+            **/opt_report.json
           retention-days: 7
           if-no-files-found: warn
 
