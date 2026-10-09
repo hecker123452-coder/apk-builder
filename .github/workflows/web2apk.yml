@@ -229,6 +229,10 @@ on:
         description: 'APK hemat arm64-only (~40% lebih kecil) (true/false)'
         required: false
         default: 'false'
+      optimize:
+        description: '⚡ v4.40 Optimasi build: scan dulu + R8/shrink + obfuscate + tree-shake (true/false)'
+        required: false
+        default: 'false'
       html_zip_url:
         description: 'v5.0 Direct download URL ZIP situs statis (index.html di root)'
         required: false
@@ -278,6 +282,7 @@ jobs:
       INPUT_SPLASH_STYLE: ${{ inputs.splash_style }}
       INPUT_DARK_MODE: ${{ inputs.dark_mode }}
       INPUT_SMALL_APK: ${{ inputs.small_apk }}
+      INPUT_OPTIMIZE: ${{ inputs.optimize }}
       INPUT_HTML_ZIP_URL: ${{ inputs.html_zip_url }}
       INPUT_TABS_JSON: ${{ inputs.tabs_json }}
       INPUT_STATS_URL: ${{ inputs.stats_url }}
@@ -974,6 +979,93 @@ jobs:
               } catch (_) {
                 // Gak ada app yang mau nerima link-nya — diemin aja, jangan crash.
               }
+            }
+
+            // ── ⬇️ OPT-DL v4.40: download in-app (DownloadManager + blob/data bridge) ──
+            Future<void> _handleDownload(InAppWebViewController controller, DownloadStartRequest request) async {
+              final url = request.url.toString();
+              final scheme = request.url.scheme.toLowerCase();
+              String fname = (request.suggestedFilename ?? '').trim();
+              if (fname.isEmpty) fname = 'download-' + DateTime.now().millisecondsSinceEpoch.toString();
+              fname = fname.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+              if (fname.length > 120) fname = fname.substring(fname.length - 120);
+              final mime = (request.mimeType ?? '').trim();
+              // 1) data: URI → decode base64 langsung, simpan via native
+              if (scheme == 'data') {
+                final i = url.indexOf(';base64,');
+                if (i > 0) {
+                  try {
+                    await _invokeSave(fname, mime, url.substring(i + 8));
+                    return;
+                  } catch (_) {}
+                }
+                await _openExternal(request.url);
+                return;
+              }
+              // 2) blob: → fetch di page via JS → base64 → simpan via native
+              if (scheme == 'blob') {
+                try {
+                  final res = await controller.callAsyncJavaScript(
+                    functionBody: """
+                      async function(dzrUrl) {
+                        try {
+                          const r = await fetch(dzrUrl);
+                          if (!r.ok) return { ok: false, err: 'HTTP ' + r.status };
+                          const blob = await r.blob();
+                          const buf = new Uint8Array(await blob.arrayBuffer());
+                          if (buf.length > 48 * 1024 * 1024) return { ok: false, err: 'file kegedean (max 48MB)' };
+                          let bin = '';
+                          const CH = 0x8000;
+                          for (let i = 0; i < buf.length; i += CH) {
+                            bin += String.fromCharCode.apply(null, buf.subarray(i, i + CH));
+                          }
+                          return { ok: true, mime: blob.type || '', b64: btoa(bin) };
+                        } catch (e) { return { ok: false, err: String(e) }; }
+                      }
+                    """,
+                    arguments: {'dzrUrl': url},
+                  );
+                  final v = res?.value;
+                  if (v is Map && v['ok'] == true) {
+                    final b64 = (v['b64'] ?? '') as String;
+                    if (b64.isNotEmpty) {
+                      await _invokeSave(fname, ((v['mime'] ?? '') as String).trim().isEmpty ? mime : (v['mime'] as String), b64);
+                      return;
+                    }
+                  }
+                } catch (_) {}
+                await _openExternal(request.url);
+                return;
+              }
+              // 3) http/https → DownloadManager NATIVE (notif progress + folder Download)
+              if (scheme == 'http' || scheme == 'https') {
+                String cookies = '';
+                try {
+                  final cl = await CookieManager.instance().getCookies(url: request.url);
+                  cookies = (cl ?? []).map((c) => c.name + '=' + (c.value ?? '')).join('; ');
+                } catch (_) {}
+                String ua = '';
+                try {
+                  final st = await controller.getSettings();
+                  ua = (st?.userAgent ?? '').toString();
+                } catch (_) {}
+                try {
+                  final r = await _updateChannel.invokeMethod('download', {
+                    'url': url, 'filename': fname, 'cookies': cookies,
+                    'mimetype': mime, 'ua': ua,
+                  });
+                  if (r == 'ok') return;
+                } catch (_) {}
+                // native gak ready / gagal → jalur lama (browser luar)
+                await _openExternal(request.url);
+                return;
+              }
+              await _openExternal(request.url);
+            }
+
+            Future<void> _invokeSave(String name, String mime, String b64) async {
+              final r = await _updateChannel.invokeMethod('saveDownload', {'name': name, 'mime': mime, 'b64': b64});
+              if (r != 'ok') throw Exception('saveDownload gagal: ' + r.toString());
             }
 
             // ── 📢 v5.1: tarik pengumuman global (raw.githubusercontent).
@@ -2146,8 +2238,10 @@ jobs:
                             _fail(error.description);
                           },
                           onDownloadStartRequest: (controller, request) async {
-                            // Link download → serahin ke browser/DownloadManager sistem
-                            await _openExternal(request.url);
+                            // ⬇️ OPT-DL v4.40: download beneran in-app — DownloadManager
+                            // native (http/s) + bridge blob/data via JS (yang dulu cuma
+                            // dilempar ke browser luar → keluar app / senyap mati).
+                            await _handleDownload(controller, request);
                           },
                         ),
 
@@ -2599,6 +2693,10 @@ jobs:
             if ! grep -q "REQUEST_INSTALL_PACKAGES" "$MANIFEST"; then
               sed -i 's|<application|<uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />\n    <application|' "$MANIFEST"
             fi
+            # ── ⬇️ v4.40 OPT-DL: izin buat DownloadManager di Android 9 ke bawah ──
+            if ! grep -q "WRITE_EXTERNAL_STORAGE" "$MANIFEST"; then
+              sed -i 's|<application|<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />\n    <application|' "$MANIFEST"
+            fi
             # FileProvider = nyalain app kasih file APK ke installer dgn aman
             # (content:// URI — wajib di Android 7+).
             if ! grep -q "androidx.core.content.FileProvider" "$MANIFEST"; then
@@ -2625,10 +2723,17 @@ jobs:
               app_pkg = '.'.join(parts[ki + 1:-1])
               kotlin = '''package __APP_PKG__
 
+          import android.app.DownloadManager
           import android.app.NotificationChannel
           import android.app.NotificationManager
           import android.app.PendingIntent
+          import android.content.ContentValues
+          import android.content.Context
           import android.content.Intent
+          import android.os.Environment
+          import android.provider.MediaStore
+          import android.util.Base64
+          import android.widget.Toast
           import android.content.pm.PackageManager
           import android.net.Uri
           import android.os.Build
@@ -2678,9 +2783,93 @@ jobs:
                                   call.argument<String>("path") ?: ""))
                               "notifDismiss" -> result.success(notifDismiss())
                               "ensureNotifPerm" -> result.success(ensureNotifPerm())
+                              // ⬇️ OPT-DL v4.40: download link → DownloadManager sistem
+                              "download" -> result.success(download(
+                                  call.argument<String>("url") ?: "",
+                                  call.argument<String>("filename") ?: "",
+                                  call.argument<String>("cookies") ?: "",
+                                  call.argument<String>("mimetype") ?: "",
+                                  call.argument<String>("ua") ?: ""))
+                              // ⬇️ OPT-DL v4.40: blob/data bytes (base64) → folder Download
+                              "saveDownload" -> result.success(saveDownload(
+                                  call.argument<String>("name") ?: "file.bin",
+                                  call.argument<String>("mime") ?: "",
+                                  call.argument<String>("b64") ?: ""))
                               else -> result.notImplemented()
                           }
                       }
+              }
+
+              // ── ⬇️ OPT-DL v4.40: download beneran in-app (native feel) ──
+              // Dulu: link download dilempar ke browser luar (launchUrl) → keluar
+              // app / senyap mati; blob:/data: PASTI gak jalan. Sekarang:
+              // http(s) = DownloadManager (notif progress, masuk folder Download),
+              // blob/data = bytes base64 dari webview → MediaStore/File.
+              private fun download(url: String, filename: String, cookies: String, mimetype: String, ua: String): String {
+                  return try {
+                      val u = Uri.parse(url)
+                      val sch = u.scheme ?: ""
+                      if (sch != "http" && sch != "https") return "error:scheme"
+                      val req = DownloadManager.Request(u)
+                      req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                      req.setTitle(filename)
+                      req.setDescription("Mengunduh...")
+                      req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename)
+                      req.setAllowedOverMetered(true)
+                      req.setAllowedOverRoaming(true)
+                      if (mimetype.isNotEmpty()) req.setMimeType(mimetype)
+                      if (ua.isNotEmpty()) req.addRequestHeader("User-Agent", ua)
+                      if (cookies.isNotEmpty()) req.addRequestHeader("Cookie", cookies)
+                      (getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(req)
+                      toast("⬇️ Mengunduh " + filename)
+                      "ok"
+                  } catch (e: SecurityException) {
+                      // Android ≤9: butuh izin storage → minta, user tap lagi
+                      try {
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+                              requestPermissions(arrayOf(android.Manifest.permission.WRITE_EXTERNAL_STORAGE), 4207)
+                          }
+                      } catch (_) {}
+                      "error:perm"
+                  } catch (e: Exception) {
+                      "error:" + (e.message ?: "unknown")
+                  }
+              }
+
+              private fun saveDownload(name: String, mime: String, b64: String): String {
+                  return try {
+                      val bytes = Base64.decode(b64, Base64.DEFAULT)
+                      val safeMime = if (mime.isNotEmpty()) mime else "application/octet-stream"
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                          val cv = ContentValues()
+                          cv.put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                          cv.put(MediaStore.MediaColumns.MIME_TYPE, safeMime)
+                          cv.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                          val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
+                              ?: return "error:insert"
+                          contentResolver.openOutputStream(uri)!!.use { it.write(bytes) }
+                      } else {
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) return "error:perm"
+                          val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                          if (!dir.exists()) dir.mkdirs()
+                          var f = File(dir, name)
+                          var i = 1
+                          while (f.exists()) {
+                              val dot = name.lastIndexOf('.')
+                              f = File(dir, if (dot > 0) name.substring(0, dot) + " (" + i + ")" + name.substring(dot) else name + " (" + i + ")")
+                              i++
+                          }
+                          FileOutputStream(f).use { it.write(bytes) }
+                      }
+                      toast("✅ Tersimpan di folder Download: " + name)
+                      "ok"
+                  } catch (e: Exception) {
+                      "error:" + (e.message ?: "unknown")
+                  }
+              }
+
+              private fun toast(text: String) {
+                  try { runOnUiThread { Toast.makeText(this, text, Toast.LENGTH_LONG).show() } } catch (_) {}
               }
 
               private fun canInstall(): Boolean =
@@ -3229,7 +3418,256 @@ jobs:
             -exec sed -i "s/getDefaultProguardFile('proguard-android.txt')/getDefaultProguardFile('proguard-android-optimize.txt')/g" {} + 2>/dev/null || true
           echo "AGP9 proguard safety patch: OK"
 
-          # ── Build ──
+          # ── ⚡ v4.40.0 OPTIMASI: helper python (scan dulu → apply → laporan) ──
+          cat > /tmp/optscan.py <<'OPTSCAN'
+          #!/usr/bin/env python3
+          # OPT-SCAN v4.40.0 — scan project SEBELUM build optimasi (baca doang, non-destruktif).
+          # Output: /tmp/opt_scan.json + log ringkas. Jenis project ke-detect otomatis.
+          import glob, json, os, re
+          
+          SKIP = {".git", "build", ".dart_tool", ".gradle", "node_modules", ".idea", "buildSrc", "gradle"}
+          files = []
+          total = 0
+          for root, dirs, fns in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in SKIP]
+              for f in fns:
+                  p = os.path.join(root, f)
+                  try:
+                      s = os.path.getsize(p)
+                  except OSError:
+                      continue
+                  total += s
+                  files.append((s, p.replace(os.sep, "/")))
+          files.sort(reverse=True)
+          dart = sum(1 for _, p in files if p.endswith(".dart"))
+          native = sum(1 for _, p in files if p.endswith((".kt", ".java")))
+          resf = sum(1 for _, p in files if "/res/" in p)
+          big = [{"path": p, "mb": round(s / 1048576, 2)} for s, p in files[:5] if s >= 1048576]
+          sc = {"files": len(files), "totalMB": round(total / 1048576, 1), "dartFiles": dart,
+                "nativeFiles": native, "resFiles": resf, "bigFiles": big}
+          acts = perms = 0
+          dbg = False
+          for mpath in glob.glob("*/src/main/AndroidManifest.xml") + glob.glob("android/app/src/main/AndroidManifest.xml"):
+              try:
+                  mt = open(mpath, encoding="utf-8", errors="replace").read()
+              except OSError:
+                  continue
+              acts += len(re.findall(r"<activity[ >]", mt))
+              perms += len(re.findall(r"<uses-permission", mt))
+              if 'android:debuggable="true"' in mt:
+                  dbg = True
+          sc.update({"activities": acts, "permissions": perms, "debuggable": dbg})
+          json.dump({"scan": sc}, open("/tmp/opt_scan.json", "w"), indent=1)
+          print("OPT-SCAN:", json.dumps(sc)[:360])
+          
+          OPTSCAN
+          cat > /tmp/optgradle.py <<'OPTGRADLE'
+          #!/usr/bin/env python3
+          # OPT-GRADLE v4.40.0 — apply/undo optimasi gradle (R8 minify + shrinkResources +
+          # proguard optimize + buang debuggable). Idempoten (marker). undo = restore byte
+          # persis dari backup -> self-heal aman. Kotlin/Flutter ke-detect otomatis.
+          import glob, json, os, re, sys
+          
+          MARK = "/tmp/opt_gradle_active"
+          BAKG = "/tmp/opt_gradle_bak.json"
+          RPT = "/tmp/opt_gradle.json"
+          mode = sys.argv[1] if len(sys.argv) > 1 else "apply"
+          
+          def gradle_files():
+              pats = ["android/app/build.gradle", "android/app/build.gradle.kts",
+                      "app/build.gradle", "app/build.gradle.kts",
+                      "*/app/build.gradle", "*/app/build.gradle.kts",
+                      "*/build.gradle", "*/build.gradle.kts"]
+              seen = []
+              for pat in pats:
+                  for p in sorted(glob.glob(pat)):
+                      if not os.path.isfile(p) or p in seen:
+                          continue
+                      try:
+                          t = open(p, encoding="utf-8", errors="replace").read()
+                      except OSError:
+                          continue
+                      if "com.android.application" in t:
+                          seen.append(p)
+              return seen[:1]
+          
+          def release_region(lines):
+              start = None
+              for i, ln in enumerate(lines):
+                  if re.match(r'^\s*release\s*\{', ln):
+                      start = i
+                      break
+              if start is None:
+                  return None
+              bal = 0
+              for j in range(start, len(lines)):
+                  bal += lines[j].count("{") - lines[j].count("}")
+                  if bal == 0:
+                      return (start, j)
+              return None
+          
+          def apply_gradle(p, applied, notes):
+              t = open(p, encoding="utf-8").read()
+              kts = p.endswith(".kts")
+              lines = t.split("\n")
+              reg = release_region(lines)
+              if reg is None:
+                  notes.append(p + ": release block gak ketemu — skip R8")
+                  return t
+              s, e = reg
+              seg = lines[s:e + 1]
+              def sub(seg, key, kts):
+                  rx = re.compile(r'^\s*' + key + r'\s*(=\s*)?false\s*$')
+                  has_false = False
+                  has_any = False
+                  for i, ln in enumerate(seg):
+                      if re.match(r'^\s*' + key + r'\b', ln):
+                          has_any = True
+                          if rx.match(ln):
+                              has_false = True
+                  if has_false:
+                      val = key + (" = true" if kts else " true")
+                      for i, ln in enumerate(seg):
+                          if rx.match(ln):
+                              seg[i] = re.sub(key + r'\s*(=\s*)?false\s*$', val, ln)
+                              applied.append(key + " false -> true (" + ("R8/resource dibuang" if key == "minifyEnabled" else "resource dibuang") + ")")
+                      return seg, True
+                  if not has_any:
+                      ins = "            " + key + (" = true" if kts else " true")
+                      seg.insert(1, ins)
+                      applied.append(key + " true disisip ke release")
+                      return seg, True
+                  return seg, False
+              changed = False
+              seg, c = sub(seg, "minifyEnabled", kts)
+              changed = changed or c
+              seg, c = sub(seg, "shrinkResources", kts)
+              changed = changed or c
+              segtxt = "\n".join(seg)
+              if "proguardFiles" not in segtxt and "getDefaultProguardFile" not in segtxt:
+                  line = ('proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")'
+                          if kts else
+                          "proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'")
+                  seg.insert(1, "            " + line)
+                  applied.append("proguardFiles optimize + rules disisip")
+                  changed = True
+              lines[s:e + 1] = seg
+              return "\n".join(lines) if changed else t
+          
+          def strip_debuggable(applied):
+              out = {}
+              for mpath in glob.glob("*/src/main/AndroidManifest.xml") + glob.glob("android/app/src/main/AndroidManifest.xml"):
+                  try:
+                      mt = open(mpath, encoding="utf-8").read()
+                  except OSError:
+                      continue
+                  if 'android:debuggable="true"' in mt:
+                      out[mpath] = mt
+                      mt = mt.replace(' android:debuggable="true"', "")
+                      open(mpath, "w", encoding="utf-8").write(mt)
+                      applied.append("manifest: debuggable=true dibuang")
+              return out
+          
+          def write_proguard(grad_path, created):
+              pg = os.path.join(os.path.dirname(grad_path), "proguard-rules.pro")
+              if os.path.exists(pg):
+                  return None
+              open(pg, "w", encoding="utf-8").write(
+                  "# DZR OPTIMASI (v4.40.0) — keep set konservatif (Flutter & native)\n"
+                  "-keep class io.flutter.** { *; }\n"
+                  "-keep class io.flutter.plugins.** { *; }\n"
+                  "-keepattributes *Annotation*, Signature, InnerClasses, EnclosingMethod\n"
+                  "-dontwarn org.apache.commons.compress.**\n")
+              created.append(pg)
+              return pg
+          
+          if mode == "apply":
+              if os.path.exists(MARK):
+                  print("OPT-GRADLE: udah applied (marker) — no-op")
+                  sys.exit(0)
+              gs = gradle_files()
+              applied = []
+              notes = []
+              if not gs:
+                  notes.append("build.gradle app gak ketemu — optimasi gradle skip")
+                  json.dump({"applied": applied, "notes": notes}, open(RPT, "w"), indent=1)
+                  print("OPT-GRADLE_APPLIED=0")
+                  sys.exit(0)
+              bak = {"files": {}, "proguard": [], "manifests": {}}
+              n = 0
+              for p in gs:
+                  orig = open(p, encoding="utf-8").read()
+                  new = apply_gradle(p, applied, notes)
+                  if new != orig:
+                      bak["files"][p] = orig
+                      open(p, "w", encoding="utf-8").write(new)
+                      n += 1
+                      pg = write_proguard(p, bak["proguard"])
+                      if pg:
+                          applied.append("proguard-rules.pro ditulis (keep set aman)")
+              bak["manifests"] = strip_debuggable(applied)
+              json.dump({"applied": applied, "notes": notes}, open(RPT, "w"), indent=1)
+              if n > 0 or bak["manifests"]:
+                  json.dump(bak, open(BAKG, "w"))
+                  open(MARK, "w").write("1")
+              print("OPT-GRADLE_APPLIED=" + str(len(applied)))
+              for a in applied:
+                  print("  + " + a)
+              for x in notes:
+                  print("  - " + x)
+          else:
+              if not os.path.exists(BAKG):
+                  print("OPT-GRADLE_UNDO=0 (gak ada backup)")
+                  sys.exit(0)
+              bak = json.load(open(BAKG))
+              for p, orig in (bak.get("files") or {}).items():
+                  try:
+                      open(p, "w", encoding="utf-8").write(orig)
+                  except OSError:
+                      pass
+              for p in (bak.get("proguard") or []):
+                  try:
+                      os.remove(p)
+                  except OSError:
+                      pass
+              for p, orig in (bak.get("manifests") or {}).items():
+                  try:
+                      open(p, "w", encoding="utf-8").write(orig)
+                  except OSError:
+                      pass
+              os.remove(BAKG)
+              if os.path.exists(MARK):
+                  os.remove(MARK)
+              print("OPT-GRADLE_UNDO=1")
+          
+          OPTGRADLE
+          cat > /tmp/optreport.py <<'OPTREPORT'
+          #!/usr/bin/env python3
+          # OPT-REPORT v4.40.0 — gabung hasil scan + applied optimasi + size APK final.
+          # opt_report.json ikut artifact -> bot bacain laporannya ke user (bukti jalan).
+          import glob, json, os
+          
+          rep = {}
+          for f, k in (("/tmp/opt_scan.json", "scan"), ("/tmp/opt_gradle.json", "gradle")):
+              try:
+                  d = json.load(open(f))
+                  # flatten: opt_scan.json bentuknya {"scan": {...}} -> ambil isinya langsung
+                  rep[k] = d.get(k, d) if isinstance(d, dict) else d
+              except Exception:
+                  pass
+          apks = glob.glob("build/app/outputs/flutter-apk/*.apk") + glob.glob("apk_out/*.apk")
+          if not apks:
+              apks = glob.glob("**/build/app/outputs/flutter-apk/*.apk", recursive=True)
+          if apks:
+              p = max(apks, key=os.path.getsize)
+              rep["apkMB"] = round(os.path.getsize(p) / 1048576, 2)
+          rep["rolledBack"] = os.path.exists("/tmp/opt_gradle_undone") or os.path.exists("/tmp/opt_rolledback")
+          rep["ver"] = "4.40.0"
+          json.dump(rep, open("opt_report.json", "w"), indent=1)
+          print("OPT-REPORT OK — rolledBack=" + str(rep["rolledBack"]))
+          
+          OPTREPORT
+                    # ── Build ──
           # v5.2: --build-number = GITHUB_RUN_NUMBER → versionCode NAIK tiap
           # build (run number monoton). Ini syarat WAJIB update-over-install:
           # Android nolak install versionCode lebih rendah/sama dari lama.
@@ -3241,7 +3679,25 @@ jobs:
             BUILD_ARGS="$BUILD_ARGS --target-platform android-arm64"
             echo "Small APK mode: arm64-only"
           fi
-          flutter build apk $BUILD_ARGS 2>&1 | tee build_output.txt
+          # ── ⚡ OPT-SELFHEAL v4.40: scan dulu → optimasi beneran → gagal? rollback + retry polos ──
+          if [ "$INPUT_OPTIMIZE" = "true" ]; then
+            python3 /tmp/optscan.py || true
+            python3 /tmp/optgradle.py apply || true
+            OPT_ARGS="--release --tree-shake-icons --obfuscate --split-debug-info=/tmp/dzr-symbols --build-number=${GITHUB_RUN_NUMBER:-1} --build-name=3.0.${GITHUB_RUN_NUMBER:-1}"
+            if [ "$INPUT_SMALL_APK" = "true" ]; then
+              OPT_ARGS="$OPT_ARGS --target-platform android-arm64"
+            fi
+            echo "⚡ Optimasi ON — flutter build apk (R8 + obfuscate + tree-shake)"
+            flutter build apk $OPT_ARGS 2>&1 | tee build_output.txt
+            if ! find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1 | grep -q apk; then
+              echo "⚡ build dgn optimasi gagal → SELF-HEAL: rollback optimasi + retry polos"
+              touch /tmp/opt_rolledback
+              python3 /tmp/optgradle.py undo || true
+              flutter build apk $BUILD_ARGS 2>&1 | tee build_output.txt
+            fi
+          else
+            flutter build apk $BUILD_ARGS 2>&1 | tee build_output.txt
+          fi
 
           APK_PATH=$(find build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -1 || find build/app/outputs/apk -name "*.apk" 2>/dev/null | head -1)
           if [ -z "$APK_PATH" ]; then
@@ -3250,6 +3706,10 @@ jobs:
             exit 1
           fi
           echo "APK: $APK_PATH ($(du -sh "$APK_PATH" | cut -f1))"
+          # ⚡ v4.40: laporan optimasi masuk artifact → bot bacain ke user
+          if [ "$INPUT_OPTIMIZE" = "true" ]; then
+            python3 /tmp/optreport.py || true
+          fi
 
       # ─── 🔐 v5.2 → v6.6: STABLE SIGNING + OTA RELEASE (update tanpa uninstall) ────
       # 1. Keystore release disimpan TERENKRIPSI di repo (signing/global-v2.jks.enc,
@@ -3934,6 +4394,7 @@ jobs:
           path: |
             **/build/app/outputs/flutter-apk/*.apk
             **/build/app/outputs/flutter-apk/*.apk.enc
+            opt_report.json
           retention-days: 7
           if-no-files-found: error
 
