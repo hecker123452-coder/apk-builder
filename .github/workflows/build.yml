@@ -1021,6 +1021,23 @@ jobs:
               if _bdp:
                   applied.append('relokasi build dir buat flutter tool: ' + ', '.join(_bdp))
 
+          # ── 🆕 v4.41 DESUGAR REAKTIF: error "requires core library desugaring"
+          # (run #102: flutter_local_notifications) → enable desugaring + dep
+          # desugar_jdk_libs, terus retry. Sekali per job (guard marker).
+          if re.search(r'requires core library desugaring', err) and not os.path.exists('/tmp/bldfix_desugar_done'):
+              try:
+                  import desugarfix as _dsf
+              except Exception:
+                  import sys as _sysd
+                  _sysd.path.insert(0, '/tmp')
+                  import desugarfix as _dsf
+              _dnotes, _dtgt = _dsf.apply_desugar()
+              if _dnotes:
+                  applied.append('core library desugaring (' + _dtgt + '): ' + ', '.join(_dnotes))
+                  open('/tmp/bldfix_desugar_done', 'w').write('ok')
+              else:
+                  print('DESUGAR-FIX reaktif: config udah ada tapi error masih desugaring — cek manual')
+
           if applied:
               print('AUTO-FIX toolchain:', '; '.join(applied))
               with open('/tmp/bldfix_applied', 'w') as f:
@@ -1085,6 +1102,113 @@ jobs:
               print('TOOLCHAIN-FIX: AGP/Kotlin udah >= minimum Flutter, aman')
           PYAGP
           python3 /tmp/agpfix.py || true
+
+          # ── 🆕 v4.41 DESUGAR PROAKTIF: paket yang WAJIB core library
+          # desugaring (flutter_local_notifications, workmanager) di-scan
+          # dari pubspec.yaml/pubspec.lock → config di-inject SEBELUM build
+          # pertama (run #102: lawangs_chat_flutter kebuang ~2 menit buat
+          # attempt yang 100% predictable gagal). Idempoten + non-destruktif
+          # (config yang udah ada gak disentuh). Versi desugar AGP-aware.
+          cat > /tmp/desugarfix.py <<'PYDSGR'
+          import os, re
+
+          DESUGAR_PKGS = ('flutter_local_notifications', 'workmanager')
+          DESUGAR_NEW = '2.1.4'
+          DESUGAR_OLD = '1.1.5'
+
+          def vkey(v):
+              return [int(x) for x in v.split('.') if x.isdigit()]
+
+          def desugar_version():
+              ver = None
+              for base in ('android/build.gradle.kts', 'android/build.gradle', 'android/settings.gradle.kts', 'android/settings.gradle'):
+                  if os.path.isfile(base):
+                      try:
+                          with open(base, encoding='utf-8') as f:
+                              t = f.read()
+                      except Exception:
+                          continue
+                      m = (re.search(r'com\.android\.tools\.build:gradle:([\d.]+)', t)
+                           or re.search(r'id\(\s*["\']com\.android\.application["\']\s*\)\s+version\s+["\']([\d.]+)', t)
+                           or re.search(r'id\s+["\']com\.android\.application["\']\s+version\s+["\']([\d.]+)', t))
+                      if m:
+                          ver = m.group(1)
+                          break
+              if ver:
+                  try:
+                      if vkey(ver) < [7, 4]:
+                          return DESUGAR_OLD
+                  except Exception:
+                      pass
+              return DESUGAR_NEW
+
+          def apply_desugar():
+              tgt = desugar_version()
+              done = []
+              for path in ('android/app/build.gradle.kts', 'android/app/build.gradle'):
+                  if not os.path.isfile(path):
+                      continue
+                  kts = path.endswith('.kts')
+                  try:
+                      with open(path, encoding='utf-8') as f:
+                          g = f.read()
+                  except Exception:
+                      continue
+                  g2 = g
+                  notes = []
+                  flag = 'isCoreLibraryDesugaringEnabled = true' if kts else 'coreLibraryDesugaringEnabled true'
+                  dep = ('coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:' + tgt + '")' if kts else "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:" + tgt + "'")
+                  if 'coreLibraryDesugaringEnabled' not in g2 and 'isCoreLibraryDesugaringEnabled' not in g2:
+                      blk_copt = ('    compileOptions {\n        ' + flag + '\n        sourceCompatibility = JavaVersion.VERSION_11\n        targetCompatibility = JavaVersion.VERSION_11\n    }\n' if kts else '    compileOptions {\n        ' + flag + '\n        sourceCompatibility JavaVersion.VERSION_11\n        targetCompatibility JavaVersion.VERSION_11\n    }\n')
+                      if re.search(r'compileOptions\s*\{', g2):
+                          g2 = re.sub(r'compileOptions\s*\{', lambda mm: mm.group(0) + '\n        ' + flag, g2, count=1)
+                          notes.append('flag compileOptions')
+                      elif re.search(r'android\s*\{', g2):
+                          g2 = re.sub(r'android\s*\{', lambda mm: mm.group(0) + '\n' + blk_copt, g2, count=1)
+                          notes.append('blok compileOptions baru')
+                  if not re.search(r'(?m)^\s*coreLibraryDesugaring(\s|\()', g2):
+                      blk_dep = 'dependencies {\n    ' + dep + '\n}\n'
+                      if re.search(r'(?m)^dependencies\s*\{', g2):
+                          g2 = re.sub(r'(?m)^(dependencies\s*\{)', lambda mm: mm.group(1) + '\n    ' + dep, g2, count=1)
+                          notes.append('dep desugar_jdk_libs ' + tgt)
+                      else:
+                          g2 = g2.rstrip() + '\n' + blk_dep
+                          notes.append('blok dependencies + dep ' + tgt)
+                  if g2 != g:
+                      try:
+                          with open(path, 'w', encoding='utf-8') as f:
+                              f.write(g2)
+                          done.append(os.path.basename(path) + ' [' + ', '.join(notes) + ']')
+                      except Exception:
+                          pass
+              return done, tgt
+
+          def needed():
+              hits = []
+              for pf in ('pubspec.yaml', 'pubspec.lock'):
+                  if os.path.isfile(pf):
+                      try:
+                          with open(pf, encoding='utf-8') as f:
+                              t = f.read()
+                      except Exception:
+                          continue
+                      for p in DESUGAR_PKGS:
+                          if re.search(r'(?m)^\s*' + re.escape(p) + r'\s*:', t):
+                              hits.append(p)
+              return hits
+
+          if __name__ == '__main__':
+              hits = needed()
+              if not hits:
+                  print('DESUGAR-FIX: gak ada paket yang butuh desugaring — aman')
+              else:
+                  done, tgt = apply_desugar()
+                  if done:
+                      print('DESUGAR-FIX (proaktif, paket ' + ', '.join(sorted(set(hits))) + '): ' + tgt + ' — ' + '; '.join(done))
+                  else:
+                      print('DESUGAR-FIX: config udah ada — aman')
+          PYDSGR
+          python3 /tmp/desugarfix.py || true
 
       - name: Write Dart Auto-Fix Helper + Patch Packages
         run: |
@@ -2783,6 +2907,10 @@ jobs:
           # dobelnya SEBELUM build (idempoten — jalan 2x hasil sama).
           rm -f /tmp/resdedup_removed
           python3 /tmp/resdedup.py || true
+          # ── 🆕 v4.41 DESUGAR: pasca-scaffold/regen → pastikan config
+          # desugaring nempel (idempoten; scaffold baru dari flutter create
+          # gak bawa desugaring padahal pubspec butuh) ──
+          python3 /tmp/desugarfix.py || true
           # ── ⚙️ v5.4/v5.5: build + auto-fix reaktif (max 5 percobaan) ──
           # Toolchain ke tua → bldfix.py. Error kompilasi Dart (API package
           # hasil major-upgrade) → dartfix.py. Terus retry sampai OK.
@@ -3341,6 +3469,10 @@ jobs:
           # dobelnya SEBELUM build (idempoten — jalan 2x hasil sama).
           rm -f /tmp/resdedup_removed
           python3 /tmp/resdedup.py || true
+          # ── 🆕 v4.41 DESUGAR: pasca-scaffold/regen → pastikan config
+          # desugaring nempel (idempoten; scaffold baru dari flutter create
+          # gak bawa desugaring padahal pubspec butuh) ──
+          python3 /tmp/desugarfix.py || true
           # ── ⚙️ v5.4/v5.5: build AAB + auto-fix reaktif (max 5 percobaan) ──
           # Sama kayak step APK: toolchain ke tua → bldfix.py, error Dart →
           # dartfix.py, terus retry.
