@@ -2829,7 +2829,7 @@ jobs:
                           if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
                               requestPermissions(arrayOf(android.Manifest.permission.WRITE_EXTERNAL_STORAGE), 4207)
                           }
-                      } catch (_) {}
+                      } catch (_: Exception) {}
                       "error:perm"
                   } catch (e: Exception) {
                       "error:" + (e.message ?: "unknown")
@@ -2869,7 +2869,7 @@ jobs:
               }
 
               private fun toast(text: String) {
-                  try { runOnUiThread { Toast.makeText(this, text, Toast.LENGTH_LONG).show() } } catch (_) {}
+                  try { runOnUiThread { Toast.makeText(this, text, Toast.LENGTH_LONG).show() } } catch (_: Exception) {}
               }
 
               private fun canInstall(): Boolean =
@@ -3467,12 +3467,12 @@ jobs:
           # proguard optimize + buang debuggable). Idempoten (marker). undo = restore byte
           # persis dari backup -> self-heal aman. Kotlin/Flutter ke-detect otomatis.
           import glob, json, os, re, sys
-          
+
           MARK = "/tmp/opt_gradle_active"
           BAKG = "/tmp/opt_gradle_bak.json"
           RPT = "/tmp/opt_gradle.json"
           mode = sys.argv[1] if len(sys.argv) > 1 else "apply"
-          
+
           def gradle_files():
               pats = ["android/app/build.gradle", "android/app/build.gradle.kts",
                       "app/build.gradle", "app/build.gradle.kts",
@@ -3490,11 +3490,11 @@ jobs:
                       if "com.android.application" in t:
                           seen.append(p)
               return seen[:1]
-          
+
           def release_region(lines):
               start = None
               for i, ln in enumerate(lines):
-                  if re.match(r'^\s*release\s*\{', ln):
+                  if re.match(r'^\s*release\s*\{', ln) or re.match(r'^\s*getByName("release")\s*\{', ln) or re.match(r"^\s*named('release')\s*\{", ln) or re.match(r'^\s*named("release")\s*\{', ln):
                       start = i
                       break
               if start is None:
@@ -3505,7 +3505,7 @@ jobs:
                   if bal == 0:
                       return (start, j)
               return None
-          
+
           def apply_gradle(p, applied, notes):
               t = open(p, encoding="utf-8").read()
               kts = p.endswith(".kts")
@@ -3516,32 +3516,34 @@ jobs:
                   return t
               s, e = reg
               seg = lines[s:e + 1]
-              def sub(seg, key, kts):
-                  rx = re.compile(r'^\s*' + key + r'\s*(=\s*)?false\s*$')
+              # AGP 9 KTS: nama properti isMinifyEnabled/isShrinkResources (minifyEnabled
+              # polos = Unresolved reference). Groovy lama: minifyEnabled true.
+              def sub(seg, groovy_name, kts_name, kts):
+                  rx_false = re.compile(r'^\s*(?:' + groovy_name + r'|' + kts_name + r')\s*(=\s*)?false\s*$')
+                  rx_any = re.compile(r'^\s*(?:' + groovy_name + r'|' + kts_name + r')\b')
                   has_false = False
                   has_any = False
-                  for i, ln in enumerate(seg):
-                      if re.match(r'^\s*' + key + r'\b', ln):
+                  for ln in seg:
+                      if rx_any.match(ln):
                           has_any = True
-                          if rx.match(ln):
+                          if rx_false.match(ln):
                               has_false = True
+                  val = (kts_name + " = true") if kts else (groovy_name + " true")
                   if has_false:
-                      val = key + (" = true" if kts else " true")
                       for i, ln in enumerate(seg):
-                          if rx.match(ln):
-                              seg[i] = re.sub(key + r'\s*(=\s*)?false\s*$', val, ln)
-                              applied.append(key + " false -> true (" + ("R8/resource dibuang" if key == "minifyEnabled" else "resource dibuang") + ")")
+                          if rx_false.match(ln):
+                              seg[i] = rx_false.sub(val, ln)
+                              applied.append(kts_name + " -> true (" + ("R8/resource dibuang" if "Minify" in kts_name else "resource dibuang") + ")")
                       return seg, True
                   if not has_any:
-                      ins = "            " + key + (" = true" if kts else " true")
-                      seg.insert(1, ins)
-                      applied.append(key + " true disisip ke release")
+                      seg.insert(1, "            " + val)
+                      applied.append(kts_name + " true disisip ke release")
                       return seg, True
                   return seg, False
               changed = False
-              seg, c = sub(seg, "minifyEnabled", kts)
+              seg, c = sub(seg, "minifyEnabled", "isMinifyEnabled", kts)
               changed = changed or c
-              seg, c = sub(seg, "shrinkResources", kts)
+              seg, c = sub(seg, "shrinkResources", "isShrinkResources", kts)
               changed = changed or c
               segtxt = "\n".join(seg)
               if "proguardFiles" not in segtxt and "getDefaultProguardFile" not in segtxt:
@@ -3553,7 +3555,7 @@ jobs:
                   changed = True
               lines[s:e + 1] = seg
               return "\n".join(lines) if changed else t
-          
+
           def strip_debuggable(applied):
               out = {}
               for mpath in glob.glob("*/src/main/AndroidManifest.xml") + glob.glob("android/app/src/main/AndroidManifest.xml"):
@@ -3567,7 +3569,7 @@ jobs:
                       open(mpath, "w", encoding="utf-8").write(mt)
                       applied.append("manifest: debuggable=true dibuang")
               return out
-          
+
           def write_proguard(grad_path, created):
               pg = os.path.join(os.path.dirname(grad_path), "proguard-rules.pro")
               if os.path.exists(pg):
@@ -3580,7 +3582,7 @@ jobs:
                   "-dontwarn org.apache.commons.compress.**\n")
               created.append(pg)
               return pg
-          
+
           if mode == "apply":
               if os.path.exists(MARK):
                   print("OPT-GRADLE: udah applied (marker) — no-op")
@@ -3639,7 +3641,7 @@ jobs:
               if os.path.exists(MARK):
                   os.remove(MARK)
               print("OPT-GRADLE_UNDO=1")
-          
+
           OPTGRADLE
           cat > /tmp/optreport.py <<'OPTREPORT'
           #!/usr/bin/env python3
