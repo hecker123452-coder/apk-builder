@@ -969,6 +969,40 @@ jobs:
                               f.write(g2)
                           applied.append('compileSdk ' + mod + ' -> ' + tgt)
 
+          # ── 🦈 v4.42 MAHORAGA: compileSdk adaptasi format AGP BARU (probe
+          # T79): "Dependency 'androidx.lifecycle:lifecycle-process:2.7.0'
+          # requires libraries and applications that depend on it to compile
+          # against version 34 or later ... :geocoding_android is currently
+          # compiled against android-33" — subject Dependency = artifact
+          # androidx (BUKAN ':mod'), module ke-rendah di akhir kalimat →
+          # regex format lama (run #53) gak nangkep. Loop SEMUA pasangan
+          # (tgt, mod), ambil tgt max per mod (>= 34), bump plugin di
+          # pub-cache ATAU :app — idempoten (cur >= tgt = no-op).
+          import glob as _glob2
+          _sdkmap = {}
+          for mm2 in re.finditer(r"compile against version (\d+) or later of the\s+Android APIs\.\s*:([\w.]+) is currently compiled against android-(\d+)", err):
+              _mod2, _tgt2 = mm2.group(2), max(int(mm2.group(1)), 34)
+              _sdkmap[_mod2] = max(_sdkmap.get(_mod2, 0), _tgt2)
+          for _mod2, _tgt2 in _sdkmap.items():
+              if _mod2 == 'app':
+                  _paths2 = [p for p in ('android/app/build.gradle', 'android/app/build.gradle.kts') if os.path.isfile(p)]
+              else:
+                  _paths2 = _glob2.glob(os.path.expanduser('~/.pub-cache/hosted/pub.dev/' + _mod2 + '-*/android/build.gradle')) + _glob2.glob(os.path.expanduser('~/.pub-cache/hosted/pub.dev/' + _mod2 + '-*/android/build.gradle.kts'))
+              for _path2 in _paths2:
+                  with open(_path2, encoding='utf-8') as f:
+                      _g2 = f.read()
+
+                  def _bump_sdk2(mmm):
+                      cur = mmm.group(2)
+                      if cur == 'flutter.compileSdkVersion' or int(cur) < _tgt2:
+                          return mmm.group(1) + str(_tgt2)
+                      return mmm.group(0)
+
+                  _g2b = re.sub(r'(?m)(compileSdk(?:Version)?\s*=?\s*)(\d+|flutter\.compileSdkVersion)', _bump_sdk2, _g2)
+                  if _g2b != _g2:
+                      with open(_path2, 'w', encoding='utf-8') as f:
+                          f.write(_g2b)
+                      applied.append('compileSdk ' + _mod2 + ' -> ' + str(_tgt2) + ' (MAHORAGA format AGP baru)')
           # ── v5.8.5: "cannot find symbol: class <XyzPlugin>" di
           # GeneratedPluginRegistrant = plugin artifacts gak sinkron abis
           # dependency_overrides ganti versi plugin (run #88: pub get #1
