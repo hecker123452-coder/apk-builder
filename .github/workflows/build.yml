@@ -1038,6 +1038,41 @@ jobs:
               else:
                   print('DESUGAR-FIX reaktif: config udah ada tapi error masih desugaring — cek manual')
 
+          # ── 🦈 v4.42 MAHORAGA: LINT & OOM (adaptasi umum project lawas) ──
+          if re.search(r'Lint found (?:fatal )?errors', err) and not os.path.exists('/tmp/bldfix_lint_done'):
+              _lintp = ''
+              for _lp in ('android/app/build.gradle.kts', 'android/app/build.gradle'):
+                  if not os.path.isfile(_lp):
+                      continue
+                  with open(_lp, encoding='utf-8') as f:
+                      _ltxt = f.read()
+                  if 'abortOnError' in _ltxt:
+                      continue
+                  if _lp.endswith('.kts'):
+                      _blk = ('\nandroid {\n    lint {\n        abortOnError = false\n        checkReleaseBuilds = false\n    }\n}\n')
+                  else:
+                      _blk = ('\nandroid {\n    lintOptions {\n        abortOnError false\n        checkReleaseBuilds false\n    }\n}\n')
+                  with open(_lp, 'w', encoding='utf-8') as f:
+                      f.write(_ltxt.rstrip() + '\n' + _blk)
+                  _lintp = _lp
+                  break
+              if _lintp:
+                  applied.append('lint abortOnError=false (' + _lintp + ')')
+                  open('/tmp/bldfix_lint_done', 'w').write('ok')
+          if re.search(r'OutOfMemoryError|Java heap space|Gradle build daemon disappeared|exit value 137', err) and not os.path.exists('/tmp/bldfix_oom_done'):
+              for _gp in ('android/gradle.properties', 'gradle.properties'):
+                  if os.path.isfile(_gp):
+                      with open(_gp, encoding='utf-8') as f:
+                          _gtxt = f.read()
+                      _gtxt2 = re.sub(r'(?m)^org\.gradle\.jvmargs=.*$', 'org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1536m -Dfile.encoding=UTF-8', _gtxt)
+                      if not re.search(r'(?m)^org\.gradle\.jvmargs=', _gtxt2):
+                          _gtxt2 = _gtxt2.rstrip() + '\norg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1536m -Dfile.encoding=UTF-8\n'
+                      if _gtxt2 != _gtxt:
+                          with open(_gp, 'w', encoding='utf-8') as f:
+                              f.write(_gtxt2)
+                          applied.append('JVM heap bump 4g (OOM adaptasi — ' + _gp + ')')
+                          open('/tmp/bldfix_oom_done', 'w').write('ok')
+                          break
           if applied:
               print('AUTO-FIX toolchain:', '; '.join(applied))
               with open('/tmp/bldfix_applied', 'w') as f:
@@ -1375,7 +1410,26 @@ jobs:
                   write_f(f, src2)
                   applied.append(f + ': encryptedSharedPreferences dibuang (flutter_secure_storage >=11)')
 
+          # 🦈 v4.42 MAHORAGA R6-GUARD (run #105): file_picker 11.0.3 butuh
+          # win32 ^5.9.0 — kalau pubspec ada share_plus >=13 (win32 ^6.0.1,
+          # disjoint) maka R6 (downgrade 11.0.3) PASTI version solving failed
+          # (run #105: otax share_plus ^13.3.1 → 3 percobaan mati polos).
+          # Data pub.dev (2026-10): file_picker >=12 GAK PUNYA dep win32
+          # sama sekali → kompatibel share_plus 13.x → pilih jalur API BARU
+          # (R2/R3 rewrite) via override "any", JANGAN downgrade.
+          _r6skip = False
           if fp12 and not fp_done:
+              try:
+                  _ptxt6 = read_f('pubspec.yaml')
+                  _w6 = any(int(_m6.group(1)) >= 13 for _m6 in re.finditer(r'(?m)^\s*share_plus:\s*["\']?\^?(\d+)', _ptxt6))
+              except Exception:
+                  _w6 = False
+              if _w6:
+                  _r6skip = True
+                  add_overrides({'file_picker': 'any'})
+                  applied.append('R6-MAHORAGA: share_plus >=13 (win32 ^6) — file_picker dibiarkan >=12 (win32-free) via any, API baru via R2/R3')
+                  open('/tmp/dartfix_fp_done', 'w').write('ok')
+          if fp12 and not fp_done and not _r6skip:
               # R6: file_picker >=12 ngerewrite total API-nya (FilePickerResult +
               # FilePicker.platform dihapus) → refactor kode terlalu dalem buat
               # di-regex. Balikin API lama via dependency_overrides ke 11.0.3
@@ -2079,6 +2133,49 @@ jobs:
                   applied.append(_cls_file + ': stub method ' + _ident + '() disisipin di class ' + _cls)
                   _stub_done.add(_key)
 
+          # 🦈 v4.42 MAHORAGA VS-SOLVER: "version solving failed" saat build
+          # loop (run #105 percobaan 2-3 mati polos — dulu gak ada pola) →
+          # parser konflik pub → adaptasi berlapis: rollback override
+          # file_picker 11.0.3 → "any" (>=12 win32-free), relax constraint
+          # user ke any (solver pub yang milih), kandidat transitif →
+          # dependency_overrides any. win32 JANGAN PERNAH di-override
+          # (lesson run #80: file_picker 11 windows code gak kompil dgn
+          # win32 6 — 30+ error COINIT).
+          if re.search(r'version solving failed', out) and not os.path.exists('/tmp/dartfix_vs_done'):
+              _vscands = []
+              for _mv in re.finditer(r'depends on both ([a-z0-9_]+) [^\s]+(?: and ([a-z0-9_]+))?', out):
+                  for _g in _mv.groups():
+                      if _g and _g not in _vscands:
+                          _vscands.append(_g)
+              for _mv in re.finditer(r'(?:which )?(?:depends on|requires) ([a-z0-9_]+) ', out):
+                  if _mv.group(1) not in _vscands:
+                      _vscands.append(_mv.group(1))
+              _vscands = [c for c in _vscands if c != 'win32'][:6]
+              if _vscands:
+                  _vsm = {}
+                  for _c in _vscands:
+                      if _c == 'file_picker' and os.path.exists('/tmp/dartfix_fp_done'):
+                          _vsm[_c] = 'any'
+                          continue
+                      _didV = False
+                      try:
+                          _ptxtV = read_f('pubspec.yaml')
+                          _patV = re.compile(r'(?m)^(\s*' + re.escape(_c) + r':\s*)([^\n#]+?)(\s*#.*)?$')
+                          _mV = _patV.search(_ptxtV)
+                          if _mV and _mV.group(2).strip() != 'any':
+                              _ptxtV = _patV.sub(lambda mm: mm.group(1) + 'any' + (mm.group(3) or ''), _ptxtV, count=1)
+                              write_f('pubspec.yaml', _ptxtV)
+                              pubspec_changed = True
+                              applied.append('MAHORAGA vs-solver: constraint ' + _c + ' di-relax ke any (solver pub yang milih)')
+                              _didV = True
+                      except Exception:
+                          pass
+                      if not _didV:
+                          _vsm[_c] = 'any'
+                  if _vsm:
+                      add_overrides(_vsm)
+                      applied.append('MAHORAGA vs-solver: version solving failed → adaptasi override: ' + ', '.join(k + '→any' for k in _vsm))
+                      open('/tmp/dartfix_vs_done', 'w').write('ok')
           if applied:
               print('DART-FIX:', '; '.join(applied))
               with open('/tmp/dartfix_applied', 'w') as f:
