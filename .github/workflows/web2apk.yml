@@ -262,6 +262,10 @@ on:
         description: '🔐 v4.11 Perizinan: daftar izin Android dipisah koma (mis. CAMERA,RECORD_AUDIO). Kosong = tanpa tambahan.'
         required: false
         default: ''
+      keystore_id:
+        description: '🔐 v4.45.0 KUNCI: ID keystore per user (mis. 12345 → keystores/u12345.jks.enc). Kosong = keystore global.'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -4099,6 +4103,8 @@ jobs:
           KS_ENC_KEY: ${{ secrets.KS_ENC_KEY }}
           KS_PASS: ${{ secrets.KS_PASS }}
           KS_PASS_OLD: ${{ secrets.KS_PASS_OLD }}
+          # ── 🔐 v4.45.0 KUNCI: guard ikut keystore per-user (SHA cert = kunci user sendiri) ──
+          INPUT_KEYSTORE_ID: ${{ inputs.keystore_id }}
           GUARD_MODE: flutter
         run: python3 /tmp/dzr_license_guard.py
       - name: Stable signing + OTA release
@@ -4110,6 +4116,8 @@ jobs:
           KS_PASS: ${{ secrets.KS_PASS }}
           KS_PASS_OLD: ${{ secrets.KS_PASS_OLD }}
           KS_ENC_KEY: ${{ secrets.KS_ENC_KEY }}
+          # ── 🔐 v4.45.0 KUNCI: ID keystore per-user dari bot (kosong = global) ──
+          INPUT_KEYSTORE_ID: ${{ inputs.keystore_id }}
         run: |
           APK=$(find . -name "*.apk" -path "*flutter-apk*" 2>/dev/null | head -1 || find . -name "*.apk" -path "*outputs/apk*" 2>/dev/null | head -1)
           if [ -z "$APK" ]; then
@@ -4124,7 +4132,18 @@ jobs:
           # di repo publik gak bisa dibuka siapapun. Gak tergantung R2.
           # Aturan: decrypt/validasi gagal = FAIL LOUD (JANGAN regenerate —
           # merusak rantai update app ter-install!).
-          KS_ENC="signing/global-v2.jks.enc"
+          # ── 🔐 v4.45.0 KUNCI: keystore per-user (input keystore_id) —
+          # signature konsisten PER USER di jalur Web2APK juga (samain dgn
+          # build.yml/build_kotlin.yml/repack.yml v6.2). Kosong = global
+          # (dispatch manual lama tetep jalan). Sanitasi ketat alfanumerik. ──
+          KID=$(printf '%s' "${INPUT_KEYSTORE_ID:-}" | tr -cd 'a-zA-Z0-9')
+          if [ -n "$KID" ]; then
+            KS_ENC="keystores/u${KID}.jks.enc"
+            echo "🔐 Keystore PER-USER: $KS_ENC"
+          else
+            KS_ENC="signing/global-v2.jks.enc"
+            echo "🔐 Keystore GLOBAL (keystore_id kosong): $KS_ENC"
+          fi
           KS=/tmp/dzr-release.jks
           rm -f "$KS" /tmp/ks.enc
           # ⚠️ Gak ada actions/checkout di workflow ini → keberadaan .enc dicek
@@ -4190,6 +4209,8 @@ jobs:
               "$BT/apksigner" verify "$APK" \
                 && echo "✅ APK ke-sign keystore stabil — update tanpa uninstall AKTIF" \
                 || echo "WARNING: verify gagal (non-fatal, APK tetep ke-upload)"
+              # 🔐 v4.45.0 KUNCI: cetak SHA-256 cert (bukti signature konsisten antar build)
+              "$BT/apksigner" verify --print-certs "$APK" 2>/dev/null | grep -iE "SHA-256" | head -1 | sed 's/^/🔐 CERT /' || true
             else
               echo "WARNING: zipalign/apksigner gak ada di $BT (skip re-sign)"
             fi
