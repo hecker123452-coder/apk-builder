@@ -4196,12 +4196,18 @@ jobs:
               echo "=== BUILD FAILED: keystore terenkripsi ada tapi GAGAL didekrip (cek secret KS_ENC_KEY) ==="
               exit 1
             fi
-            if ! keytool -list -keystore "$KS" -storepass "$KS_PASS" -alias dzr >/dev/null 2>&1; then
-              echo "=== BUILD FAILED: keystore didekrip tapi KS_PASS gak cocok ==="
-              echo "JANGAN regenerate! Cek secret KS_PASS — salah pass = semua app ter-install gak bisa update."
+            KS_USE_PASS=""
+            if keytool -list -keystore "$KS" -storepass "$KS_PASS" -alias dzr >/dev/null 2>&1; then
+              KS_USE_PASS="$KS_PASS"
+            elif [ -n "$KS_PASS_OLD" ] && keytool -list -keystore "$KS" -storepass "$KS_PASS_OLD" -alias dzr >/dev/null 2>&1; then
+              KS_USE_PASS="$KS_PASS_OLD"
+              echo "ℹ️ Keystore legacy (pass lama) — tetep dipake biar app ter-install lama tetap bisa update"
+            fi
+            if [ -z "$KS_USE_PASS" ]; then
+              echo "=== BUILD FAILED: keystore didekrip tapi pass gak cocok (KS_PASS/KS_PASS_OLD salah) ==="
+              echo "JANGAN regenerate! Cek secrets — salah pass = app ter-install gak bisa update."
               exit 1
             fi
-            KS_USE_PASS="$KS_PASS"
             echo "🔐 Keystore stabil: DIPAKE dari $KS_ENC (dekripsi OK) — signature sama kayak build sebelumnya"
           else
             echo "🔐 Keystore belum ada — generate BARU + commit TERENKRIPSI ($KS_ENC)..."
@@ -4226,6 +4232,11 @@ jobs:
                 && openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in /tmp/ks.enc -out "$KS" -pass pass:"$KS_ENC_KEY" 2>/dev/null \
                 && [ -s "$KS" ] && keytool -list -keystore "$KS" -storepass "$KS_PASS" -alias dzr >/dev/null 2>&1; then
                 echo "🔐 Race guard: pake keystore dari repo (identik)"
+              elif [ "$ENC_HTTP" = "200" ] && [ -s /tmp/ks.enc ] \
+                && openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in /tmp/ks.enc -out "$KS" -pass pass:"$KS_ENC_KEY" 2>/dev/null \
+                && [ -s "$KS" ] && [ -n "$KS_PASS_OLD" ] && keytool -list -keystore "$KS" -storepass "$KS_PASS_OLD" -alias dzr >/dev/null 2>&1; then
+                KS_USE_PASS="$KS_PASS_OLD"
+                echo "🔐 Race guard: pake keystore dari repo (legacy pass lama)"
               else
                 echo "=== BUILD FAILED: keystore gak bisa disimpan/diambil — stop biar signature konsisten ==="
                 exit 1
