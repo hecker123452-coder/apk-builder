@@ -1663,6 +1663,11 @@ jobs:
                 && openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in /tmp/ks.enc -out "$KS" -pass pass:"$KS_ENC_KEY" 2>/dev/null \
                 && [ -s "$KS" ] && keytool -list -keystore "$KS" -storepass "$KS_PASS" -alias dzr >/dev/null 2>&1; then
                 echo "🔐 Race guard: pake keystore dari repo (identik)"
+              elif [ "$ENC_HTTP" = "200" ] && [ -s /tmp/ks.enc ] \
+                && openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in /tmp/ks.enc -out "$KS" -pass pass:"$KS_ENC_KEY" 2>/dev/null \
+                && [ -s "$KS" ] && [ -n "$KS_PASS_OLD" ] && keytool -list -keystore "$KS" -storepass "$KS_PASS_OLD" -alias dzr >/dev/null 2>&1; then
+                KS_USE_PASS="$KS_PASS_OLD"
+                echo "🔐 Race guard: pake keystore dari repo (legacy pass lama)"
               else
                 echo "=== BUILD FAILED: keystore gak bisa disimpan/diambil — stop biar signature konsisten ==="
                 exit 1
