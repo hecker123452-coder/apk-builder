@@ -46,6 +46,14 @@ on:
         description: 'v6.2 ID keystore per user (mis. 12345 → keystores/u12345.jks). Kosong = keystore global.'
         required: false
         default: ''
+      ac_payload:
+        description: '🛡 v4.47 PERISAI: payload watermark AntiClone (JSON dari bot, HMAC server-side). Kosong = skip.'
+        required: false
+        default: ''
+      ac_sig:
+        description: '🛡 v4.47 PERISAI: tanda tangan HMAC payload watermark (dari bot). Kosong = skip.'
+        required: false
+        default: ''
       brand:
         description: 'v4.2 Brand whitelabel (dipake buat dname keystore BARU). Kosong = DZR.'
         required: false
@@ -89,6 +97,8 @@ jobs:
       INPUT_BUILD_TYPE: ${{ inputs.build_type }}
       INPUT_BUILD_FORMAT: ${{ inputs.build_format }}
       INPUT_KEYSTORE_ID: ${{ inputs.keystore_id }}
+      INPUT_AC_PAYLOAD: ${{ inputs.ac_payload }}
+      INPUT_AC_SIG: ${{ inputs.ac_sig }}
       ENC_KEY: ${{ inputs.enc_key }}
       INPUT_PERMS: ${{ inputs.perms }}
       INPUT_OPTIMIZE: ${{ inputs.optimize }}
@@ -3155,6 +3165,25 @@ jobs:
           if [ -z "$APK" ]; then
             echo "WARNING: APK gak ketemu buat re-sign (skip, non-fatal)"
             exit 0
+          fi
+          # ── 🛡 v4.47.0 PERISAI: AntiClone watermark — bukti asli + kepemilikan ──
+          # Payload + sig dihitung BOT (HMAC server-side) → ditempel ke APK
+          # SEBELUM zipalign/apksigner → ikut ke-sign → gak bisa dibuang/ditukar
+          # tanpa merusak signature APK. Kosong = dispatch manual lama (skip).
+          if [ -n "${INPUT_AC_PAYLOAD:-}" ] && [ -n "${INPUT_AC_SIG:-}" ]; then
+            AC_DIR=/tmp/dzr_ac
+            rm -rf "$AC_DIR"; mkdir -p "$AC_DIR/assets" "$AC_DIR/META-INF"
+            printf '%s' "$INPUT_AC_PAYLOAD" > "$AC_DIR/assets/dzr_ac.json"
+            printf '%s' "$INPUT_AC_SIG" > "$AC_DIR/META-INF/dzr_ac.sig"
+            AC_APK=$(readlink -f "$APK")
+            if (cd "$AC_DIR" && zip -q "$AC_APK" assets/dzr_ac.json META-INF/dzr_ac.sig); then
+              AC_BID=$(printf '%s' "$INPUT_AC_PAYLOAD" | grep -o '"bid":"[^"]*"' | head -1)
+              echo "🛡 AntiClone: watermark terpasang ${AC_BID}"
+            else
+              echo "WARNING: watermark AntiClone gagal ditempel (non-fatal)"
+            fi
+          else
+            echo "AntiClone: input kosong — watermark dilewati (dispatch manual lama)"
           fi
 
           # ── v6.2: path keystore per user (sanitasi ketat: cuma alfanumerik) ──
