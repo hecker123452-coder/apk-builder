@@ -266,6 +266,14 @@ on:
         description: '🔐 v4.45.0 KUNCI: ID keystore per user (mis. 12345 → keystores/u12345.jks.enc). Kosong = keystore global.'
         required: false
         default: ''
+      ac_payload:
+        description: '🛡 v4.47 PERISAI: payload watermark AntiClone (JSON dari bot, HMAC server-side). Kosong = skip.'
+        required: false
+        default: ''
+      ac_sig:
+        description: '🛡 v4.47 PERISAI: tanda tangan HMAC payload watermark (dari bot). Kosong = skip.'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -4105,6 +4113,8 @@ jobs:
           KS_PASS_OLD: ${{ secrets.KS_PASS_OLD }}
           # ── 🔐 v4.45.0 KUNCI: guard ikut keystore per-user (SHA cert = kunci user sendiri) ──
           INPUT_KEYSTORE_ID: ${{ inputs.keystore_id }}
+          INPUT_AC_PAYLOAD: ${{ inputs.ac_payload }}
+          INPUT_AC_SIG: ${{ inputs.ac_sig }}
           GUARD_MODE: flutter
         run: python3 /tmp/dzr_license_guard.py
       - name: Stable signing + OTA release
@@ -4118,6 +4128,8 @@ jobs:
           KS_ENC_KEY: ${{ secrets.KS_ENC_KEY }}
           # ── 🔐 v4.45.0 KUNCI: ID keystore per-user dari bot (kosong = global) ──
           INPUT_KEYSTORE_ID: ${{ inputs.keystore_id }}
+          INPUT_AC_PAYLOAD: ${{ inputs.ac_payload }}
+          INPUT_AC_SIG: ${{ inputs.ac_sig }}
         run: |
           APK=$(find . -name "*.apk" -path "*flutter-apk*" 2>/dev/null | head -1 || find . -name "*.apk" -path "*outputs/apk*" 2>/dev/null | head -1)
           if [ -z "$APK" ]; then
@@ -4125,6 +4137,25 @@ jobs:
             exit 0
           fi
           echo "APK target: $APK"
+          # ── 🛡 v4.47.0 PERISAI: AntiClone watermark — bukti asli + kepemilikan ──
+          # Payload + sig dihitung BOT (HMAC server-side) → ditempel ke APK
+          # SEBELUM zipalign/apksigner → ikut ke-sign → gak bisa dibuang/ditukar
+          # tanpa merusak signature APK. Kosong = dispatch manual lama (skip).
+          if [ -n "${INPUT_AC_PAYLOAD:-}" ] && [ -n "${INPUT_AC_SIG:-}" ]; then
+            AC_DIR=/tmp/dzr_ac
+            rm -rf "$AC_DIR"; mkdir -p "$AC_DIR/assets" "$AC_DIR/META-INF"
+            printf '%s' "$INPUT_AC_PAYLOAD" > "$AC_DIR/assets/dzr_ac.json"
+            printf '%s' "$INPUT_AC_SIG" > "$AC_DIR/META-INF/dzr_ac.sig"
+            AC_APK=$(readlink -f "$APK")
+            if (cd "$AC_DIR" && zip -q "$AC_APK" assets/dzr_ac.json META-INF/dzr_ac.sig); then
+              AC_BID=$(printf '%s' "$INPUT_AC_PAYLOAD" | grep -o '"bid":"[^"]*"' | head -1)
+              echo "🛡 AntiClone: watermark terpasang ${AC_BID}"
+            else
+              echo "WARNING: watermark AntiClone gagal ditempel (non-fatal)"
+            fi
+          else
+            echo "AntiClone: input kosong — watermark dilewati (dispatch manual lama)"
+          fi
 
           # ── 🔐 v6.6: keystore dari file TERENKRIPSI di repo ──
           # Format: AES-256-CBC + PBKDF2 (600k iter, salt acak) via openssl.
