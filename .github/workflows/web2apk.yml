@@ -4076,14 +4076,30 @@ jobs:
                   else:
                       # template Flutter modern: class tanpa onCreate → tambahkan method
                       stripped = body.rstrip()
-                      if not stripped.endswith("}"):
-                          fail("MainActivity.kt struktur aneh — gak bisa sisip onCreate")
                       inject = ("\n    override fun onCreate(savedInstanceState: android.os.Bundle?) {\n"
                                 "        super.onCreate(savedInstanceState)\n"
                                 "        LicenseGuard.check(this)\n"
                                 "    }\n")
-                      idx = stripped.rfind("}")
-                      body2 = stripped[:idx] + inject + "}\n"
+                      if stripped.endswith("}"):
+                          idx = stripped.rfind("}")
+                          body2 = stripped[:idx] + inject + "}\n"
+                      else:
+                          # template Flutter 3.x terbaru: class TANPA body —
+                          # "class MainActivity : FlutterActivity()" tanpa kurung kurawal
+                          # (fix run #110: guard gak nemu titik sisip → "struktur aneh")
+                          mcls = None
+                          for mm in re.finditer(r"(?m)^[ \t]*[^\n{}]*\b(?:class|object)\s+\w+[^\n{}]*\)\s*(?://[^\n]*)?(?:/\*.*?\*/)?\s*$", stripped):
+                              mcls = mm
+                          if not mcls:
+                              fail("MainActivity.kt struktur aneh — gak bisa sisip onCreate (bukan class tanpa-body standar)")
+                          head = re.sub(r"\s*//.*$", "", stripped[:mcls.end()])
+                          head = re.sub(r"\s*/\*.*?\*/\s*$", "", head).rstrip()
+                          tail = stripped[mcls.end():]
+                          for tl in tail.splitlines():
+                              ts2 = tl.strip()
+                              if ts2 and not ts2.startswith("//") and not ts2.startswith("/*") and not ts2.startswith("*") and not ts2.endswith("*/"):
+                                  fail("MainActivity.kt struktur aneh — ada kode lain setelah deklarasi class")
+                          body2 = head + " {" + inject + "}\n"
               open(src, "w", encoding="utf-8").write(body2)
               return gpath
 
