@@ -1320,6 +1320,36 @@ jobs:
                   print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' sisip override modifier')
                   return 1
 
+              def kt_fix_type_args(path, lineno, col, name, n):
+                  # v4.59b dokter ronde 5: "N type argument(s) expected for interface/class X"
+                  # Kaskade wajar dari fix dokter sendiri (contoh E2E dokter5: chain-fix
+                  # CoroutineContext.Key → Key<E> butuh argumen). Nempel star-projection
+                  # setelah nama tipe: 1 → '<*>', N → '<*, *, ...>'. Occurrence `name`
+                  # TERDEKAT col error (anchor K2 = simple name, kadang START rantai).
+                  # GUARD idempoten: sesudah nama udah ada '<' (udah generik/dipatch) → skip.
+                  src2 = kt_read(path)
+                  if not src2:
+                      return 0
+                  lines2 = src2.split('\n')
+                  if lineno < 1 or lineno > len(lines2):
+                      return 0
+                  line2 = lines2[lineno - 1]
+                  cands = []
+                  for m2 in re.finditer(r'\b' + re.escape(name) + r'\b', line2):
+                      cands.append((abs((m2.start() + 1) - col), m2.start() + 1, m2.end()))
+                  if not cands:
+                      return 0
+                  cands.sort()
+                  _d, s0, e0 = cands[0]
+                  if _d > 80:
+                      return 0
+                  if line2[e0:e0 + 1] == '<':
+                      return 0
+                  proj = '<*>' if n <= 1 else '<' + ', '.join(['*'] * n) + '>'
+                  lines2[lineno - 1] = line2[:e0] + proj + line2[e0:]
+                  open(path, 'w', encoding='utf-8').write('\n'.join(lines2))
+                  return 1
+
               def kt_fix_foreach_ambig(path, lineno, col):
                   # v4.58: patch SEMUA .forEach di baris yang belum disisipi.
                   # v4.59 tambahan: (1) occurrence yang UDAH disisipi tapi MASIH
@@ -1597,6 +1627,16 @@ jobs:
                       if 'Overload resolution ambiguity' in msg:
                           if kt_fix_foreach_ambig(fp, aline, acol) > 0:
                               applied.append('forEach ambigu -> ' + os.path.basename(fp) + ':' + str(aline))
+                      # K2 tulis angka pakai KATA ("One type argument expected...") —
+                      # terbukti log E2E dokter5 — kadang digit utk N besar; dua-duanya kebaca
+                      _mta = re.search(r'([0-9]+|One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten) type arguments? expected for (?:interface|class) ([\w.]+)', msg)
+                      if _mta:
+                          _tn = _mta.group(2).split('.')[-1]
+                          _mtan = {'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10}.get(_mta.group(1).lower())
+                          if _mtan is None:
+                              _mtan = int(_mta.group(1))
+                          if kt_fix_type_args(fp, aline, acol, _tn, _mtan) > 0:
+                              applied.append('type-args ' + _tn + '<*> -> ' + os.path.basename(fp) + ':' + str(aline))
                   if 'com.google.mlkit.nl.' in (kt_read(fp) or ''):
                       kt_fix_mlkit(fp)
                   if mref and mref.group(1) in KT_NOOP_MEMBERS:
@@ -1605,7 +1645,7 @@ jobs:
                       continue   # biasanya sembuh sendiri begitu import launch masuk
                   if re.search(r'Unresolved reference: (findNodeByText|findEditableNode|suspendTapGesture)', msg):
                       kt_acc_inject(fp)
-              kt_notes = [a for a in applied if a.startswith(('import ', 'helper ', 'inline-FQN ', 'null-safe ', '!! type-mismatch ', 'typo mlkit ', 'dependency ', 'member ', 'override ', 'forEach ', 'FQN chain ', 'revert '))]
+              kt_notes = [a for a in applied if a.startswith(('import ', 'helper ', 'inline-FQN ', 'null-safe ', '!! type-mismatch ', 'typo mlkit ', 'dependency ', 'member ', 'override ', 'forEach ', 'FQN chain ', 'revert ', 'type-args '))]
               if kt_notes:
                   print('KFIX-KT: ' + str(len(kt_notes)) + ' perbaikan source Kotlin')
                   for _n in kt_notes[:15]:
