@@ -1655,6 +1655,13 @@ jobs:
           fi
           rm -f /tmp/resdedup_removed
           python3 /tmp/resdedup.py || true
+          # ── 🩺 v4.55.0 PIPEFAIL FIX (akar sesungguhnya dokter mati total) ──
+          # GH Actions default shell = bash -e TANPA pipefail → pipeline exit
+          # = exit tee (selalu 0) → `if gradle | tee` selalu dianggap SUKSES
+          # → loop retry + kfix GAK PERNAH jalan (dead code sejak lahir!),
+          # build gagal langsung loncat ke "ERROR: Gak ada APK hasil build!".
+          # Bukti: run #21 (26/10) & E2E run 40276787628 — nol output kfix.
+          set -o pipefail
           BUILD_OK=false
           ATTEMPT=0
           while [ "$ATTEMPT" -lt 3 ]; do
@@ -1730,6 +1737,8 @@ jobs:
           fi
           rm -f /tmp/resdedup_removed
           python3 /tmp/resdedup.py || true
+          # ── 🩺 v4.55.0 PIPEFAIL FIX (jalur AAB — sama dengan jalur APK) ──
+          set -o pipefail
           BUILD_OK=false
           ATTEMPT=0
           while [ "$ATTEMPT" -lt 3 ]; do
