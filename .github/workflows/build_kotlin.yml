@@ -1041,22 +1041,36 @@ jobs:
                   segs = chain.split('.')
                   if sym not in segs:
                       return 0
-                  fq = KT_IMPORT_MAP.get(segs[-1])
-                  if not fq:
+                  # anchor MAP = segmen TERAKHIR yang dikenal KT_IMPORT_MAP (scan dari
+                  # belakang) — run #39 asli: CoroutineContext = SEGMENT TENGAH rantai
+                  # yang lebih panjang (error di col 32 = titik sebelum segmen gagal,
+                  # ekor setelahnya bikin segs[-1] gak dikenal → v4.58 skip total)
+                  mi = None
+                  for i in range(len(segs) - 1, -1, -1):
+                      if segs[i] in KT_IMPORT_MAP:
+                          mi = i
+                          break
+                  if mi is None:
                       return 0
-                  if fq == chain:
-                      if segs[-1] in KT_FQN_DENY and len(segs) > 1:
+                  fq = KT_IMPORT_MAP[segs[mi]]
+                  prefix = '.'.join(segs[:mi + 1])
+                  if sym in KT_FQN_DENY:
+                      # extension call — JANGAN di-FQN-call. Satu-satunya pengecualian:
+                      # rantai udah persis FQN resmi = bekas mangle dokter lama
+                      # (kotlinx.coroutines.launch tanpa receiver) → balikin polos.
+                      if sym == segs[-1] and prefix == fq and len(segs) > 1:
                           st = cm.start()
                           lines0[lineno - 1] = line[:st] + sym + line[cm.end():]
                           open(path, 'w', encoding='utf-8').write('\n'.join(lines0))
                           print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' balikin receiver call ' + fq + ' → ' + sym)
                           return 1
                       return 0
-                  if segs[-1] in KT_FQN_DENY:
+                  if prefix == fq:
                       return 0
-                  lines0[lineno - 1] = line[:cm.start()] + fq + line[cm.end():]
+                  lines0[lineno - 1] = line[:cm.start()] + fq + line[cm.start() + len(prefix):]
                   open(path, 'w', encoding='utf-8').write('\n'.join(lines0))
-                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' FQN chain ' + chain + ' → ' + fq)
+                  tail = segs[mi + 1:]
+                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' FQN chain ' + chain + ' → ' + fq + ('.' + '.'.join(tail) if tail else ''))
                   return 1
 
               def kt_unpatch_foreach(path, lineno, col):
