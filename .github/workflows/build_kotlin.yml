@@ -1365,6 +1365,10 @@ jobs:
                   lines0 = s0.split('\n')
                   if not (1 <= lineno <= len(lines0)):
                       return 0
+                  # PELAJARAN E2E run 40305652459 tetap hidup: .asIterable() GAK CUKUP —
+                  # stdlib Map juga punya asIterable() (kandidat tetap ambigu) — makanya
+                  # pakai .iterator().asSequence() (iterator() = member Iterable doang,
+                  # Sequence.forEach tunggal, lambda + destructuring user tetap utuh).
                   INS = '.iterator().asSequence()'
                   n = 0
                   while n < 4:
