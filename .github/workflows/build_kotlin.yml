@@ -988,6 +988,75 @@ jobs:
                           lines.insert(0, ins)
                   open(path, 'w', encoding='utf-8').write('\n'.join(lines))
                   return 1
+
+              def kt_fix_fqn_chain(path, lineno, col, sym):
+                  # v4.58: "Unresolved reference: X" di TENGAH path FQN yang
+                  # DIPAKAI INLINE di kode (bukan import) — kasus run #35
+                  # (NovaQuickTile 90:32 kotlinx.coroutines.flow.CoroutineContext):
+                  # kt_add_import cuma nambah import (GAK nolong — path FQN
+                  # diselesaikan apa adanya) → shift +1 baris; inline-FQN ganti
+                  # SEGMENT TERAKHIR doang → kotlinx.coroutines.flow.kotlin.
+                  # coroutines.CoroutineContext = MANGLE (run #35 attempt-3
+                  # "Unresolved reference: kotlin"). Solusi: ganti SELURUH rantai
+                  # dotted yang memuat sym dengan FQN resmi — segmen terakhir
+                  # harus dikenal KT_IMPORT_MAP. Sekalian nyembuhin mangle lama
+                  # (rantai 6-segmen tetap dikenali, segmen terakhir sama).
+                  s0 = kt_read(path)
+                  if s0 is None:
+                      return 0
+                  lines0 = s0.split('\n')
+                  if not (1 <= lineno <= len(lines0)):
+                      return 0
+                  line = lines0[lineno - 1]
+                  hits = [m3 for m3 in re.finditer(r'\b' + re.escape(sym) + r'\b', line)]
+                  if not hits:
+                      return 0
+                  best = min(hits, key=lambda m3: abs(m3.start() - (col - 1)))
+                  if abs(best.start() - (col - 1)) > 3:
+                      return 0
+                  chain = None
+                  cm = None
+                  for m3 in re.finditer(r'[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+', line):
+                      if m3.start() <= best.start() and best.end() <= m3.end():
+                          chain = m3.group(0)
+                          cm = m3
+                          break
+                  if not chain or '.' not in chain:
+                      return 0
+                  segs = chain.split('.')
+                  if sym not in segs:
+                      return 0
+                  fq = KT_IMPORT_MAP.get(segs[-1])
+                  if not fq or fq == chain:
+                      return 0
+                  lines0[lineno - 1] = line[:cm.start()] + fq + line[cm.end():]
+                  open(path, 'w', encoding='utf-8').write('\n'.join(lines0))
+                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' FQN chain ' + chain + ' → ' + fq)
+                  return 1
+
+              def kt_unpatch_foreach(path, lineno, col):
+                  # v4.58: "Unresolved reference: iterator" = sisipan
+                  # '.iterator().asSequence()' nyasar di receiver Map MURNI
+                  # (Map gak punya iterator()) → lepas sisipan itu.
+                  s0 = kt_read(path)
+                  if s0 is None:
+                      return 0
+                  lines0 = s0.split('\n')
+                  if not (1 <= lineno <= len(lines0)):
+                      return 0
+                  line = lines0[lineno - 1]
+                  if '.iterator().asSequence()' not in line:
+                      return 0
+                  occ = [m3 for m3 in re.finditer(r'\.iterator\(\)\.asSequence\(\)', line)]
+                  if not occ:
+                      return 0
+                  best = min(occ, key=lambda m3: abs(m3.start() + 1 - (col - 1)))
+                  if not (best.start() <= col - 1 <= best.start() + 11):
+                      return 0
+                  lines0[lineno - 1] = line[:best.start()] + line[best.end():]
+                  open(path, 'w', encoding='utf-8').write('\n'.join(lines0))
+                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' lepas sisipan iterator (receiver gak punya)')
+                  return 1
               def kt_file_package(path):
                   src = kt_read(path)
                   if src is None:
@@ -1095,9 +1164,11 @@ jobs:
                   '    return null\n'
                   '}\n'
                   '\n'
-                  'suspend fun suspendTapGesture(x: Number, y: Number): Boolean = kotlinx.coroutines.suspendCancellableCoroutine { cont ->\n'
+                  'suspend fun suspendTapGesture(vararg a: Any?): Boolean = kotlinx.coroutines.suspendCancellableCoroutine { cont ->\n'
                   '    val svc = kfixAccSvc\n'
-                  '    if (svc == null) { cont.resumeWith(Result.success(false)); return@suspendCancellableCoroutine }\n'
+                  '    if (svc == null || a.size < 2) { cont.resumeWith(Result.success(false)); return@suspendCancellableCoroutine }\n'
+                  '    val x = a[a.size - 2] as Number\n'
+                  '    val y = a[a.size - 1] as Number\n'
                   '    val p = android.graphics.Path().apply { moveTo(x.toFloat(), y.toFloat()) }\n'
                   '    val stroke = android.accessibilityservice.GestureDescription.StrokeDescription(p, 0L, 80L)\n'
                   '    val g = android.accessibilityservice.GestureDescription.Builder().addStroke(stroke).build()\n'
@@ -1211,35 +1282,38 @@ jobs:
                   return 1
 
               def kt_fix_foreach_ambig(path, lineno, col):
-                  # v4.57 ATURAN BARU: "Overload resolution ambiguity" antara
-                  # Iterable.forEach vs Map.forEach (run #31 NovaQuickTile
-                  # 92:45) → receiver applicable ke dua-duanya = pasti
-                  # implement Iterable. Selipan: .iterator().asSequence()
-                  # sebelum .forEach — iterator() cuma anggota Iterable
-                  # (stdlib Map GAK punya iterator()) → resolusi tunggal;
-                  # Sequence.forEach juga tunggal; lambda + destructuring
-                  # tetap utuh. PELAJARAN E2E run 40305652459: .asIterable()
-                  # GAK CUKUP — stdlib Map juga punya asIterable() → ambiguitas
-                  # cuma pindah ke asIterable (bukti kandidat attempt-2).
-                  # Gak ada .forEach di baris = skip.
+                  # v4.58 REVISI: v4.57 cuma patch SATU occurrence terdekat —
+                  # kalau baris punya >1 .forEach, yang kepatch bisa yang salah
+                  # (bukti run #35: ambigu 92:45 kepatch, attempt berikut ambigu
+                  # 92:69 masih ambigu — sisipan cuma geser col +24). Sekarang:
+                  # patch SEMUA .forEach di baris yang belum disisipi. Receiver
+                  # ambigu Map-vs-Iterable PASTI punya iterator() (kandidat
+                  # Iterable.forEach cuma apply kalau receiver Iterable);
+                  # salah-patch di Iterable murni tetap sah kompil; Map murni
+                  # gak mungkin ambigu; kalau ketukar ke-Map murni, aturan
+                  # revert (kt_unpatch_foreach) yang nguleg di attempt berikut.
+                  # PELAJARAN E2E run 40305652459 tetap hidup: .asIterable() GAK CUKUP — stdlib Map juga punya asIterable().
                   s0 = kt_read(path)
                   if s0 is None:
                       return 0
                   lines0 = s0.split('\n')
                   if not (1 <= lineno <= len(lines0)):
                       return 0
-                  l = lines0[lineno - 1]
-                  if '.iterator().asSequence().forEach' in l:
+                  n = 0
+                  while n < 4:
+                      l = lines0[lineno - 1]
+                      hits = [m2 for m2 in re.finditer(r'\.forEach\b', l)
+                              if l[max(0, m2.start() - 24):m2.start()] != '.iterator().asSequence()']
+                      if not hits:
+                          break
+                      best = min(hits, key=lambda m2: abs(m2.start() - (col - 1)))
+                      lines0[lineno - 1] = l[:best.start()] + '.iterator().asSequence()' + l[best.start():]
+                      n += 1
+                  if n == 0:
                       return 0
-                  hits = [m2 for m2 in re.finditer(r'\.forEach\b', l)]
-                  if not hits:
-                      return 0
-                  best = min(hits, key=lambda m2: abs(m2.start() - (col - 1)))
-                  lines0[lineno - 1] = l[:best.start()] + '.iterator().asSequence()' + l[best.start():]
                   open(path, 'w', encoding='utf-8').write('\n'.join(lines0))
-                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' forEach ambigu → iterator().asSequence()')
+                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' forEach ambigu → iterator().asSequence()' + (' x' + str(n) if n > 1 else ''))
                   return 1
-
               def kt_inline_fqn(path, lineno, col, sym, fqn):
                   # v4.56 fallback: import udah ada tapi simbol tetap unresolved
                   # (kasus CoroutineContext NovaQuickTile run #24) → tempel FQN
@@ -1413,6 +1487,16 @@ jobs:
                   mref = re.search(r'Unresolved reference: (\w+)', msg)
                   if mref:
                       sym = mref.group(1)
+                      # v4.58: revert salah-patch iterator + FQN-chain DULU —
+                      # import gak nolong referensi FQN inline & per-segmen = mangle
+                      if sym == 'iterator' and kt_unpatch_foreach(fp, aline, acol) > 0:
+                          applied.append('revert forEach-patch (Map murni) -> ' + os.path.basename(fp) + ':' + str(aline))
+                          mref = None
+                      elif kt_fix_fqn_chain(fp, aline, acol, sym) > 0:
+                          applied.append('FQN chain ' + sym + ' -> ' + os.path.basename(fp))
+                          mref = None
+                  if mref:
+                      sym = mref.group(1)
                       fq = KT_IMPORT_MAP.get(sym)
                       if fq and kt_add_import(fp, fq) > 0:
                           applied.append('import ' + fq + ' -> ' + os.path.basename(fp))
@@ -1460,7 +1544,7 @@ jobs:
                       continue   # biasanya sembuh sendiri begitu import launch masuk
                   if re.search(r'Unresolved reference: (findNodeByText|findEditableNode|suspendTapGesture)', msg):
                       kt_acc_inject(fp)
-              kt_notes = [a for a in applied if a.startswith(('import ', 'helper ', 'inline-FQN ', 'null-safe ', '!! type-mismatch ', 'typo mlkit ', 'dependency ', 'member ', 'override ', 'forEach '))]
+              kt_notes = [a for a in applied if a.startswith(('import ', 'helper ', 'inline-FQN ', 'null-safe ', '!! type-mismatch ', 'typo mlkit ', 'dependency ', 'member ', 'override ', 'forEach ', 'FQN chain ', 'revert '))]
               if kt_notes:
                   print('KFIX-KT: ' + str(len(kt_notes)) + ' perbaikan source Kotlin')
                   for _n in kt_notes[:15]:
