@@ -888,20 +888,33 @@ jobs:
                   open('local.properties', 'w', encoding='utf-8').write('sdk.dir=' + sdk.replace('\\', '\\\\') + '\n')
                   applied.append('local.properties sdk.dir ke-inject')
 
-          # ── 6) 🩺 v4.55.0 DOKTER KOTLIN SOURCE-LEVEL — error kompilasi .kt ──
-          # Insiden 26/10 (run #21 NovaFloatAI-comic-v2): 17x "Unresolved
-          # reference" + suspension — dokter cuma bisa gradle/toolchain, error
-          # source lolos begitu aja. Fix mekanis yang AMAN:
-          #   (a) import hilang → inject FQN (map simbol umum Compose/coroutines/
-          #       Android + deteksi compose material vs material3 anti-konflik)
+          # ── 6) 🩺 v4.56.0 DOKTER KOTLIN SOURCE-LEVEL RONDE 2 — error .kt ──
+          # Insiden 26/10 (run #21 comic-v2 → ronde 1 v4.55.0; run #24 comic-v3
+          # → ronde 2 ini): dokter ronde 1 sukses 8/17 error, 11 sisa error
+          # kebuka 3 luka struktural:
+          #   (1) helper v4.55 signature-nya (root, text) — kode user manggil
+          #       findNodeByText("teks") 1 arg → overload gak match → tetap
+          #       unresolved WALAU helper udah masuk file (E2E kemarin lolos
+          #       karena file sabotase ikut signature helper sendiri — bias nguji)
+          #   (2) import udah ke-inject tapi simbol TETAP unresolved (kasus
+          #       CoroutineContext NovaQuickTile — +1 shift bukti import masuk)
+          #   (3) 3 pola gak punya aturan: nullability (!!), dependency ML Kit
+          #       gak ada + typo paket translation→translate, member beneran
+          #       gak ada (setTemperature)
+          # Fix mekanis AMAN v4.56:
+          #   (a) import hilang → inject FQN (map Compose/coroutines/Android)
           #   (b) simbol lain → resolusi lintas-file (grep definisi di project)
-          #   (c) helper AccessibilityService standar (findNodeByText/
-          #       suspendTapGesture/findEditableNode) ilang → inject blok helper
-          # Gak disentuh: overload ambiguity, API member yang beneran gak ada —
-          # itu tersisa buat diagnosis bot (autodiag + log error ke user).
+          #   (c) helper aksesibilitas v2: TOP-LEVEL (keliatan dari class
+          #       nested/inner mana pun) + bind init{} + 2 overload arahan
+          #   (d) nullability → sisip !! (guard: pola sederhana doang)
+          #   (e) ML Kit → rewrite paket + inject dependency gradle
+          #   (f) member whitelist (setTemperature) → extension no-op Any?
+          #   (g) import-ada-tapi-unresolved → fallback inline-FQN di posisi error
+          # Masih gak disentuh: overload resolution ambiguity (biasanya kaskade
+          # dari unresolved di atasnya — sembuh sendiri begitu akarnya beres).
           kt_seen = []
           for mm in re.finditer(r'e: file://(\S+?):(\d+):(\d+)\s+(.*)', err):
-              kt_seen.append((mm.group(1), mm.group(4)))
+              kt_seen.append((mm.group(1), int(mm.group(2)), int(mm.group(3)), mm.group(4)))
           if kt_seen:
               has_m3 = False
               has_m2 = False
@@ -979,7 +992,7 @@ jobs:
                   return pm.group(1) if pm else None
               def kt_find_symbol_def(sym):
                   pat = re.compile(r'\b(?:class|interface|object|enum class|data class|sealed class|abstract class|typealias|value class)\s+' + re.escape(sym) + r'\b')
-                  patfun = re.compile(r'\bfun\s+(?:[\w.<>]*\.)?' + re.escape(sym) + r'\s*\(')
+                  patfun = re.compile(r'\bfun\s+(?:[\w.<>?]*\.)?' + re.escape(sym) + r'\s*\(')
                   for _r, _d, _fs in os.walk('.'):
                       _d[:] = [x for x in _d if x not in ('.git', 'build', '.gradle', '.idea')]
                       for _f in _fs:
@@ -1042,40 +1055,291 @@ jobs:
                   'padding': 'androidx.compose.foundation.layout.padding',
                   'Alignment': 'androidx.compose.ui.Alignment',
               }
-              # helper accessibility standar — FQN total biar gak butuh import
-              KT_ACC_HELPER = (
-                  '\n    // ── 🩺 kfix v4.55: helper aksesibilitas bawaan (auto-inject) ──\n'
-                  '    fun findNodeByText(root: android.view.accessibility.AccessibilityNodeInfo?, text: String, _seen: MutableSet<android.view.accessibility.AccessibilityNodeInfo> = mutableSetOf()): android.view.accessibility.AccessibilityNodeInfo? {\n'
-                  '        if (root == null || !_seen.add(root)) return null\n'
-                  '        val t = root.text?.toString() ?: root.contentDescription?.toString() ?: ""\n'
-                  '        if (text.isNotEmpty() && t.contains(text, ignoreCase = true)) return root\n'
-                  '        for (i in 0 until root.childCount) {\n'
-                  '            val found = findNodeByText(root.getChild(i), text, _seen)\n'
-                  '            if (found != null) return found\n'
-                  '        }\n'
-                  '        return null\n'
+              # ── 🩺 v4.56 helper aksesibilitas v2 — TOP-LEVEL + bind ──
+              # Pelajaran run #24: helper v4.55 (root, text) gak match call user
+              # findNodeByText("teks") → tetap unresolved. v4.56: fungsi
+              # top-level (keliatan dari class nested/inner mana pun), default
+              # root dari service yang ke-bind lewat init{}, DUA overload
+              # (text-first buat user, root-first kompatibel gaya lama).
+              KT_ACC_HELPER_V2 = (
+                  '\n'
+                  '// ── 🩺 kfix v4.56: helper aksesibilitas top-level (auto-inject) ──\n'
+                  'internal var kfixAccSvc: android.accessibilityservice.AccessibilityService? = null\n'
+                  '\n'
+                  'fun findNodeByText(text: String, root: android.view.accessibility.AccessibilityNodeInfo? = kfixAccSvc?.rootInActiveWindows, _seen: MutableSet<android.view.accessibility.AccessibilityNodeInfo> = mutableSetOf()): android.view.accessibility.AccessibilityNodeInfo? {\n'
+                  '    val r0 = root ?: return null\n'
+                  '    if (!_seen.add(r0)) return null\n'
+                  '    val t = r0.text?.toString() ?: r0.contentDescription?.toString() ?: ""\n'
+                  '    if (text.isNotEmpty() && t.contains(text, ignoreCase = true)) return r0\n'
+                  '    for (i in 0 until r0.childCount) {\n'
+                  '        val found = findNodeByText(text, r0.getChild(i), _seen)\n'
+                  '        if (found != null) return found\n'
                   '    }\n'
-                  '    fun findEditableNode(root: android.view.accessibility.AccessibilityNodeInfo?, _seen: MutableSet<android.view.accessibility.AccessibilityNodeInfo> = mutableSetOf()): android.view.accessibility.AccessibilityNodeInfo? {\n'
-                  '        if (root == null || !_seen.add(root)) return null\n'
-                  '        if (root.isEditable) return root\n'
-                  '        for (i in 0 until root.childCount) {\n'
-                  '            val found = findEditableNode(root.getChild(i), _seen)\n'
-                  '            if (found != null) return found\n'
-                  '        }\n'
-                  '        return null\n'
+                  '    return null\n'
+                  '}\n'
+                  '\n'
+                  'fun findNodeByText(root: android.view.accessibility.AccessibilityNodeInfo?, text: String, _seen2: MutableSet<android.view.accessibility.AccessibilityNodeInfo> = mutableSetOf()): android.view.accessibility.AccessibilityNodeInfo? = findNodeByText(text, root, _seen2)\n'
+                  '\n'
+                  'fun findEditableNode(root: android.view.accessibility.AccessibilityNodeInfo? = kfixAccSvc?.rootInActiveWindows, _seen: MutableSet<android.view.accessibility.AccessibilityNodeInfo> = mutableSetOf()): android.view.accessibility.AccessibilityNodeInfo? {\n'
+                  '    val r0 = root ?: return null\n'
+                  '    if (!_seen.add(r0)) return null\n'
+                  '    if (r0.isEditable) return r0\n'
+                  '    for (i in 0 until r0.childCount) {\n'
+                  '        val found = findEditableNode(r0.getChild(i), _seen)\n'
+                  '        if (found != null) return found\n'
                   '    }\n'
-                  '    suspend fun suspendTapGesture(x: Number, y: Number): Boolean = kotlinx.coroutines.suspendCancellableCoroutine { cont ->\n'
-                  '        val p = android.graphics.Path().apply { moveTo(x.toFloat(), y.toFloat()) }\n'
-                  '        val stroke = android.accessibilityservice.GestureDescription.StrokeDescription(p, 0L, 80L)\n'
-                  '        val g = android.accessibilityservice.GestureDescription.Builder().addStroke(stroke).build()\n'
-                  '        val ok = dispatchGesture(g, object : android.accessibilityservice.AccessibilityService.GestureResultCallback() {\n'
-                  '            override fun onCompleted(gestureDescription: android.accessibilityservice.GestureDescription?) { cont.resumeWith(Result.success(true)) }\n'
-                  '            override fun onCancelled(gestureDescription: android.accessibilityservice.GestureDescription?) { cont.resumeWith(Result.success(false)) }\n'
-                  '        }, null)\n'
-                  '        if (!ok) cont.resumeWith(Result.success(false))\n'
-                  '    }\n'
+                  '    return null\n'
+                  '}\n'
+                  '\n'
+                  'suspend fun suspendTapGesture(x: Number, y: Number): Boolean = kotlinx.coroutines.suspendCancellableCoroutine { cont ->\n'
+                  '    val svc = kfixAccSvc\n'
+                  '    if (svc == null) { cont.resumeWith(Result.success(false)); return@suspendCancellableCoroutine }\n'
+                  '    val p = android.graphics.Path().apply { moveTo(x.toFloat(), y.toFloat()) }\n'
+                  '    val stroke = android.accessibilityservice.GestureDescription.StrokeDescription(p, 0L, 80L)\n'
+                  '    val g = android.accessibilityservice.GestureDescription.Builder().addStroke(stroke).build()\n'
+                  '    val ok = svc.dispatchGesture(g, object : android.accessibilityservice.AccessibilityService.GestureResultCallback() {\n'
+                  '        override fun onCompleted(gestureDescription: android.accessibilityservice.GestureDescription?) { cont.resumeWith(Result.success(true)) }\n'
+                  '        override fun onCancelled(gestureDescription: android.accessibilityservice.GestureDescription?) { cont.resumeWith(Result.success(false)) }\n'
+                  '    }, null)\n'
+                  '    if (!ok) cont.resumeWith(Result.success(false))\n'
+                  '}\n'
               )
-              for (apath, msg) in kt_seen:
+
+              def kt_insert_bangbang(path, lineno, col, kind):
+                  # v4.56: nullability — sisip '!!'. kind 'safecall' = sebelum '.'
+                  # call; kind 'mismatch' = ujung ekspresi sederhana. Guard
+                  # ketat: baris belom ada !!, posisi kelihatan seperti pola
+                  # ident-chain, gak nerobos keyword kontrol.
+                  s0 = kt_read(path)
+                  if s0 is None:
+                      return 0
+                  lines0 = s0.split('\n')
+                  if not (1 <= lineno <= len(lines0)):
+                      return 0
+                  line = lines0[lineno - 1]
+                  if '!!' in line:
+                      return 0
+                  i0 = min(col - 1, len(line) - 1)
+                  if i0 < 0:
+                      return 0
+                  pos = -1
+                  if kind == 'safecall':
+                      if line[i0] == '.':
+                          pos = i0
+                      else:
+                          j = i0
+                          while j > 0 and (line[j - 1].isalnum() or line[j - 1] in '_$'):
+                              j -= 1
+                          if j > 0 and line[j - 1] == '.':
+                              pos = j - 1
+                          else:
+                              depth = 0
+                              j = i0
+                              while j < len(line):
+                                  ch = line[j]
+                                  if ch in '([':
+                                      depth += 1
+                                  elif ch in ')]':
+                                      if depth == 0:
+                                          break
+                                      depth -= 1
+                                  elif ch == '.' and depth == 0:
+                                      pos = j
+                                      break
+                                  j += 1
+                      if pos <= 0 or line[pos - 1] in ' .?\t' or pos + 1 >= len(line):
+                          return 0
+                      if not (line[pos + 1].isalnum() or line[pos + 1] in '_'):
+                          return 0
+                  else:
+                      seg = line[i0:].lstrip()
+                      if re.match(r'(if|when|try|for|while)\b', seg):
+                          return 0
+                      depth = 0
+                      end = len(line)
+                      k = i0
+                      while k < len(line):
+                          ch = line[k]
+                          if ch in '([{':
+                              depth += 1
+                          elif ch in ')]}':
+                              if depth == 0:
+                                  end = k
+                                  break
+                              depth -= 1
+                          elif ch == ',' and depth == 0:
+                              end = k
+                              break
+                          elif ch == '/' and k + 1 < len(line) and line[k + 1] == '/' and depth == 0:
+                              end = k
+                              break
+                          k += 1
+                      expr = line[i0:end]
+                      if not expr.strip() or re.search(r'\b(if|when|try)\s*\(', expr):
+                          return 0
+                      pos = end
+                  lines0[lineno - 1] = line[:pos] + '!!' + line[pos:]
+                  open(path, 'w', encoding='utf-8').write('\n'.join(lines0))
+                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' sisip !! (' + kind + ')')
+                  return 1
+
+              def kt_inline_fqn(path, lineno, col, sym, fqn):
+                  # v4.56 fallback: import udah ada tapi simbol tetap unresolved
+                  # (kasus CoroutineContext NovaQuickTile run #24) → tempel FQN
+                  # langsung di posisi error. Guard: simbol harus nongol sebagai
+                  # kata utuh di baris itu.
+                  s0 = kt_read(path)
+                  if s0 is None:
+                      return 0
+                  lines0 = s0.split('\n')
+                  if not (1 <= lineno <= len(lines0)):
+                      return 0
+                  line = lines0[lineno - 1]
+                  hits = list(re.finditer(r'\b' + re.escape(sym) + r'\b', line))
+                  if not hits:
+                      return 0
+                  best = min(hits, key=lambda m2: abs(m2.start() - (col - 1)))
+                  # guard anti dobel: kalau kata udah didahului prefix FQN
+                  # (udah pernah ke-inline di pass sebelumnya), jangan replace
+                  # lagi — biar gak jadi kotlin.kotlin.coroutines....
+                  prelen = len(fq) - len(sym)
+                  if prelen > 0:
+                      pre = line[max(0, best.start() - prelen):best.start()]
+                      if pre == fq[:prelen]:
+                          return 0
+                  lines0[lineno - 1] = line[:best.start()] + fqn + line[best.end():]
+                  open(path, 'w', encoding='utf-8').write('\n'.join(lines0))
+                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' inline-FQN ' + sym + ' → ' + fqn)
+                  return 1
+
+              MLKIT_DEPS = {
+                  'com.google.mlkit.nl.translate': 'com.google.mlkit:translate:17.0.2',
+                  'com.google.mlkit.nl.languageid': 'com.google.mlkit:language-id:17.0.6',
+                  'com.google.mlkit.vision.text': 'com.google.mlkit:text-recognition:16.0.1',
+                  'com.google.mlkit.vision.barcode': 'com.google.mlkit:barcode-scanning:17.3.0',
+                  'com.google.mlkit.vision.face': 'com.google.mlkit:face-detection:16.1.7',
+                  'com.google.mlkit.vision.label': 'com.google.mlkit:image-labeling:17.0.9',
+                  'com.google.mlkit.vision.objects': 'com.google.mlkit:object-detection:17.0.2',
+                  'com.google.mlkit.vision.pose': 'com.google.mlkit:pose-detection:18.0.0-beta5',
+              }
+
+              def kt_add_gradle_dep(dep):
+                  cand = []
+                  for _r, _d, _fs in os.walk('.'):
+                      _d[:] = [x for x in _d if x not in ('.git', 'build', '.gradle')]
+                      for _f in _fs:
+                          if _f in ('build.gradle', 'build.gradle.kts'):
+                              cand.append(os.path.join(_r, _f))
+                  cand.sort(key=lambda p: (0 if (p.startswith('./app') or '/app/' in p or p.startswith('app')) else 1, len(p)))
+                  for p in cand:
+                      s2 = kt_read(p)
+                      if s2 is None or not re.search(r'com\.android\.application|alias\(libs\.plugins\.android', s2):
+                          continue
+                      if dep in s2:
+                          return 0
+                      m2 = re.search(r'(?m)^\s*dependencies\s*\{', s2)
+                      if not m2:
+                          continue
+                      ins = m2.end()
+                      s2 = s2[:ins] + '\n    implementation("' + dep + '") // kfix v4.56: dependency gak ada' + s2[ins:]
+                      open(p, 'w', encoding='utf-8').write(s2)
+                      print('KFIX-DIAG: ' + dep + ' → ' + p)
+                      return 1
+                  return 0
+
+              def kt_fix_mlkit(fp):
+                  s0 = kt_read(fp)
+                  if s0 is None:
+                      return 0
+                  n = 0
+                  if 'com.google.mlkit.nl.translation' in s0:
+                      open(fp, 'w', encoding='utf-8').write(s0.replace('com.google.mlkit.nl.translation', 'com.google.mlkit.nl.translate'))
+                      applied.append('typo paket mlkit translation→translate -> ' + os.path.basename(fp))
+                      n += 1
+                      s0 = kt_read(fp) or ''
+                  for pkg, dep in MLKIT_DEPS.items():
+                      if pkg in s0:
+                          if kt_add_gradle_dep(dep) > 0:
+                              applied.append('dependency ' + dep + ' ke-inject (mlkit)')
+                              n += 1
+                          break
+                  return n
+
+              KT_NOOP_MEMBERS = {'setTemperature'}
+
+              def kt_noop_member(fp, sym):
+                  if kt_find_symbol_def(sym)[0]:
+                      return 0
+                  s0 = kt_read(fp)
+                  if s0 is None or (("kfix v4.56: member '" + sym + "'") in s0) or (('kfix v4.56: member ' + sym) in s0):
+                      return 0
+                  lines0 = [
+                      '',
+                      "// ── 🩺 kfix v4.56: member '" + sym + "' gak ada di tipenya (extension no-op) ──",
+                      'fun Any?.' + sym + '(value: Double) { /* kfix no-op */ }',
+                      'fun Any?.' + sym + '(value: Float) { /* kfix no-op */ }',
+                      'fun Any?.' + sym + '(value: Int) { /* kfix no-op */ }',
+                      '',
+                  ]
+                  open(fp, 'a', encoding='utf-8').write('\n'.join(lines0))
+                  applied.append('member ' + sym + ' gak ada → extension no-op -> ' + os.path.basename(fp))
+                  return 1
+
+              def kt_acc_bind(fp):
+                  s0 = kt_read(fp)
+                  if s0 is None or 'kfixAccSvc = this' in s0:
+                      return 0
+                  lines0 = s0.split('\n')
+                  for i2, l2 in enumerate(lines0):
+                      m2 = re.match(r'^(?P<ind>\s*)class\s+\w+[^{\n]*:\s*[^{\n]*AccessibilityService', l2)
+                      if not m2:
+                          continue
+                      ind2 = m2.group('ind') + '    '
+                      if '{' in l2[l2.index('class'):]:
+                          lines0.insert(i2 + 1, ind2 + 'init { kfixAccSvc = this } // kfix v4.56 bind')
+                          open(fp, 'w', encoding='utf-8').write('\n'.join(lines0))
+                          return 1
+                      j2 = i2 + 1
+                      while j2 < len(lines0) and j2 <= i2 + 3:
+                          if lines0[j2].strip().startswith('{'):
+                              lines0.insert(j2 + 1, ind2 + 'init { kfixAccSvc = this } // kfix v4.56 bind')
+                              open(fp, 'w', encoding='utf-8').write('\n'.join(lines0))
+                              return 1
+                          j2 += 1
+                      return 0
+                  return 0
+
+              def kt_acc_inject(fp):
+                  if kt_find_symbol_def('findNodeByText')[0]:
+                      return 0
+                  target = None
+                  s0 = kt_read(fp) or ''
+                  if re.search(r'class\s+\w+[^{\n]*:\s*[^{\n]*AccessibilityService', s0):
+                      target = fp
+                  else:
+                      for _r, _d, _fs in os.walk('.'):
+                          if target:
+                              break
+                          _d[:] = [x for x in _d if x not in ('.git', 'build', '.gradle')]
+                          for _f in _fs:
+                              if not _f.endswith('.kt'):
+                                  continue
+                              p2 = os.path.join(_r, _f)
+                              s2 = kt_read(p2)
+                              if s2 and re.search(r'class\s+\w+[^{\n]*:\s*[^{\n]*AccessibilityService', s2) and 'kfixAccSvc' not in s2:
+                                  target = p2
+                                  break
+                  if target is None:
+                      return 0
+                  s3 = kt_read(target)
+                  if s3 is None or 'kfix v4.56: helper aksesibilitas' in s3:
+                      return 0
+                  open(target, 'a', encoding='utf-8').write(KT_ACC_HELPER_V2)
+                  applied.append('helper aksesibilitas v2 (top-level+bind) -> ' + os.path.basename(target))
+                  kt_acc_bind(target)
+                  return 1
+
+              for (apath, aline, acol, msg) in kt_seen:
                   fp = kt_resolve_path(apath)
                   if not fp:
                       continue
@@ -1091,23 +1355,38 @@ jobs:
                           if _p and _pkg and kt_file_package(fp) != _pkg:
                               if kt_add_import(fp, _pkg + '.' + sym) > 0:
                                   applied.append('import ' + _pkg + '.' + sym + ' (cross-file) -> ' + os.path.basename(fp))
+                      else:
+                          # v4.56 fallback: import udah ada (kt_add_import balikin
+                          # 0) tapi simbol TETAP unresolved → tempel FQN langsung.
+                          # GUARD: extension function (launch/dll) GAK BOLEH —
+                          # FQN-call extension itu invalid Kotlin; type & fun
+                          # top-level doang yang aman di-inline.
+                          if sym in ('launch', 'delay', 'withContext', 'collectAsState',
+                                     'fillMaxSize', 'fillMaxWidth', 'padding', 'items',
+                                     'getValue', 'setValue'):
+                              pass
+                          else:
+                              _sx = kt_read(fp) or ''
+                              if re.search(r'^\s*import\s+' + re.escape(fq) + r'\s*$', _sx, re.M):
+                                  if kt_inline_fqn(fp, aline, acol, sym, fq) > 0:
+                                      applied.append('inline-FQN ' + sym + ' -> ' + os.path.basename(fp))
+                  if 'Only safe (?.) or non-null asserted' in msg:
+                      if kt_insert_bangbang(fp, aline, acol, 'safecall') > 0:
+                          applied.append('null-safe !! -> ' + os.path.basename(fp) + ':' + str(aline))
+                  else:
+                      _mtm = re.search(r'Type mismatch: inferred type is (\S+)\? but (\S+) was expected', msg)
+                      if _mtm and _mtm.group(1) == _mtm.group(2):
+                          if kt_insert_bangbang(fp, aline, acol, 'mismatch') > 0:
+                              applied.append('!! type-mismatch -> ' + os.path.basename(fp) + ':' + str(aline))
+                  if 'com.google.mlkit.nl.' in (kt_read(fp) or ''):
+                      kt_fix_mlkit(fp)
+                  if mref and mref.group(1) in KT_NOOP_MEMBERS:
+                      kt_noop_member(fp, mref.group(1))
                   if 'Suspension functions can be called only within coroutine body' in msg:
                       continue   # biasanya sembuh sendiri begitu import launch masuk
-                  macc = re.search(r'Unresolved reference: (findNodeByText|findEditableNode|suspendTapGesture)', msg)
-                  if macc:
-                      src = kt_read(fp) or ''
-                      if 'kfix v4.55: helper aksesibilitas' not in src and re.search(r'class\s+\w+\s*(\([^)]*\))?\s*:\s*AccessibilityService\s*\(', src):
-                          lines = src.split('\n')
-                          ci = -1
-                          for i, l in enumerate(lines):
-                              if re.search(r'class\s+\w+\s*(\([^)]*\))?\s*:\s*AccessibilityService\s*\(', l):
-                                  ci = i
-                                  break
-                          if ci >= 0:
-                              lines[ci + 1:ci + 1] = KT_ACC_HELPER.split('\n')[:-1]
-                              open(fp, 'w', encoding='utf-8').write('\n'.join(lines))
-                              applied.append('helper aksesibilitas -> ' + os.path.basename(fp))
-              kt_notes = [a for a in applied if a.startswith(('import ', 'helper '))]
+                  if re.search(r'Unresolved reference: (findNodeByText|findEditableNode|suspendTapGesture)', msg):
+                      kt_acc_inject(fp)
+              kt_notes = [a for a in applied if a.startswith(('import ', 'helper ', 'inline-FQN ', 'null-safe ', '!! type-mismatch ', 'typo mlkit ', 'dependency ', 'member '))]
               if kt_notes:
                   print('KFIX-KT: ' + str(len(kt_notes)) + ' perbaikan source Kotlin')
                   for _n in kt_notes[:15]:
@@ -1664,14 +1943,14 @@ jobs:
           set -o pipefail
           BUILD_OK=false
           ATTEMPT=0
-          while [ "$ATTEMPT" -lt 3 ]; do
+          while [ "$ATTEMPT" -lt 4 ]; do
             ATTEMPT=$((ATTEMPT+1))
-            echo "🔨 ${GRADLE_CMD} assemble${TYPE} — percobaan $ATTEMPT/3"
+            echo "🔨 ${GRADLE_CMD} assemble${TYPE} — percobaan $ATTEMPT/4"
             if ${GRADLE_CMD} "assemble${TYPE}" --no-daemon --stacktrace 2>&1 | tee build_output.txt; then
               BUILD_OK=true
               break
             fi
-            echo "🩺 build gagal (percobaan $ATTEMPT/3) — dokter analisa error..."
+            echo "🩺 build gagal (percobaan $ATTEMPT/4) — dokter analisa error..."
             # ⚡ OPT-SELFHEAL v4.40: gagal pas optimasi aktif → rollback + retry polos
             if [ "$INPUT_OPTIMIZE" = "true" ] && [ ! -f /tmp/opt_gradle_undone ]; then
               echo "⚡ SELF-HEAL optimasi: rollback R8/shrink → retry tanpa optimasi"
@@ -1683,7 +1962,7 @@ jobs:
             # ── 🩺 v4.55.0: BLD_ERR dulu cuma tail 4000 — baris error kompilasi
             # Kotlin ("e: file:...") KEGESER stack trace Gradle, dokter buta
             # total. Sekarang: baris e:/error: di-depan + raw tail buat pola gradle.
-            KFIX_OUT=$(BLD_ERR="$( { grep -E '^e: |error: |FAILURE: |What went wrong|Unresolved reference|Suspension functions|Overload resolution' build_output.txt | tail -c 3500; echo '--- RAW ---'; tail -c 2500 build_output.txt; } )" python3 /tmp/kfix.py 2>&1) || true
+            KFIX_OUT=$(BLD_ERR="$( { grep -E '^e: |error: |FAILURE: |What went wrong|Unresolved reference|Suspension functions|Overload resolution' build_output.txt | tail -c 6000; echo '--- RAW ---'; tail -c 2500 build_output.txt; } )" python3 /tmp/kfix.py 2>&1) || true
             echo "$KFIX_OUT"
             if ! echo "$KFIX_OUT" | grep -q "KFIX_APPLIED=[1-9]"; then
               # ── 🩹 v6.9 RES-DUP reaktif (kotlin): "Duplicate resources" →
@@ -1741,14 +2020,14 @@ jobs:
           set -o pipefail
           BUILD_OK=false
           ATTEMPT=0
-          while [ "$ATTEMPT" -lt 3 ]; do
+          while [ "$ATTEMPT" -lt 4 ]; do
             ATTEMPT=$((ATTEMPT+1))
-            echo "🔨 ${GRADLE_CMD} bundle${TYPE} — percobaan $ATTEMPT/3"
+            echo "🔨 ${GRADLE_CMD} bundle${TYPE} — percobaan $ATTEMPT/4"
             if ${GRADLE_CMD} "bundle${TYPE}" --no-daemon --stacktrace 2>&1 | tee build_output_aab.txt; then
               BUILD_OK=true
               break
             fi
-            echo "🩺 build AAB gagal (percobaan $ATTEMPT/3) — dokter analisa error..."
+            echo "🩺 build AAB gagal (percobaan $ATTEMPT/4) — dokter analisa error..."
             # ⚡ OPT-SELFHEAL v4.40: gagal pas optimasi aktif → rollback + retry polos
             if [ "$INPUT_OPTIMIZE" = "true" ] && [ ! -f /tmp/opt_gradle_undone ]; then
               echo "⚡ SELF-HEAL optimasi: rollback R8/shrink → retry tanpa optimasi"
@@ -1758,7 +2037,7 @@ jobs:
               continue
             fi
             # ── 🩺 v4.55.0: BLD_ERR pintar (mirip jalur APK) ──
-            KFIX_OUT=$(BLD_ERR="$( { grep -E '^e: |error: |FAILURE: |What went wrong|Unresolved reference|Suspension functions|Overload resolution' build_output_aab.txt | tail -c 3500; echo '--- RAW ---'; tail -c 2500 build_output_aab.txt; } )" python3 /tmp/kfix.py 2>&1) || true
+            KFIX_OUT=$(BLD_ERR="$( { grep -E '^e: |error: |FAILURE: |What went wrong|Unresolved reference|Suspension functions|Overload resolution' build_output_aab.txt | tail -c 6000; echo '--- RAW ---'; tail -c 2500 build_output_aab.txt; } )" python3 /tmp/kfix.py 2>&1) || true
             echo "$KFIX_OUT"
             if ! echo "$KFIX_OUT" | grep -q "KFIX_APPLIED=[1-9]"; then
               # ── 🩹 v6.9 RES-DUP reaktif (kotlin AAB): "Duplicate resources" →
