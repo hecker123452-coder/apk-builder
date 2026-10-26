@@ -960,14 +960,18 @@ jobs:
                   lines = src.split('\n')
                   # import nama-sama dari FQN beda = import RUSAK (error "Unresolved"
                   # pas ada import valid itu mustahil) → GANTI, jangan skip
-                  for i, l in enumerate(lines[:80]):
+                  # v4.57: scan SEMUA baris — import rusak bisa di >80
+                  # (run #31: import CoroutineContext rusak di baris 90
+                  # kelewat → import bener di-INSERT doang → error njalan
+                  # terus → inline-FQN ganti import = mangle)
+                  for i, l in enumerate(lines):
                       im = re.match(r'^(\s*)import\s+([\w.]+)\s*(?://.*)?$', l)
                       if im and im.group(2).rsplit('.', 1)[-1] == last and im.group(2) != fqn:
                           lines[i] = im.group(1) + 'import ' + fqn
                           open(path, 'w', encoding='utf-8').write('\n'.join(lines))
                           return 1
                   last_imp = -1
-                  for i, l in enumerate(lines[:80]):
+                  for i, l in enumerate(lines):
                       if re.match(r'^\s*import\s+', l):
                           last_imp = i
                   ins = 'import ' + fqn
@@ -1183,6 +1187,53 @@ jobs:
                   print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' sisip !! (' + kind + ')')
                   return 1
 
+              def kt_add_override(path, lineno):
+                  # v4.57 ATURAN BARU: "X hides member of supertype Y and
+                  # needs 'override' modifier" (run #31 LocalLlmEngine.kt
+                  # contextTokens) → sisip modifier override sebelum
+                  # val/var/fun. Kotlin nerima urutan modifier bebas, jadi
+                  # nempel sebelum val/var/fun SELALU valid.
+                  s0 = kt_read(path)
+                  if s0 is None:
+                      return 0
+                  lines0 = s0.split('\n')
+                  if not (1 <= lineno <= len(lines0)):
+                      return 0
+                  l = lines0[lineno - 1]
+                  if re.search(r'\boverride\b', l):
+                      return 0
+                  m2 = re.match(r'^(\s*(?:(?:private|internal|protected|public|open|final|abstract|suspend|inline|lateinit|expect|actual|external)\s+)*)(val|var|fun)\b', l)
+                  if not m2:
+                      return 0
+                  lines0[lineno - 1] = m2.group(1) + 'override ' + m2.group(2) + l[m2.end(2):]
+                  open(path, 'w', encoding='utf-8').write('\n'.join(lines0))
+                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' sisip override modifier')
+                  return 1
+
+              def kt_fix_foreach_ambig(path, lineno, col):
+                  # v4.57 ATURAN BARU: "Overload resolution ambiguity" antara
+                  # Iterable.forEach vs Map.forEach (run #31 NovaQuickTile
+                  # 92:45) → receiver JELAS applicable ke dua-duanya, artinya
+                  # Iterable → selipin .asIterable() sebelum .forEach biar
+                  # resolusinya tunggal. Gak ada .forEach di baris = skip.
+                  s0 = kt_read(path)
+                  if s0 is None:
+                      return 0
+                  lines0 = s0.split('\n')
+                  if not (1 <= lineno <= len(lines0)):
+                      return 0
+                  l = lines0[lineno - 1]
+                  if '.asIterable().forEach' in l:
+                      return 0
+                  hits = [m2 for m2 in re.finditer(r'\.forEach\b', l)]
+                  if not hits:
+                      return 0
+                  best = min(hits, key=lambda m2: abs(m2.start() - (col - 1)))
+                  lines0[lineno - 1] = l[:best.start()] + '.asIterable()' + l[best.start():]
+                  open(path, 'w', encoding='utf-8').write('\n'.join(lines0))
+                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' forEach ambigu → asIterable()')
+                  return 1
+
               def kt_inline_fqn(path, lineno, col, sym, fqn):
                   # v4.56 fallback: import udah ada tapi simbol tetap unresolved
                   # (kasus CoroutineContext NovaQuickTile run #24) → tempel FQN
@@ -1195,6 +1246,12 @@ jobs:
                   if not (1 <= lineno <= len(lines0)):
                       return 0
                   line = lines0[lineno - 1]
+                  # v4.57: baris IMPORT GAK BOLEH ke-inline-FQN — nempel FQN
+                  # di dalem import = import sampah (bukti run #31:
+                  # import kotlinx.coroutines.flow.kotlin.coroutines.CoroutineContext)
+                  # import rusak dibenerin lewat replace line-utuh di atas.
+                  if re.match(r'\s*import\s', line):
+                      return 0
                   hits = list(re.finditer(r'\b' + re.escape(sym) + r'\b', line))
                   if not hits:
                       return 0
@@ -1310,8 +1367,12 @@ jobs:
                   return 0
 
               def kt_acc_inject(fp):
-                  if kt_find_symbol_def('findNodeByText')[0]:
-                      return 0
+                  # v4.57: guard "definisi nama-sama ada → skip" DIBUANG.
+                  # 'Unresolved reference' = GAK ADA yang reachable dari call
+                  # site — definisi user (extension/member/private/file laen)
+                  # bukan alasan skip; justru KASUS yang butuh overload
+                  # top-level. Regresi v4.56: guard ini bikin injection GAK
+                  # PERNA jalan di run #30/#31 padahal v4.55 jalan (run #24).
                   target = None
                   s0 = kt_read(fp) or ''
                   if re.search(r'class\s+\w+[^{\n]*:\s*[^{\n]*AccessibilityService', s0):
@@ -1378,6 +1439,13 @@ jobs:
                       if _mtm and _mtm.group(1) == _mtm.group(2):
                           if kt_insert_bangbang(fp, aline, acol, 'mismatch') > 0:
                               applied.append('!! type-mismatch -> ' + os.path.basename(fp) + ':' + str(aline))
+                      _mh = re.search(r"'(\w+)' hides member of supertype '[\w.]+' and needs 'override' modifier", msg)
+                      if _mh:
+                          if kt_add_override(fp, aline) > 0:
+                              applied.append('override modifier -> ' + os.path.basename(fp) + ':' + str(aline))
+                      if 'Overload resolution ambiguity' in msg:
+                          if kt_fix_foreach_ambig(fp, aline, acol) > 0:
+                              applied.append('forEach ambigu -> ' + os.path.basename(fp) + ':' + str(aline))
                   if 'com.google.mlkit.nl.' in (kt_read(fp) or ''):
                       kt_fix_mlkit(fp)
                   if mref and mref.group(1) in KT_NOOP_MEMBERS:
@@ -1386,7 +1454,7 @@ jobs:
                       continue   # biasanya sembuh sendiri begitu import launch masuk
                   if re.search(r'Unresolved reference: (findNodeByText|findEditableNode|suspendTapGesture)', msg):
                       kt_acc_inject(fp)
-              kt_notes = [a for a in applied if a.startswith(('import ', 'helper ', 'inline-FQN ', 'null-safe ', '!! type-mismatch ', 'typo mlkit ', 'dependency ', 'member '))]
+              kt_notes = [a for a in applied if a.startswith(('import ', 'helper ', 'inline-FQN ', 'null-safe ', '!! type-mismatch ', 'typo mlkit ', 'dependency ', 'member ', 'override ', 'forEach '))]
               if kt_notes:
                   print('KFIX-KT: ' + str(len(kt_notes)) + ' perbaikan source Kotlin')
                   for _n in kt_notes[:15]:
