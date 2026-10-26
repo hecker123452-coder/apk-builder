@@ -888,6 +888,231 @@ jobs:
                   open('local.properties', 'w', encoding='utf-8').write('sdk.dir=' + sdk.replace('\\', '\\\\') + '\n')
                   applied.append('local.properties sdk.dir ke-inject')
 
+          # ── 6) 🩺 v4.55.0 DOKTER KOTLIN SOURCE-LEVEL — error kompilasi .kt ──
+          # Insiden 26/10 (run #21 NovaFloatAI-comic-v2): 17x "Unresolved
+          # reference" + suspension — dokter cuma bisa gradle/toolchain, error
+          # source lolos begitu aja. Fix mekanis yang AMAN:
+          #   (a) import hilang → inject FQN (map simbol umum Compose/coroutines/
+          #       Android + deteksi compose material vs material3 anti-konflik)
+          #   (b) simbol lain → resolusi lintas-file (grep definisi di project)
+          #   (c) helper AccessibilityService standar (findNodeByText/
+          #       suspendTapGesture/findEditableNode) ilang → inject blok helper
+          # Gak disentuh: overload ambiguity, API member yang beneran gak ada —
+          # itu tersisa buat diagnosis bot (autodiag + log error ke user).
+          kt_seen = []
+          for mm in re.finditer(r'e: file://(\S+?):(\d+):(\d+)\s+(.*)', err):
+              kt_seen.append((mm.group(1), mm.group(4)))
+          if kt_seen:
+              has_m3 = False
+              has_m2 = False
+              _scanned = 0
+              for _r, _d, _fs in os.walk('.'):
+                  _d[:] = [x for x in _d if x not in ('.git', 'build', '.gradle', '.idea')]
+                  for _f in _fs:
+                      if not _f.endswith(('.kt', '.kts')):
+                          continue
+                      if _scanned > 500:
+                          break
+                      _scanned += 1
+                      try:
+                          _s = open(os.path.join(_r, _f), encoding='utf-8').read()
+                      except Exception:
+                          continue
+                      if 'androidx.compose.material3' in _s:
+                          has_m3 = True
+                      if re.search(r'androidx\.compose\.material\.[A-Z]', _s):
+                          has_m2 = True
+              compose_pkg = 'androidx.compose.material3' if (has_m3 or not has_m2) else 'androidx.compose.material'
+              def kt_resolve_path(abs_path):
+                  if os.path.isfile(abs_path):
+                      return abs_path
+                  parts = abs_path.split('/')
+                  for i in range(len(parts)):
+                      cand = '/'.join(parts[i:])
+                      if os.path.isfile(cand):
+                          return cand
+                  return None
+              def kt_read(path):
+                  try:
+                      return open(path, encoding='utf-8').read()
+                  except Exception:
+                      return None
+              def kt_add_import(path, fqn):
+                  src = kt_read(path)
+                  if src is None:
+                      return 0
+                  if re.search(r'^\s*import\s+' + re.escape(fqn) + r'\s*$', src, re.M):
+                      return 0
+                  last = fqn.rsplit('.', 1)[-1]
+                  lines = src.split('\n')
+                  # import nama-sama dari FQN beda = import RUSAK (error "Unresolved"
+                  # pas ada import valid itu mustahil) → GANTI, jangan skip
+                  for i, l in enumerate(lines[:80]):
+                      im = re.match(r'^(\s*)import\s+([\w.]+)\s*(?://.*)?$', l)
+                      if im and im.group(2).rsplit('.', 1)[-1] == last and im.group(2) != fqn:
+                          lines[i] = im.group(1) + 'import ' + fqn
+                          open(path, 'w', encoding='utf-8').write('\n'.join(lines))
+                          return 1
+                  last_imp = -1
+                  for i, l in enumerate(lines[:80]):
+                      if re.match(r'^\s*import\s+', l):
+                          last_imp = i
+                  ins = 'import ' + fqn
+                  if last_imp >= 0:
+                      lines.insert(last_imp + 1, ins)
+                  else:
+                      placed = False
+                      for i, l in enumerate(lines[:30]):
+                          if re.match(r'^\s*package\s+', l):
+                              lines[i:i + 1] = [l, '', ins]
+                              placed = True
+                              break
+                      if not placed:
+                          lines.insert(0, ins)
+                  open(path, 'w', encoding='utf-8').write('\n'.join(lines))
+                  return 1
+              def kt_file_package(path):
+                  src = kt_read(path)
+                  if src is None:
+                      return None
+                  pm = re.search(r'(?m)^\s*package\s+([\w.]+)', src)
+                  return pm.group(1) if pm else None
+              def kt_find_symbol_def(sym):
+                  pat = re.compile(r'\b(?:class|interface|object|enum class|data class|sealed class|abstract class|typealias|value class)\s+' + re.escape(sym) + r'\b')
+                  patfun = re.compile(r'\bfun\s+(?:[\w.<>]*\.)?' + re.escape(sym) + r'\s*\(')
+                  for _r, _d, _fs in os.walk('.'):
+                      _d[:] = [x for x in _d if x not in ('.git', 'build', '.gradle', '.idea')]
+                      for _f in _fs:
+                          if not _f.endswith('.kt'):
+                              continue
+                          p = os.path.join(_r, _f)
+                          _s = kt_read(p)
+                          if _s is None:
+                              continue
+                          if pat.search(_s) or patfun.search(_s):
+                              pm = re.search(r'(?m)^\s*package\s+([\w.]+)', _s)
+                              return p, (pm.group(1) if pm else None)
+                  return None, None
+              KT_IMPORT_MAP = {
+                  'Text': compose_pkg + '.Text',
+                  'remember': 'androidx.compose.runtime.remember',
+                  'mutableStateOf': 'androidx.compose.runtime.mutableStateOf',
+                  'getValue': 'androidx.compose.runtime.getValue',
+                  'setValue': 'androidx.compose.runtime.setValue',
+                  'LaunchedEffect': 'androidx.compose.runtime.LaunchedEffect',
+                  'DisposableEffect': 'androidx.compose.runtime.DisposableEffect',
+                  'collectAsState': 'androidx.compose.runtime.collectAsState',
+                  'launch': 'kotlinx.coroutines.launch',
+                  'delay': 'kotlinx.coroutines.delay',
+                  'withContext': 'kotlinx.coroutines.withContext',
+                  'Dispatchers': 'kotlinx.coroutines.Dispatchers',
+                  'CoroutineScope': 'kotlinx.coroutines.CoroutineScope',
+                  'SupervisorJob': 'kotlinx.coroutines.SupervisorJob',
+                  'Job': 'kotlinx.coroutines.Job',
+                  'runBlocking': 'kotlinx.coroutines.runBlocking',
+                  'CoroutineContext': 'kotlin.coroutines.CoroutineContext',
+                  'GestureResultCallback': 'android.accessibilityservice.AccessibilityService.GestureResultCallback',
+                  'GestureDescription': 'android.accessibilityservice.GestureDescription',
+                  'StrokeDescription': 'android.accessibilityservice.GestureDescription.StrokeDescription',
+                  'suspendCancellableCoroutine': 'kotlinx.coroutines.suspendCancellableCoroutine',
+                  'Composable': 'androidx.compose.runtime.Composable',
+                  'Column': compose_pkg + '.Column',
+                  'Row': compose_pkg + '.Row',
+                  'Box': compose_pkg + '.Box',
+                  'Spacer': compose_pkg + '.Spacer',
+                  'Button': compose_pkg + '.Button',
+                  'IconButton': compose_pkg + '.IconButton',
+                  'Icon': compose_pkg + '.Icon',
+                  'Card': compose_pkg + '.Card',
+                  'Scaffold': compose_pkg + '.Scaffold',
+                  'TopAppBar': compose_pkg + '.TopAppBar',
+                  'FloatingActionButton': compose_pkg + '.FloatingActionButton',
+                  'MaterialTheme': compose_pkg + '.MaterialTheme',
+                  'TextField': compose_pkg + '.TextField',
+                  'OutlinedTextField': compose_pkg + '.OutlinedTextField',
+                  'Switch': compose_pkg + '.Switch',
+                  'Checkbox': compose_pkg + '.Checkbox',
+                  'Slider': compose_pkg + '.Slider',
+                  'LazyColumn': 'androidx.compose.foundation.lazy.LazyColumn',
+                  'LazyRow': 'androidx.compose.foundation.lazy.LazyRow',
+                  'items': 'androidx.compose.foundation.lazy.items',
+                  'Modifier': 'androidx.compose.ui.Modifier',
+                  'fillMaxSize': 'androidx.compose.foundation.layout.fillMaxSize',
+                  'fillMaxWidth': 'androidx.compose.foundation.layout.fillMaxWidth',
+                  'padding': 'androidx.compose.foundation.layout.padding',
+                  'Alignment': 'androidx.compose.ui.Alignment',
+              }
+              # helper accessibility standar — FQN total biar gak butuh import
+              KT_ACC_HELPER = (
+                  '\n    // ── 🩺 kfix v4.55: helper aksesibilitas bawaan (auto-inject) ──\n'
+                  '    fun findNodeByText(root: android.view.accessibility.AccessibilityNodeInfo?, text: String, _seen: MutableSet<android.view.accessibility.AccessibilityNodeInfo> = mutableSetOf()): android.view.accessibility.AccessibilityNodeInfo? {\n'
+                  '        if (root == null || !_seen.add(root)) return null\n'
+                  '        val t = root.text?.toString() ?: root.contentDescription?.toString() ?: ""\n'
+                  '        if (text.isNotEmpty() && t.contains(text, ignoreCase = true)) return root\n'
+                  '        for (i in 0 until root.childCount) {\n'
+                  '            val found = findNodeByText(root.getChild(i), text, _seen)\n'
+                  '            if (found != null) return found\n'
+                  '        }\n'
+                  '        return null\n'
+                  '    }\n'
+                  '    fun findEditableNode(root: android.view.accessibility.AccessibilityNodeInfo?, _seen: MutableSet<android.view.accessibility.AccessibilityNodeInfo> = mutableSetOf()): android.view.accessibility.AccessibilityNodeInfo? {\n'
+                  '        if (root == null || !_seen.add(root)) return null\n'
+                  '        if (root.isEditable) return root\n'
+                  '        for (i in 0 until root.childCount) {\n'
+                  '            val found = findEditableNode(root.getChild(i), _seen)\n'
+                  '            if (found != null) return found\n'
+                  '        }\n'
+                  '        return null\n'
+                  '    }\n'
+                  '    suspend fun suspendTapGesture(x: Number, y: Number): Boolean = kotlinx.coroutines.suspendCancellableCoroutine { cont ->\n'
+                  '        val p = android.graphics.Path().apply { moveTo(x.toFloat(), y.toFloat()) }\n'
+                  '        val stroke = android.accessibilityservice.GestureDescription.StrokeDescription(p, 0L, 80L)\n'
+                  '        val g = android.accessibilityservice.GestureDescription.Builder().addStroke(stroke).build()\n'
+                  '        val ok = dispatchGesture(g, object : android.accessibilityservice.AccessibilityService.GestureResultCallback() {\n'
+                  '            override fun onCompleted(gestureDescription: android.accessibilityservice.GestureDescription?) { cont.resumeWith(Result.success(true)) }\n'
+                  '            override fun onCancelled(gestureDescription: android.accessibilityservice.GestureDescription?) { cont.resumeWith(Result.success(false)) }\n'
+                  '        }, null)\n'
+                  '        if (!ok) cont.resumeWith(Result.success(false))\n'
+                  '    }\n'
+              )
+              for (apath, msg) in kt_seen:
+                  fp = kt_resolve_path(apath)
+                  if not fp:
+                      continue
+                  mref = re.search(r'Unresolved reference: (\w+)', msg)
+                  if mref:
+                      sym = mref.group(1)
+                      fq = KT_IMPORT_MAP.get(sym)
+                      if fq and kt_add_import(fp, fq) > 0:
+                          applied.append('import ' + fq + ' -> ' + os.path.basename(fp))
+                      elif not fq:
+                          # resolusi lintas-file: cari definisi simbol di project
+                          _p, _pkg = kt_find_symbol_def(sym)
+                          if _p and _pkg and kt_file_package(fp) != _pkg:
+                              if kt_add_import(fp, _pkg + '.' + sym) > 0:
+                                  applied.append('import ' + _pkg + '.' + sym + ' (cross-file) -> ' + os.path.basename(fp))
+                  if 'Suspension functions can be called only within coroutine body' in msg:
+                      continue   # biasanya sembuh sendiri begitu import launch masuk
+                  macc = re.search(r'Unresolved reference: (findNodeByText|findEditableNode|suspendTapGesture)', msg)
+                  if macc:
+                      src = kt_read(fp) or ''
+                      if 'kfix v4.55: helper aksesibilitas' not in src and re.search(r'class\s+\w+\s*(\([^)]*\))?\s*:\s*AccessibilityService\s*\(', src):
+                          lines = src.split('\n')
+                          ci = -1
+                          for i, l in enumerate(lines):
+                              if re.search(r'class\s+\w+\s*(\([^)]*\))?\s*:\s*AccessibilityService\s*\(', l):
+                                  ci = i
+                                  break
+                          if ci >= 0:
+                              lines[ci + 1:ci + 1] = KT_ACC_HELPER.split('\n')[:-1]
+                              open(fp, 'w', encoding='utf-8').write('\n'.join(lines))
+                              applied.append('helper aksesibilitas -> ' + os.path.basename(fp))
+              kt_notes = [a for a in applied if a.startswith(('import ', 'helper '))]
+              if kt_notes:
+                  print('KFIX-KT: ' + str(len(kt_notes)) + ' perbaikan source Kotlin')
+                  for _n in kt_notes[:15]:
+                      print('KFIX-KT:   - ' + _n)
+
           print('KFIX: ' + ('; '.join(applied) if applied else 'gak ada pola error yang kebaca'))
           print('KFIX_APPLIED=' + str(len(applied)))
           PYKFIX
@@ -1448,7 +1673,10 @@ jobs:
               sleep 2
               continue
             fi
-            KFIX_OUT=$(BLD_ERR="$(tail -c 4000 build_output.txt)" python3 /tmp/kfix.py 2>&1) || true
+            # ── 🩺 v4.55.0: BLD_ERR dulu cuma tail 4000 — baris error kompilasi
+            # Kotlin ("e: file:...") KEGESER stack trace Gradle, dokter buta
+            # total. Sekarang: baris e:/error: di-depan + raw tail buat pola gradle.
+            KFIX_OUT=$(BLD_ERR="$( { grep -E '^e: |error: |FAILURE: |What went wrong|Unresolved reference|Suspension functions|Overload resolution' build_output.txt | tail -c 3500; echo '--- RAW ---'; tail -c 2500 build_output.txt; } )" python3 /tmp/kfix.py 2>&1) || true
             echo "$KFIX_OUT"
             if ! echo "$KFIX_OUT" | grep -q "KFIX_APPLIED=[1-9]"; then
               # ── 🩹 v6.9 RES-DUP reaktif (kotlin): "Duplicate resources" →
@@ -1520,7 +1748,8 @@ jobs:
               sleep 2
               continue
             fi
-            KFIX_OUT=$(BLD_ERR="$(tail -c 4000 build_output_aab.txt)" python3 /tmp/kfix.py 2>&1) || true
+            # ── 🩺 v4.55.0: BLD_ERR pintar (mirip jalur APK) ──
+            KFIX_OUT=$(BLD_ERR="$( { grep -E '^e: |error: |FAILURE: |What went wrong|Unresolved reference|Suspension functions|Overload resolution' build_output_aab.txt | tail -c 3500; echo '--- RAW ---'; tail -c 2500 build_output_aab.txt; } )" python3 /tmp/kfix.py 2>&1) || true
             echo "$KFIX_OUT"
             if ! echo "$KFIX_OUT" | grep -q "KFIX_APPLIED=[1-9]"; then
               # ── 🩹 v6.9 RES-DUP reaktif (kotlin AAB): "Duplicate resources" →
