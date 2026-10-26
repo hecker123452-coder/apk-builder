@@ -1213,9 +1213,15 @@ jobs:
               def kt_fix_foreach_ambig(path, lineno, col):
                   # v4.57 ATURAN BARU: "Overload resolution ambiguity" antara
                   # Iterable.forEach vs Map.forEach (run #31 NovaQuickTile
-                  # 92:45) → receiver JELAS applicable ke dua-duanya, artinya
-                  # Iterable → selipin .asIterable() sebelum .forEach biar
-                  # resolusinya tunggal. Gak ada .forEach di baris = skip.
+                  # 92:45) → receiver applicable ke dua-duanya = pasti
+                  # implement Iterable. Selipan: .iterator().asSequence()
+                  # sebelum .forEach — iterator() cuma anggota Iterable
+                  # (stdlib Map GAK punya iterator()) → resolusi tunggal;
+                  # Sequence.forEach juga tunggal; lambda + destructuring
+                  # tetap utuh. PELAJARAN E2E run 40305652459: .asIterable()
+                  # GAK CUKUP — stdlib Map juga punya asIterable() → ambiguitas
+                  # cuma pindah ke asIterable (bukti kandidat attempt-2).
+                  # Gak ada .forEach di baris = skip.
                   s0 = kt_read(path)
                   if s0 is None:
                       return 0
@@ -1223,15 +1229,15 @@ jobs:
                   if not (1 <= lineno <= len(lines0)):
                       return 0
                   l = lines0[lineno - 1]
-                  if '.asIterable().forEach' in l:
+                  if '.iterator().asSequence().forEach' in l:
                       return 0
                   hits = [m2 for m2 in re.finditer(r'\.forEach\b', l)]
                   if not hits:
                       return 0
                   best = min(hits, key=lambda m2: abs(m2.start() - (col - 1)))
-                  lines0[lineno - 1] = l[:best.start()] + '.asIterable()' + l[best.start():]
+                  lines0[lineno - 1] = l[:best.start()] + '.iterator().asSequence()' + l[best.start():]
                   open(path, 'w', encoding='utf-8').write('\n'.join(lines0))
-                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' forEach ambigu → asIterable()')
+                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' forEach ambigu → iterator().asSequence()')
                   return 1
 
               def kt_inline_fqn(path, lineno, col, sym, fqn):
