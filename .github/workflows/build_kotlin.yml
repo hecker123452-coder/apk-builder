@@ -2069,18 +2069,44 @@ jobs:
                   mpkg = mmp.group(1)
               acts = re.findall(r"<activity[^>]*android:name=\"([^\"]+)\"", mbody)
               target = None
-              for mm in re.finditer(r"<activity[^>]*>", mbody):
-                  blk_start = mm.start()
-                  blk_end = mbody.find("</activity>", blk_start)
-                  if blk_end < 0:
-                      blk_end = min(blk_start + 2000, len(mbody))
-                  blk = mbody[blk_start:blk_end]
-                  nm = re.search(r'android:name="([^"]+)"', mm.group(0))
-                  if nm and "LAUNCHER" in blk:
+              # 🏰 v4.62.1: activity SELF-CLOSING (<activity .../>) gak punya body —
+              # chunk lama (find "</activity>") nyamber penutup activity LAIN di
+              # belakangnya → intent-filter LAUNCHER milik launcher asli ketelen ke
+              # chunk activity self-closing sebelumnya (kasus nyata run #47: suntikan
+              # OTA nempel OtaPushActivity self-closing → guard salah pilih launcher
+              # → build mati "source OtaPushActivity gak ketemu" di Benteng Lisensi).
+              for mm in re.finditer(r'<activity\b', mbody):
+                  tag_end = mbody.find('>', mm.start())
+                  if tag_end < 0:
+                      continue
+                  opentag = mbody[mm.start():tag_end + 1]
+                  nm = re.search(r'android:name="([^"]+)"', opentag)
+                  if not nm:
+                      continue
+                  if opentag.rstrip().endswith('/>'):
+                      continue  # self-closing: mustahil punya intent-filter
+                  close = mbody.find('</activity>', tag_end)
+                  blk_end = (close + len('</activity>')) if close >= 0 else min(tag_end + 2000, len(mbody))
+                  if 'LAUNCHER' in mbody[mm.start():blk_end]:
+                      target = nm.group(1)
+                      break
+              if not target:
+                  # fallback: activity pembuka pertama yang BUKAN self-closing dan
+                  # BUKAN komponen internal suntikan OTA (com.deruzuan.ota)
+                  for mm in re.finditer(r'<activity\b', mbody):
+                      tag_end = mbody.find('>', mm.start())
+                      if tag_end < 0:
+                          continue
+                      opentag = mbody[mm.start():tag_end + 1]
+                      nm = re.search(r'android:name="([^"]+)"', opentag)
+                      if not nm or opentag.rstrip().endswith('/>'):
+                          continue
+                      if 'com.deruzuan.ota' in nm.group(1):
+                          continue
                       target = nm.group(1)
                       break
               if not target and acts:
-                  target = acts[0]  # fallback: activity pertama
+                  target = acts[0]  # fallback terakhir: activity pertama apa adanya
               if not target:
                   fail("activity launcher gak ketemu di AndroidManifest")
               if target.startswith("."):
@@ -2096,7 +2122,25 @@ jobs:
               for ext in (".kt", ".java"):
                   hits += [p for p in glob.glob("**/" + cls_short + ext, recursive=True) if "/build/" not in p]
               if not hits:
-                  fail("source " + cls_short + " (.kt/.java) gak ketemu — gak bisa pasang guard")
+                  # 🏰 v4.62.1: class bisa hidup di file bernama lain (1 file multi
+                  # class, ex. OtaGate.java berisi OtaPushActivity) → cari deklarasi
+                  # class langsung di seluruh source
+                  decl = re.compile(r'\b(?:class|object)\s+' + re.escape(cls_short) + r'\b')
+                  for cand in glob.glob('**/*.kt', recursive=True) + glob.glob('**/*.java', recursive=True):
+                      if '/build/' in cand or '/.git/' in cand:
+                          continue
+                      try:
+                          if decl.search(open(cand, encoding='utf-8', errors='replace').read()):
+                              hits.append(cand)
+                      except Exception:
+                          pass
+                  hits = sorted(set(hits))
+              if not hits:
+                  # 🏰 v4.62.1 FAIL-OPEN: patch lisensi GAK kritis buat keberhasilan
+                  # build — jangan matiin build user cuma karena launcher gak
+                  # ketemu; LOG KERAS biar ketauan, build diterusin TANPA guard
+                  print('🏰 [Lisensi] WARNING: source launcher ' + cls_short + ' gak ketemu — guard DI-SKIP utk build ini (fail-open v4.62.1), build diterusin')
+                  return ('', '', '')
               src = sorted(hits)[0]
               body = open(src, encoding="utf-8", errors="replace").read()
               spkg = pkg_from_source(body, "")
@@ -2163,6 +2207,9 @@ jobs:
                   is_java = False
               else:
                   src, body, pkg = find_kotlin_native_target()
+                  if not src:
+                      print('🏰 [Lisensi] Benteng di-skip utk build ini (fail-open v4.62.1) — build diterusin')
+                      return
                   is_java = src.endswith(".java")
               out = patch_source(src, body, sha, pkg, is_java)
               print("🛡️ [Lisensi] Benteng terpasang: " + src + " + " + (out or "(existing)"))
