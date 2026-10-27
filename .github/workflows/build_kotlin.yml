@@ -2011,17 +2011,34 @@ jobs:
           # v4.63: observabilitas — dokter gak punya pola = dump baris
           # sumber error ke log, biar blind-spot kebaca tanpa nebak-nebak
           # (pelajaran run #49: 3 kelas error baru, sumber gak pernah keliatan)
+          # v4.66 ronde 9 (bukti run #67/#68 NovaFloatAI v1_3_9): dump lama cap
+          # 4 + urutan error → error ke-8 (ChatScreen.kt:101 'p0' — SATU-SATUNYA
+          # sisa error fatal) gak PERNAH ke-dump → dokter "buta" persis di error
+          # yang paling butuh dilihat. Ronde 9: (1) blind-spot (error TANPA fix)
+          # didahulukan, (2) cap 4 → 12, (3) tiap error dapet KFIX-SRC 1 baris.
+          _fixed_sites = set()
+          for _a in applied:
+              _fm = re.search(r'-> (\S+\.kt):(\d+)$', _a)
+              if _fm:
+                  _fixed_sites.add((_fm.group(1), int(_fm.group(2))))
+          _seen_sorted = sorted(
+              kt_seen,
+              key=lambda t: 0 if (os.path.basename(t[0]), t[1]) not in _fixed_sites else 1,
+          )
           if kt_seen:
               _dumped = 0
-              for (_dp, _dl, _dc, _dm) in kt_seen:
-                  if _dumped >= 4:
-                      break
+              for (_dp, _dl, _dc, _dm) in _seen_sorted:
                   _dfp = kt_resolve_path(_dp)
                   if not _dfp:
                       continue
                   _dls = (kt_read(_dfp) or '').split('\n')
                   if 1 <= _dl <= len(_dls):
-                      print('KFIX-CTX: ' + os.path.basename(_dfp) + ':' + str(_dl) + ':' + str(_dc) + ' | ' + _dls[_dl - 1].strip()[:180])
+                      print('KFIX-SRC: ' + os.path.basename(_dfp) + ':' + str(_dl) + ':' + str(_dc) + ' | ' + _dls[_dl - 1].strip()[:180])
+                  else:
+                      print('KFIX-SRC: ' + os.path.basename(_dfp) + ':' + str(_dl) + ':' + str(_dc) + ' | (baris di luar jangkauan, total ' + str(len(_dls)) + ' baris)')
+                  if _dumped >= 12:
+                      continue
+                  if 1 <= _dl <= len(_dls):
                       for _cl in range(max(1, _dl - 8), min(len(_dls), _dl + 8) + 1):
                           if _cl == _dl:
                               continue
