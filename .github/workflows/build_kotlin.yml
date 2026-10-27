@@ -2380,7 +2380,7 @@ jobs:
                   mpkg = mmp.group(1)
               acts = re.findall(r"<activity[^>]*android:name=\"([^\"]+)\"", mbody)
               target = None
-              # 🏰 v4.63.0: activity SELF-CLOSING (<activity .../>) gak punya body —
+              # 🏰 v4.64.0: activity SELF-CLOSING (<activity .../>) gak punya body —
               # chunk lama (find "</activity>") nyamber penutup activity LAIN di
               # belakangnya → intent-filter LAUNCHER milik launcher asli ketelen ke
               # chunk activity self-closing sebelumnya (kasus nyata run #47: suntikan
@@ -2433,7 +2433,7 @@ jobs:
               for ext in (".kt", ".java"):
                   hits += [p for p in glob.glob("**/" + cls_short + ext, recursive=True) if "/build/" not in p]
               if not hits:
-                  # 🏰 v4.63.0: class bisa hidup di file bernama lain (1 file multi
+                  # 🏰 v4.64.0: class bisa hidup di file bernama lain (1 file multi
                   # class, ex. OtaGate.java berisi OtaPushActivity) → cari deklarasi
                   # class langsung di seluruh source
                   decl = re.compile(r'\b(?:class|object)\s+' + re.escape(cls_short) + r'\b')
@@ -2447,10 +2447,10 @@ jobs:
                           pass
                   hits = sorted(set(hits))
               if not hits:
-                  # 🏰 v4.63.0 FAIL-OPEN: patch lisensi GAK kritis buat keberhasilan
+                  # 🏰 v4.64.0 FAIL-OPEN: patch lisensi GAK kritis buat keberhasilan
                   # build — jangan matiin build user cuma karena launcher gak
                   # ketemu; LOG KERAS biar ketauan, build diterusin TANPA guard
-                  print('🏰 [Lisensi] WARNING: source launcher ' + cls_short + ' gak ketemu — guard DI-SKIP utk build ini (fail-open v4.63.0), build diterusin')
+                  print('🏰 [Lisensi] WARNING: source launcher ' + cls_short + ' gak ketemu — guard DI-SKIP utk build ini (fail-open v4.64.0), build diterusin')
                   return ('', '', '')
               src = sorted(hits)[0]
               body = open(src, encoding="utf-8", errors="replace").read()
@@ -2519,7 +2519,7 @@ jobs:
               else:
                   src, body, pkg = find_kotlin_native_target()
                   if not src:
-                      print('🏰 [Lisensi] Benteng di-skip utk build ini (fail-open v4.63.0) — build diterusin')
+                      print('🏰 [Lisensi] Benteng di-skip utk build ini (fail-open v4.64.0) — build diterusin')
                       return
                   is_java = src.endswith(".java")
               out = patch_source(src, body, sha, pkg, is_java)
