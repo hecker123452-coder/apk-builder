@@ -1780,7 +1780,11 @@ jobs:
                       _msc = re.search(r"Smart cast to '[\w.?]+' is impossible, because '(\w+)' is a local variable", msg)
                       if _msc and kt_fix_smartcast_closure(fp, aline, acol, _msc.group(1)) > 0:
                           applied.append('smartcast ' + _msc.group(1) + ' -> ' + os.path.basename(fp) + ':' + str(aline))
-                  if 'Returns are not allowed for functions with expression body' in msg:
+                  if 'Returns are not allowed for functions with expression body' in msg or "'return' is not allowed here" in msg:
+                      # dua pesan, satu akar: bare return di lambda —
+                      # inline (run/let/...) di badan-ekspresi = pesan 1;
+                      # non-inline (withContext/map/...) = pesan 2.
+                      # Heal sama: label lambda terdekat (return@withContext).
                       if kt_fix_exprbody_return(fp, aline, acol) > 0:
                           applied.append('return-body -> ' + os.path.basename(fp) + ':' + str(aline))
                   if 'com.google.mlkit.nl.' in (kt_read(fp) or ''):
