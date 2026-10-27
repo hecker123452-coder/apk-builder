@@ -1516,9 +1516,23 @@ jobs:
                           return 0
                   if i < 1 or line[i - 1:i] != '.':
                       return 0
-                  lines0[lineno - 1] = line[:i] + '-1' + line[i + len(sym):]
+                  # ronde 7 r2 (bukti E2E run #56): ganti member doang =
+                  # `Recv.-1` = SYNTAX ERROR (member access ke angka negatif).
+                  # Ganti SELURUH rantai `Receiver.member` (termasuk `?.` di
+                  # depan receiver) jadi `-1`.
+                  _pre = line[:i - 1]
+                  _sq = 1 if _pre.endswith('?') else 0
+                  if _sq:
+                      _pre = _pre[:-1]
+                  _cs = re.search(r'([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)$', _pre)
+                  if not _cs or not _cs.group(1):
+                      return 0
+                  _start = i - 1 - _sq - len(_cs.group(1))
+                  if _start < 0 or (_start > 0 and line[_start - 1:_start] == '.'):
+                      return 0
+                  lines0[lineno - 1] = line[:_start] + '-1' + line[i + len(sym):]
                   open(path, 'w', encoding='utf-8').write('\n'.join(lines0))
-                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' ' + sym + ' -> -1 (konstanta gak ada)')
+                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' ' + _cs.group(1) + '.' + sym + ' -> -1 (konstanta gak ada)')
                   return 1
 
               def kt_fix_unresolved_boolcond(path, lineno, col, sym):
