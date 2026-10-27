@@ -1297,6 +1297,135 @@ jobs:
                   print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' sisip !! (' + kind + ')')
                   return 1
 
+              ICON_SETS_LOWER = {'filled': 'Filled', 'outlined': 'Outlined', 'rounded': 'Rounded',
+                                 'sharp': 'Sharp', 'twotone': 'TwoTone', 'automirrored': 'AutoMirrored'}
+
+              def kt_fix_icons_case(path, lineno, col, sym):
+                  # v4.63 dokter ronde 6 (bukti run #49 ComicUi 384:13):
+                  # Icons.filled.Star → Icons.Filled.Star — set ikon Compose
+                  # huruf-kecil = salah kapital; objek nested material GAK
+                  # bisa di-import, jadi dibenerin langsung di barisnya.
+                  # GUARD: cuma baris yang beneran nulis 'Icons.<lower>.'.
+                  s0 = kt_read(path)
+                  if s0 is None:
+                      return 0
+                  lines0 = s0.split('\n')
+                  if not (1 <= lineno <= len(lines0)):
+                      return 0
+                  line = lines0[lineno - 1]
+                  if 'Icons.' not in line:
+                      return 0
+                  good = ICON_SETS_LOWER[sym]
+                  new = re.sub(r'Icons\.' + sym + r'\.', 'Icons.' + good + '.', line)
+                  if new == line:
+                      return 0
+                  lines0[lineno - 1] = new
+                  open(path, 'w', encoding='utf-8').write('\n'.join(lines0))
+                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' Icons.' + sym + ' -> Icons.' + good)
+                  return 1
+
+              def kt_fix_smartcast_closure(path, lineno, col, vname):
+                  # v4.63 dokter ronde 6 (bukti run #49 NovaAgent 208:40):
+                  # "Smart cast to 'X' is impossible, because 'v' is a local
+                  # variable that is captured by a changing closure".
+                  # FIX TERBAIK: var v → val v (kalo gak ada assign ulang
+                  # lain) — smart cast jalan lagi di SEMUA titik, tanpa !!.
+                  # FALLBACK: sisip '!!' tepat di akses yang dilapor.
+                  s0 = kt_read(path)
+                  if s0 is None:
+                      return 0
+                  lines0 = s0.split('\n')
+                  if not (1 <= lineno <= len(lines0)):
+                      return 0
+                  vesc = re.escape(vname)
+                  decl = re.search(r'(?m)^\s*var\s+' + vesc + r'\b', s0)
+                  if decl:
+                      _dl = s0[:decl.start()].count('\n') + 1
+                      _n_asg = 0
+                      for _am in re.finditer(r'(?m)(?:^|[^=!<>+\-*/%&|^\s])\s*' + vesc + r'\s*(?:\+|-|\*|/|%)?=(?!=)', s0):
+                          _al = s0[:_am.start()].count('\n') + 1
+                          if _al != _dl:
+                              _n_asg += 1
+                      if _n_asg == 0:
+                          def _v(src):
+                              return re.sub(r'(?m)^(\s*)var(\s+' + vesc + r'\b)', r'\1val\2', src, count=1)
+                          if rewrite(path, _v):
+                              print('KFIX-DIAG: ' + os.path.basename(path) + ' var ' + vname + ' -> val (closure)')
+                              return 1
+                  line = lines0[lineno - 1]
+                  if vname not in line:
+                      return 0
+                  _occ = [m.start() for m in re.finditer(r'\b' + vesc + r'\b', line)]
+                  if not _occ:
+                      return 0
+                  _pick = min(_occ, key=lambda p: abs(p - max(0, col - 1)))
+                  _end = _pick + len(vname)
+                  if line[_end:_end + 2] in ('!!', '::'):
+                      return 0
+                  lines0[lineno - 1] = line[:_end] + '!!' + line[_end:]
+                  open(path, 'w', encoding='utf-8').write('\n'.join(lines0))
+                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' sisip !! (smartcast ' + vname + ')')
+                  return 1
+
+              KT_INLINE_LAMBDA = ('withContext', 'run', 'let', 'apply', 'also', 'with', 'forEach',
+                                  'forEachIndexed', 'map', 'mapIndexed', 'mapNotNull', 'filter', 'filterNot',
+                                  'flatMap', 'fold', 'foldRight', 'any', 'all', 'none', 'first',
+                                  'firstOrNull', 'runCatching', 'launch', 'async', 'repeat',
+                                  'suspendCoroutine', 'suspendCancellableCoroutine', 'takeIf', 'takeUnless',
+                                  'onEach', 'reduce', 'catch', 'onSuccess', 'onFailure', 'getOrDefault',
+                                  'sortedBy', 'groupBy', 'associateBy', 'count', 'find', 'findLast')
+
+              def kt_fix_exprbody_return(path, lineno, col):
+                  # v4.63 dokter ronde 6 (bukti run #49 NovaAgent 278/280/281):
+                  # "Returns are not allowed for functions with expression
+                  # body" — bare return di lambda inline yang nempel di
+                  # badan-ekspresi (`fun f() = withContext { ... return x }`).
+                  # Fix: kasih label lambda inline terdekat yang masih kebuka
+                  # (return@withContext x) — semantik sama krn hasil lambda =
+                  # hasil fun (badan-ekspresi gak punya kode sesudah lambda).
+                  # Gak nemu lambda inline = 0 (jujur, gak nebak-nebak).
+                  s0 = kt_read(path)
+                  if s0 is None:
+                      return 0
+                  lines0 = s0.split('\n')
+                  if not (1 <= lineno <= len(lines0)):
+                      return 0
+                  line = lines0[lineno - 1]
+                  i = col - 1
+                  if not (0 <= i < len(line)) or not line.startswith('return', i):
+                      i = line.find('return')
+                      if i < 0:
+                          return 0
+                  if line[i + 6:i + 7] == '@':
+                      return 0
+                  # stack kurung dari atas file → label lambda inline terdalam
+                  # yang masih kebuka di baris error
+                  _stack = []
+                  _lbl_re = re.compile(r'\b(' + '|'.join(KT_INLINE_LAMBDA) + r')\s*(?:\([^()]*\))?\s*(?:\{|$)')
+                  for _j in range(0, lineno - 1):
+                      _ln = lines0[_j]
+                      _lbl_here = None
+                      _m = _lbl_re.search(_ln)
+                      if _m:
+                          _lbl_here = _m.group(1)
+                      for _ch in _ln:
+                          if _ch == '{':
+                              _stack.append(_lbl_here)
+                          elif _ch == '}':
+                              if _stack:
+                                  _stack.pop()
+                  _label = None
+                  for _sl in reversed(_stack):
+                      if _sl:
+                          _label = _sl
+                          break
+                  if not _label:
+                      return 0
+                  lines0[lineno - 1] = line[:i + 6] + '@' + _label + line[i + 6:]
+                  open(path, 'w', encoding='utf-8').write('\n'.join(lines0))
+                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' return -> return@' + _label)
+                  return 1
+
               def kt_add_override(path, lineno):
                   # v4.57 ATURAN BARU: "X hides member of supertype Y and
                   # needs 'override' modifier" (run #31 LocalLlmEngine.kt
@@ -1590,6 +1719,12 @@ jobs:
                       elif kt_fix_fqn_chain(fp, aline, acol, sym) > 0:
                           applied.append('FQN chain ' + sym + ' -> ' + os.path.basename(fp))
                           mref = None
+                      # v4.63: set ikon Compose huruf-kecil (Icons.filled
+                      # dll) — objek nested, gak bisa di-import; benerin
+                      # kapitalnya langsung di baris error.
+                      if mref and sym in ICON_SETS_LOWER and kt_fix_icons_case(fp, aline, acol, sym) > 0:
+                          applied.append('Icons ' + sym + ' -> Icons.' + ICON_SETS_LOWER[sym] + ' @' + os.path.basename(fp))
+                          mref = None
                   if mref:
                       sym = mref.group(1)
                       fq = KT_IMPORT_MAP.get(sym)
@@ -1641,6 +1776,13 @@ jobs:
                               _mtan = int(_mta.group(1))
                           if kt_fix_type_args(fp, aline, acol, _tn, _mtan) > 0:
                               applied.append('type-args ' + _tn + '<*> -> ' + os.path.basename(fp) + ':' + str(aline))
+                  if 'Smart cast to ' in msg and 'captured by a changing closure' in msg:
+                      _msc = re.search(r"Smart cast to '[\w.?]+' is impossible, because '(\w+)' is a local variable", msg)
+                      if _msc and kt_fix_smartcast_closure(fp, aline, acol, _msc.group(1)) > 0:
+                          applied.append('smartcast ' + _msc.group(1) + ' -> ' + os.path.basename(fp) + ':' + str(aline))
+                  if 'Returns are not allowed for functions with expression body' in msg:
+                      if kt_fix_exprbody_return(fp, aline, acol) > 0:
+                          applied.append('return-body -> ' + os.path.basename(fp) + ':' + str(aline))
                   if 'com.google.mlkit.nl.' in (kt_read(fp) or ''):
                       kt_fix_mlkit(fp)
                   if mref and mref.group(1) in KT_NOOP_MEMBERS:
@@ -1649,12 +1791,27 @@ jobs:
                       continue   # biasanya sembuh sendiri begitu import launch masuk
                   if re.search(r'Unresolved reference: (findNodeByText|findEditableNode|suspendTapGesture)', msg):
                       kt_acc_inject(fp)
-              kt_notes = [a for a in applied if a.startswith(('import ', 'helper ', 'inline-FQN ', 'null-safe ', '!! type-mismatch ', 'typo mlkit ', 'dependency ', 'member ', 'override ', 'forEach ', 'FQN chain ', 'revert ', 'type-args '))]
+              kt_notes = [a for a in applied if a.startswith(('import ', 'helper ', 'inline-FQN ', 'null-safe ', '!! type-mismatch ', 'typo mlkit ', 'dependency ', 'member ', 'override ', 'forEach ', 'FQN chain ', 'revert ', 'type-args ', 'smartcast ', 'return-body ', 'Icons '))]
               if kt_notes:
                   print('KFIX-KT: ' + str(len(kt_notes)) + ' perbaikan source Kotlin')
                   for _n in kt_notes[:15]:
                       print('KFIX-KT:   - ' + _n)
 
+          # v4.63: observabilitas — dokter gak punya pola = dump baris
+          # sumber error ke log, biar blind-spot kebaca tanpa nebak-nebak
+          # (pelajaran run #49: 3 kelas error baru, sumber gak pernah keliatan)
+          if not applied and kt_seen:
+              _dumped = 0
+              for (_dp, _dl, _dc, _dm) in kt_seen:
+                  if _dumped >= 10:
+                      break
+                  _dfp = kt_resolve_path(_dp)
+                  if not _dfp:
+                      continue
+                  _dls = (kt_read(_dfp) or '').split('\n')
+                  if 1 <= _dl <= len(_dls):
+                      print('KFIX-CTX: ' + os.path.basename(_dfp) + ':' + str(_dl) + ':' + str(_dc) + ' | ' + _dls[_dl - 1].strip()[:180])
+                      _dumped += 1
           print('KFIX: ' + ('; '.join(applied) if applied else 'gak ada pola error yang kebaca'))
           print('KFIX_APPLIED=' + str(len(applied)))
           PYKFIX
@@ -2069,7 +2226,7 @@ jobs:
                   mpkg = mmp.group(1)
               acts = re.findall(r"<activity[^>]*android:name=\"([^\"]+)\"", mbody)
               target = None
-              # 🏰 v4.62.1: activity SELF-CLOSING (<activity .../>) gak punya body —
+              # 🏰 v4.63.0: activity SELF-CLOSING (<activity .../>) gak punya body —
               # chunk lama (find "</activity>") nyamber penutup activity LAIN di
               # belakangnya → intent-filter LAUNCHER milik launcher asli ketelen ke
               # chunk activity self-closing sebelumnya (kasus nyata run #47: suntikan
@@ -2122,7 +2279,7 @@ jobs:
               for ext in (".kt", ".java"):
                   hits += [p for p in glob.glob("**/" + cls_short + ext, recursive=True) if "/build/" not in p]
               if not hits:
-                  # 🏰 v4.62.1: class bisa hidup di file bernama lain (1 file multi
+                  # 🏰 v4.63.0: class bisa hidup di file bernama lain (1 file multi
                   # class, ex. OtaGate.java berisi OtaPushActivity) → cari deklarasi
                   # class langsung di seluruh source
                   decl = re.compile(r'\b(?:class|object)\s+' + re.escape(cls_short) + r'\b')
@@ -2136,10 +2293,10 @@ jobs:
                           pass
                   hits = sorted(set(hits))
               if not hits:
-                  # 🏰 v4.62.1 FAIL-OPEN: patch lisensi GAK kritis buat keberhasilan
+                  # 🏰 v4.63.0 FAIL-OPEN: patch lisensi GAK kritis buat keberhasilan
                   # build — jangan matiin build user cuma karena launcher gak
                   # ketemu; LOG KERAS biar ketauan, build diterusin TANPA guard
-                  print('🏰 [Lisensi] WARNING: source launcher ' + cls_short + ' gak ketemu — guard DI-SKIP utk build ini (fail-open v4.62.1), build diterusin')
+                  print('🏰 [Lisensi] WARNING: source launcher ' + cls_short + ' gak ketemu — guard DI-SKIP utk build ini (fail-open v4.63.0), build diterusin')
                   return ('', '', '')
               src = sorted(hits)[0]
               body = open(src, encoding="utf-8", errors="replace").read()
@@ -2208,7 +2365,7 @@ jobs:
               else:
                   src, body, pkg = find_kotlin_native_target()
                   if not src:
-                      print('🏰 [Lisensi] Benteng di-skip utk build ini (fail-open v4.62.1) — build diterusin')
+                      print('🏰 [Lisensi] Benteng di-skip utk build ini (fail-open v4.63.0) — build diterusin')
                       return
                   is_java = src.endswith(".java")
               out = patch_source(src, body, sha, pkg, is_java)
