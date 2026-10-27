@@ -1431,64 +1431,120 @@ jobs:
                           out.append(c); i += 1; continue
                   return ''.join(out)
 
-              def kt_fix_exprbody_return(path, lineno, col):
-                  # v4.64 dokter ronde 7 (R2 dari ronde 6 — bukti run #54/#55
-                  # NovaAgent 278/280/281 & 296/298/299 masih mati): ronde 6
-                  # cuma kenal daftar lambda + hitung kurung NAIF — string/
-                  # comment berisi `{` bikin depth meleset, lambda di luar
-                  # daftar gak kebaca → KFIX=0, build mati 2 percobaan.
-                  # R2: (1) kurung dihitung di source yang udah di-strip;
-                  # (2) label = identifier APAPUN tepat sebelum `{` (guard:
-                  # keyword + fun/class/object = bukan lambda); (3) gak nemu = 0.
+              def kt_fix_exprbody_return(path, lineno, col, bad_label=None):
+                  # v4.64 dokter ronde 8 (bukti run #54/#55/#59/#60 NovaFloatAI):
+                  # ronde 6/7 nebak LABEL lambda dari identifier tepat sebelum
+                  # '{' — buat 'class X : AccessibilityService() {' guard-nya
+                  # gak nangkep pola extends, jadi nama SUPERCLASS kepake jadi
+                  # label → return@AccessibilityService = Unresolved reference:
+                  # @AccessibilityService (3 error baru, percobaan 2 mati juga,
+                  # run #60). Heal YG BENER: badan-ekspresi
+                  #   fun f(...): T = <expr>
+                  # dirobah jadi badan-blok
+                  #   fun f(...): T { return <expr> ... }
+                  # — bare `return` langsung legal TANPA label. Sekalian
+                  # ngerapihin return@label rusak sisa percobaan sebelumnya
+                  # (varian "Unresolved reference: @X" dari dispatch, cuma
+                  # label X yang dilepas). GUARD: header harus punya tipe
+                  # balik eksplisit (`): T =`) — badan-blok tanpa tipe =
+                  # infer Unit = Type mismatch baru. Gak lolos guard = 0
+                  # (fail-open, build tetap coba).
                   s0 = kt_read(path)
                   if s0 is None:
                       return 0
                   lines0 = s0.split('\n')
-                  if not (1 <= lineno <= len(lines0)):
-                      return 0
-                  line = lines0[lineno - 1]
-                  i = col - 1
-                  if not (0 <= i < len(line)) or not line.startswith('return', i):
-                      i = line.find('return')
-                      if i < 0:
-                          return 0
-                  if line[i + 6:i + 7] == '@':
+                  n0 = len(lines0)
+                  if not (1 <= lineno <= n0):
                       return 0
                   stripped = kt_strip_code(s0).split('\n')
-                  while len(stripped) < len(lines0):
+                  while len(stripped) < n0:
                       stripped.append('')
-                  _kw = set(('if', 'else', 'for', 'while', 'when', 'try', 'catch', 'finally',
-                             'do', 'switch', 'fun', 'class', 'interface', 'object', 'enum',
-                             'companion', 'init', 'constructor', 'get', 'set', 'val', 'var',
-                             'return', 'super', 'this'))
-                  _stack = []
-                  for _j in range(0, lineno - 1):
+
+                  def _body_eq(_ln):
+                      # posisi '=' BADAN (terakhir di luar kurung, bukan ==/!=/<=/>=/===)
+                      _pd = 0; _beq = -1; _k = 0
+                      while _k < len(_ln):
+                          _c = _ln[_k]
+                          if _c == '(':
+                              _pd += 1
+                          elif _c == ')':
+                              _pd = max(0, _pd - 1)
+                          elif _c == '=' and _pd <= 0:
+                              _pv = _ln[_k - 1] if _k > 0 else ''
+                              _nx = _ln[_k + 1] if _k + 1 < len(_ln) else ''
+                              if _pv in ('=', '!', '<', '>') or _nx == '=':
+                                  pass
+                              else:
+                                  _beq = _k
+                          _k += 1
+                      return _beq
+
+                  # 1) header fun badan-ekspresi pembungkus baris error = fun
+                  #    PERTAMA di atas baris error; header tanpa '=' badan =
+                  #    bukan punya fungsi ini → fail-open.
+                  hdr = -1
+                  for _j in range(lineno - 1, max(-1, lineno - 121), -1):
+                      _sl = stripped[_j]
+                      if not _sl.strip():
+                          continue
+                      if re.search(r'\bfun\s+[A-Za-z_]', _sl):
+                          if _body_eq(_sl) > 0:
+                              hdr = _j
+                          break
+                  if hdr < 0:
+                      return 0
+                  _beq = _body_eq(stripped[hdr])
+                  if _beq < 1 or lines0[hdr][_beq:_beq + 1] != '=':
+                      return 0
+                  # 2) GUARD tipe balik eksplisit: antara ')' terakhir dan '='
+                  #    harus ada ':' (…): T =
+                  if not re.search(r'\)\s*:', stripped[hdr][:_beq]):
+                      return 0
+                  # 3) batas akhir expr: hitung { } di stripped mulai setelah
+                  #    '='; tiap depth balik ke 0 cek kelanjutan (sisa baris /
+                  #    baris berikut mulai catch/finally/'.' ) — kelanjutan =
+                  #    expr masih jalan.
+                  depth = 0; saw_open = False; end_line = -1
+                  for _j in range(hdr, min(n0, hdr + 400)):
                       _ln = stripped[_j]
-                      _k = 0
+                      _k = (_beq + 1) if _j == hdr else 0
                       while _k < len(_ln):
                           _c = _ln[_k]
                           if _c == '{':
-                              _pre = _ln[:_k]
-                              _lbl = None
-                              _mm = re.search(r'([A-Za-z_][A-Za-z0-9_]*)\s*(?:\([^()]*(?:\([^()]*\))?[^()]*\))?\s*$', _pre)
-                              if _mm and _mm.group(1).lower() not in _kw:
-                                  if not re.search(r'\b(?:fun|class|interface|object|enum|companion|init|constructor|get|set)\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:\([^()]*(?:\([^()]*\))?[^()]*\))?\s*$', _pre):
-                                      _lbl = _mm.group(1)
-                              _stack.append(_lbl)
+                              depth += 1; saw_open = True
                           elif _c == '}':
-                              if _stack:
-                                  _stack.pop()
+                              depth -= 1
+                              if saw_open and depth <= 0:
+                                  _rest = _ln[_k + 1:].strip()
+                                  _nj = _j + 1
+                                  while _nj < n0 and not stripped[_nj].strip():
+                                      _nj += 1
+                                  _nx = stripped[_nj].lstrip() if _nj < n0 else ''
+                                  if _rest.startswith(('.', 'catch', 'finally')) or _nx.startswith(('catch', 'finally', '.', '?.')):
+                                      depth = 0; saw_open = False
+                                      _k += 1
+                                      continue
+                                  end_line = _j
+                                  break
                           _k += 1
-                  _label = None
-                  for _sl in reversed(_stack):
-                      if _sl:
-                          _label = _sl
+                      if end_line >= 0:
                           break
-                  if not _label:
+                  if end_line < 0 or end_line < lineno - 1:
                       return 0
-                  lines0[lineno - 1] = line[:i + 6] + '@' + _label + line[i + 6:]
+                  # 4) robah: header '=' → '{ return'; akhir expr ditutup ' }';
+                  #    dalam range fungsi, return@bad_label → return.
+                  _hr = lines0[hdr]
+                  _tail = _hr[_beq + 1:].strip()
+                  lines0[hdr] = _hr[:_beq].rstrip() + ' { return ' + (_tail + ' ' if _tail else '')
+                  _nfix = 0
+                  if bad_label:
+                      for _j in range(hdr, end_line + 1):
+                          if re.search(r'return@' + re.escape(bad_label) + r'\b', lines0[_j]):
+                              lines0[_j] = re.sub(r'return@' + re.escape(bad_label) + r'\b', 'return', lines0[_j])
+                              _nfix += 1
+                  lines0[end_line] = lines0[end_line].rstrip() + ' }'
                   open(path, 'w', encoding='utf-8').write('\n'.join(lines0))
-                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' return -> return@' + _label)
+                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(hdr + 1) + ' badan-ekspresi -> badan-blok (ronde 8)' + (' + lepas @' + bad_label if bad_label else ''))
                   return 1
 
               def kt_fix_type_const(path, lineno, col, sym):
@@ -1927,12 +1983,17 @@ jobs:
                       if _msc and kt_fix_smartcast_closure(fp, aline, acol, _msc.group(1)) > 0:
                           applied.append('smartcast ' + _msc.group(1) + ' -> ' + os.path.basename(fp) + ':' + str(aline))
                   if 'Returns are not allowed for functions with expression body' in msg or "'return' is not allowed here" in msg:
-                      # dua pesan, satu akar: bare return di lambda —
-                      # inline (run/let/...) di badan-ekspresi = pesan 1;
-                      # non-inline (withContext/map/...) = pesan 2.
-                      # Heal sama: label lambda terdekat (return@withContext).
+                      # v4.64 ronde 8: heal = badan-ekspresi -> badan-blok
+                      # (bukan label lagi — bukti run #60, label nama
+                      # superclass = Unresolved reference: @AccessibilityService)
                       if kt_fix_exprbody_return(fp, aline, acol) > 0:
                           applied.append('return-body -> ' + os.path.basename(fp) + ':' + str(aline))
+                  _mbad = re.search(r'Unresolved reference: @(\w+)', msg)
+                  if _mbad:
+                      # v4.64 ronde 8: return@X rusak sisa percobaan sebelumnya
+                      # (ronde 6/7) — lepas label X + badan-blok sekalian.
+                      if kt_fix_exprbody_return(fp, aline, acol, _mbad.group(1)) > 0:
+                          applied.append('lepas-label -> ' + os.path.basename(fp) + ':' + str(aline))
                   if 'com.google.mlkit.nl.' in (kt_read(fp) or ''):
                       kt_fix_mlkit(fp)
                   if mref and mref.group(1) in KT_NOOP_MEMBERS:
@@ -1941,7 +2002,7 @@ jobs:
                       continue   # biasanya sembuh sendiri begitu import launch masuk
                   if re.search(r'Unresolved reference: (findNodeByText|findEditableNode|suspendTapGesture)', msg):
                       kt_acc_inject(fp)
-              kt_notes = [a for a in applied if a.startswith(('import ', 'helper ', 'inline-FQN ', 'null-safe ', '!! type-mismatch ', 'typo mlkit ', 'dependency ', 'member ', 'override ', 'forEach ', 'FQN chain ', 'revert ', 'type-args ', 'smartcast ', 'return-body ', 'Icons ', 'type-const ', 'bool-cond '))]
+              kt_notes = [a for a in applied if a.startswith(('import ', 'helper ', 'inline-FQN ', 'null-safe ', '!! type-mismatch ', 'typo mlkit ', 'dependency ', 'member ', 'override ', 'forEach ', 'FQN chain ', 'revert ', 'type-args ', 'smartcast ', 'return-body ', 'lepas-label ', 'Icons ', 'type-const ', 'bool-cond '))]
               if kt_notes:
                   print('KFIX-KT: ' + str(len(kt_notes)) + ' perbaikan source Kotlin')
                   for _n in kt_notes[:15]:
