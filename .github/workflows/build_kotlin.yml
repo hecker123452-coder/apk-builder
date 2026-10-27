@@ -1375,15 +1375,71 @@ jobs:
                                   'onEach', 'reduce', 'catch', 'onSuccess', 'onFailure', 'getOrDefault',
                                   'sortedBy', 'groupBy', 'associateBy', 'count', 'find', 'findLast')
 
+              def kt_strip_code(src):
+                  # v4.64 dokter ronde 7: mask string/comment TANPA geser kolom —
+                  # kurung { } di dalam literal ("{", // komentar) bikin hitungan
+                  # stack meleset (akar KFIX=0 di run #54/#55). Template ${...}
+                  # tetap kebaca (kurungnya nyata).
+                  out = []
+                  i, n = 0, len(src)
+                  mode = 0  # 0=code 1=line-comment 2=block-comment 3=string 4=char 5=raw-string 6=template
+                  tdepth = 0
+                  while i < n:
+                      c = src[i]
+                      nxt = src[i + 1] if i + 1 < n else ''
+                      if mode == 0:
+                          if c == '/' and nxt == '/':
+                              mode = 1; out.append('  '); i += 2; continue
+                          if c == '/' and nxt == '*':
+                              mode = 2; out.append('  '); i += 2; continue
+                          if src.startswith('"""', i):
+                              mode = 5; out.append('   '); i += 3; continue
+                          if c == '"':
+                              mode = 3; out.append(' '); i += 1; continue
+                          if c == "'":
+                              mode = 4; out.append(' '); i += 1; continue
+                          out.append(c); i += 1; continue
+                      if mode == 1:
+                          if c == '\n':
+                              mode = 0; out.append('\n')
+                          else:
+                              out.append(' ')
+                          i += 1; continue
+                      if mode == 2:
+                          if c == '*' and nxt == '/':
+                              mode = 0; out.append('  '); i += 2; continue
+                          out.append(c if c == '\n' else ' '); i += 1; continue
+                      if mode == 5:
+                          if src.startswith('"""', i):
+                              mode = 0; out.append('   '); i += 3; continue
+                          out.append(c if c == '\n' else ' '); i += 1; continue
+                      if mode in (3, 4):
+                          if c == '\\' and nxt:
+                              out.append('  '); i += 2; continue
+                          if (mode == 3 and c == '"') or (mode == 4 and c == "'"):
+                              mode = 0; out.append(' '); i += 1; continue
+                          if mode == 3 and c == '$' and nxt == '{':
+                              mode = 6; tdepth = 1; out.append('  '); i += 2; continue
+                          out.append(c if c == '\n' else ' '); i += 1; continue
+                      if mode == 6:
+                          if c == '{':
+                              tdepth += 1
+                          elif c == '}':
+                              tdepth -= 1
+                              if tdepth <= 0:
+                                  mode = 3
+                          out.append(c); i += 1; continue
+                  return ''.join(out)
+
               def kt_fix_exprbody_return(path, lineno, col):
-                  # v4.63 dokter ronde 6 (bukti run #49 NovaAgent 278/280/281):
-                  # "Returns are not allowed for functions with expression
-                  # body" — bare return di lambda inline yang nempel di
-                  # badan-ekspresi (`fun f() = withContext { ... return x }`).
-                  # Fix: kasih label lambda inline terdekat yang masih kebuka
-                  # (return@withContext x) — semantik sama krn hasil lambda =
-                  # hasil fun (badan-ekspresi gak punya kode sesudah lambda).
-                  # Gak nemu lambda inline = 0 (jujur, gak nebak-nebak).
+                  # v4.64 dokter ronde 7 (R2 dari ronde 6 — bukti run #54/#55
+                  # NovaAgent 278/280/281 & 296/298/299 masih mati): ronde 6
+                  # cuma kenal daftar lambda + hitung kurung NAIF — string/
+                  # comment berisi `{` bikin depth meleset, lambda di luar
+                  # daftar gak kebaca → KFIX=0, build mati 2 percobaan.
+                  # R2: (1) kurung dihitung di source yang udah di-strip;
+                  # (2) label = identifier APAPUN tepat sebelum `{` (guard:
+                  # keyword + fun/class/object = bukan lambda); (3) gak nemu = 0.
                   s0 = kt_read(path)
                   if s0 is None:
                       return 0
@@ -1398,22 +1454,31 @@ jobs:
                           return 0
                   if line[i + 6:i + 7] == '@':
                       return 0
-                  # stack kurung dari atas file → label lambda inline terdalam
-                  # yang masih kebuka di baris error
+                  stripped = kt_strip_code(s0).split('\n')
+                  while len(stripped) < len(lines0):
+                      stripped.append('')
+                  _kw = set(('if', 'else', 'for', 'while', 'when', 'try', 'catch', 'finally',
+                             'do', 'switch', 'fun', 'class', 'interface', 'object', 'enum',
+                             'companion', 'init', 'constructor', 'get', 'set', 'val', 'var',
+                             'return', 'super', 'this'))
                   _stack = []
-                  _lbl_re = re.compile(r'\b(' + '|'.join(KT_INLINE_LAMBDA) + r')\s*(?:\([^()]*\))?\s*(?:\{|$)')
                   for _j in range(0, lineno - 1):
-                      _ln = lines0[_j]
-                      _lbl_here = None
-                      _m = _lbl_re.search(_ln)
-                      if _m:
-                          _lbl_here = _m.group(1)
-                      for _ch in _ln:
-                          if _ch == '{':
-                              _stack.append(_lbl_here)
-                          elif _ch == '}':
+                      _ln = stripped[_j]
+                      _k = 0
+                      while _k < len(_ln):
+                          _c = _ln[_k]
+                          if _c == '{':
+                              _pre = _ln[:_k]
+                              _lbl = None
+                              _mm = re.search(r'([A-Za-z_][A-Za-z0-9_]*)\s*(?:\([^()]*(?:\([^()]*\))?[^()]*\))?\s*$', _pre)
+                              if _mm and _mm.group(1).lower() not in _kw:
+                                  if not re.search(r'\b(?:fun|class|interface|object|enum|companion|init|constructor|get|set)\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:\([^()]*(?:\([^()]*\))?[^()]*\))?\s*$', _pre):
+                                      _lbl = _mm.group(1)
+                              _stack.append(_lbl)
+                          elif _c == '}':
                               if _stack:
                                   _stack.pop()
+                          _k += 1
                   _label = None
                   for _sl in reversed(_stack):
                       if _sl:
@@ -1424,6 +1489,62 @@ jobs:
                   lines0[lineno - 1] = line[:i + 6] + '@' + _label + line[i + 6:]
                   open(path, 'w', encoding='utf-8').write('\n'.join(lines0))
                   print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' return -> return@' + _label)
+                  return 1
+
+              def kt_fix_type_const(path, lineno, col, sym):
+                  # v4.64 dokter ronde 7 (bukti run #55 NovaAgent 155/156):
+                  # "Unresolved reference: TYPE_STATUS_BAR / TYPE_NAVIGATION_BAR"
+                  # = konstanta GAK ADA di kelasnya (AOSP AccessibilityWindowInfo
+                  # cuma punya TYPE_APPLICATION..TYPE_WINDOW_CONTROL — nama API
+                  # halusinasi AI). Heal jujur-minimal: ganti simbol dgn -1
+                  # (int, comparison jadi dead-check — platform memang gak
+                  # punya tipe itu, jadi gak ada perilaku yang ilang).
+                  # GUARD: tepat sebelum simbol ada `Recv.` (akses member).
+                  s0 = kt_read(path)
+                  if s0 is None:
+                      return 0
+                  lines0 = s0.split('\n')
+                  if not (1 <= lineno <= len(lines0)):
+                      return 0
+                  line = lines0[lineno - 1]
+                  i = col - 1
+                  if not (0 <= i < len(line)) or not line.startswith(sym, i):
+                      i = line.find(sym)
+                      if i < 0:
+                          return 0
+                      if re.match(r'\w', line[i + len(sym):i + len(sym) + 1]):
+                          return 0
+                  if i < 1 or line[i - 1:i] != '.':
+                      return 0
+                  lines0[lineno - 1] = line[:i] + '-1' + line[i + len(sym):]
+                  open(path, 'w', encoding='utf-8').write('\n'.join(lines0))
+                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' ' + sym + ' -> -1 (konstanta gak ada)')
+                  return 1
+
+              def kt_fix_unresolved_boolcond(path, lineno, col, sym):
+                  # v4.64 dokter ronde 7 (bukti run #55 ComicUi 384):
+                  # "Unresolved reference: filled" dipake sbg kondisi
+                  # `if (filled)` = variabel gak pernah dideklarasiin.
+                  # Definisi gak bisa ditebak → heal minimal: kondisi jadi
+                  # `false` (compile pasti; early-return jadi skip).
+                  # GUARD: baris persis bentuk if( sym ).
+                  s0 = kt_read(path)
+                  if s0 is None:
+                      return 0
+                  lines0 = s0.split('\n')
+                  if not (1 <= lineno <= len(lines0)):
+                      return 0
+                  line = lines0[lineno - 1]
+                  i = col - 1
+                  if not (0 <= i < len(line)) or not line.startswith(sym, i):
+                      return 0
+                  _pre = line[:i]
+                  _post = line[i + len(sym):]
+                  if not re.search(r'\bif\s*\(\s*$', _pre) or not re.match(r'\s*\)', _post):
+                      return 0
+                  lines0[lineno - 1] = _pre + 'false' + _post
+                  open(path, 'w', encoding='utf-8').write('\n'.join(lines0))
+                  print('KFIX-DIAG: ' + os.path.basename(path) + ':' + str(lineno) + ' if(' + sym + ') -> if(false)')
                   return 1
 
               def kt_add_override(path, lineno):
@@ -1725,6 +1846,17 @@ jobs:
                       if mref and sym in ICON_SETS_LOWER and kt_fix_icons_case(fp, aline, acol, sym) > 0:
                           applied.append('Icons ' + sym + ' -> Icons.' + ICON_SETS_LOWER[sym] + ' @' + os.path.basename(fp))
                           mref = None
+                      # v4.64 ronde 7: konstanta TYPE_* yang GAK ADA di kelas
+                      # (halu AI) → -1 (dead-check, compile pasti)
+                      if mref and re.match(r'^TYPE_[A-Z0-9_]+$', sym or ''):
+                          if kt_fix_type_const(fp, aline, acol, sym) > 0:
+                              applied.append('type-const ' + sym + ' -> -1 @' + os.path.basename(fp))
+                              mref = None
+                      # v4.64 ronde 7: unresolved var sbg kondisi if(X)
+                      # (ComicUi 384 `if (filled)`) → kondisi false
+                      if mref and kt_fix_unresolved_boolcond(fp, aline, acol, sym) > 0:
+                          applied.append('bool-cond ' + sym + ' -> false @' + os.path.basename(fp))
+                          mref = None
                   if mref:
                       sym = mref.group(1)
                       fq = KT_IMPORT_MAP.get(sym)
@@ -1795,7 +1927,7 @@ jobs:
                       continue   # biasanya sembuh sendiri begitu import launch masuk
                   if re.search(r'Unresolved reference: (findNodeByText|findEditableNode|suspendTapGesture)', msg):
                       kt_acc_inject(fp)
-              kt_notes = [a for a in applied if a.startswith(('import ', 'helper ', 'inline-FQN ', 'null-safe ', '!! type-mismatch ', 'typo mlkit ', 'dependency ', 'member ', 'override ', 'forEach ', 'FQN chain ', 'revert ', 'type-args ', 'smartcast ', 'return-body ', 'Icons '))]
+              kt_notes = [a for a in applied if a.startswith(('import ', 'helper ', 'inline-FQN ', 'null-safe ', '!! type-mismatch ', 'typo mlkit ', 'dependency ', 'member ', 'override ', 'forEach ', 'FQN chain ', 'revert ', 'type-args ', 'smartcast ', 'return-body ', 'Icons ', 'type-const ', 'bool-cond '))]
               if kt_notes:
                   print('KFIX-KT: ' + str(len(kt_notes)) + ' perbaikan source Kotlin')
                   for _n in kt_notes[:15]:
@@ -1804,10 +1936,10 @@ jobs:
           # v4.63: observabilitas — dokter gak punya pola = dump baris
           # sumber error ke log, biar blind-spot kebaca tanpa nebak-nebak
           # (pelajaran run #49: 3 kelas error baru, sumber gak pernah keliatan)
-          if not applied and kt_seen:
+          if kt_seen:
               _dumped = 0
               for (_dp, _dl, _dc, _dm) in kt_seen:
-                  if _dumped >= 10:
+                  if _dumped >= 4:
                       break
                   _dfp = kt_resolve_path(_dp)
                   if not _dfp:
@@ -1815,6 +1947,10 @@ jobs:
                   _dls = (kt_read(_dfp) or '').split('\n')
                   if 1 <= _dl <= len(_dls):
                       print('KFIX-CTX: ' + os.path.basename(_dfp) + ':' + str(_dl) + ':' + str(_dc) + ' | ' + _dls[_dl - 1].strip()[:180])
+                      for _cl in range(max(1, _dl - 8), min(len(_dls), _dl + 8) + 1):
+                          if _cl == _dl:
+                              continue
+                          print('KFIX-CTX:   ' + str(_cl) + ' | ' + _dls[_cl - 1].strip()[:150])
                       _dumped += 1
           print('KFIX: ' + ('; '.join(applied) if applied else 'gak ada pola error yang kebaca'))
           print('KFIX_APPLIED=' + str(len(applied)))
