@@ -2694,7 +2694,7 @@ jobs:
                   r = sh(["keytool", "-genkeypair", "-v", "-keystore", "/tmp/guard_ks.jks",
                           "-alias", "dzr", "-keyalg", "RSA", "-keysize", "2048",
                           "-validity", "10950", "-storepass", KS_PASS, "-keypass", KS_PASS,
-                          "-dname", "CN=DZR CloudBuilder, OU=Deruzuan, O=DZR, L=Jakarta, C=ID"])
+                          "-dname", "CN=DZR CloudBuilder, OU=DZR, O=DZR, L=Jakarta, C=ID"])
                   if r.returncode != 0 or not os.path.exists("/tmp/guard_ks.jks") or os.path.getsize("/tmp/guard_ks.jks") == 0:
                       fail("gak bisa generate keystore (keytool): " + r.stderr.decode("utf-8", "replace")[:200])
               if OFFLINE:
@@ -3240,7 +3240,7 @@ jobs:
             echo "Keystore belum ada — generate BARU + commit TERENKRIPSI ($KS_ENC)..."
             keytool -genkeypair -v -keystore "$KS" -alias dzr -keyalg RSA -keysize 2048 \
               -validity 10950 -storepass "$KS_PASS" -keypass "$KS_PASS" \
-              -dname "CN=${{ inputs.brand || 'DZR CloudBuilder' }}, OU=Deruzuan, O=${{ inputs.brand || 'DZR' }}, L=Jakarta, C=ID" >/dev/null 2>&1
+              -dname "CN=${{ inputs.brand || 'DZR CloudBuilder' }}, OU=DZR, O=${{ inputs.brand || 'DZR' }}, L=Jakarta, C=ID" >/dev/null 2>&1
             ENC_B64=$(openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -in "$KS" -pass pass:"$KS_ENC_KEY" | base64 -w0)
             PAYLOAD=$(python3 -c "import json,sys;print(json.dumps({'message':'chore: stable signing keystore (encrypted at rest)','content':sys.argv[1],'branch':'main'}))" "$ENC_B64")
             PUT_HTTP=$(curl -sL -o /tmp/ks_put.json -w "%{http_code}" -X PUT \
