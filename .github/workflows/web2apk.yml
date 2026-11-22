@@ -200,7 +200,7 @@ on:
       package_name:
         description: 'Package Name'
         required: false
-        default: 'com.deruzuan.webapp'
+        default: 'com.dzr.webapp'
       icon_url:
         description: 'Icon URL (direct download URL asset, bukan halaman release!)'
         required: false
@@ -448,7 +448,7 @@ jobs:
           # ── Sanitize inputs ──
           SAFE_APP_NAME=$(echo "$INPUT_APP_NAME" | sed 's/[^a-zA-Z0-9 _.-]//g')
           SAFE_PKG=$(echo "$INPUT_PACKAGE_NAME" | sed 's/[^a-zA-Z0-9.]//g' | sed 's/^\.*//' | sed 's/\.*$//')
-          [ -z "$SAFE_PKG" ] && SAFE_PKG="com.deruzuan.webapp"
+          [ -z "$SAFE_PKG" ] && SAFE_PKG="com.dzr.webapp"
           [ -z "$SAFE_APP_NAME" ] && SAFE_APP_NAME="WebApp"
 
           PROJ_NAME=$(echo "$SAFE_PKG" | rev | cut -d. -f1 | rev | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]//g')
@@ -2497,7 +2497,7 @@ jobs:
           pkg_raw = os.environ.get('INPUT_PACKAGE_NAME', '') or ''
           pkg_clean = re.sub(r'[^A-Za-z0-9.]', '', pkg_raw).strip('.')
           if not pkg_clean:
-              pkg_clean = 'com.deruzuan.webapp'
+              pkg_clean = 'com.dzr.webapp'
           ota_on = str(os.environ.get('INPUT_OTA_ENABLED', '0') or '0').strip().lower() in ('1', 'true', 'yes')
           update_url_safe = ''
           if ota_on and slug.strip():
@@ -3925,7 +3925,7 @@ jobs:
                   r = sh(["keytool", "-genkeypair", "-v", "-keystore", "/tmp/guard_ks.jks",
                           "-alias", "dzr", "-keyalg", "RSA", "-keysize", "2048",
                           "-validity", "10950", "-storepass", KS_PASS, "-keypass", KS_PASS,
-                          "-dname", "CN=DZR CloudBuilder, OU=Deruzuan, O=DZR, L=Jakarta, C=ID"])
+                          "-dname", "CN=DZR CloudBuilder, OU=DZR, O=DZR, L=Jakarta, C=ID"])
                   if r.returncode != 0 or not os.path.exists("/tmp/guard_ks.jks") or os.path.getsize("/tmp/guard_ks.jks") == 0:
                       fail("gak bisa generate keystore (keytool): " + r.stderr.decode("utf-8", "replace")[:200])
               if OFFLINE:
@@ -4213,7 +4213,7 @@ jobs:
             echo "🔐 Keystore belum ada — generate BARU + commit TERENKRIPSI ($KS_ENC)..."
             keytool -genkeypair -v -keystore "$KS" -alias dzr -keyalg RSA -keysize 2048 \
               -validity 10950 -storepass "$KS_PASS" -keypass "$KS_PASS" \
-              -dname "CN=DZR CloudBuilder, OU=Deruzuan, O=DZR, L=Jakarta, C=ID" >/dev/null 2>&1
+              -dname "CN=DZR CloudBuilder, OU=DZR, O=DZR, L=Jakarta, C=ID" >/dev/null 2>&1
             ENC_B64=$(openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -in "$KS" -pass pass:"$KS_ENC_KEY" | base64 -w0)
             PAYLOAD=$(python3 -c "import json,sys;print(json.dumps({'message':'chore: stable signing keystore (encrypted at rest)','content':sys.argv[1],'branch':'main'}))" "$ENC_B64")
             PUT_HTTP=$(curl -sL -o /tmp/ks_put.json -w "%{http_code}" -X PUT \
@@ -4272,7 +4272,7 @@ jobs:
           # 🚀 v5.6: + delta patch ala Play Store (asset delta-<old>-<new>.patch
           #          + field delta di build-info.json)
           PKG="$(echo "${INPUT_PACKAGE_NAME:-}" | sed 's/[^a-zA-Z0-9.]//g' | sed 's/^\.*//' | sed 's/\.*$//')"
-          [ -z "$PKG" ] && PKG="com.deruzuan.webapp"
+          [ -z "$PKG" ] && PKG="com.dzr.webapp"
           cp "$APK" /tmp/app.apk
           # SHA-256 APK signed (sumber kebenaran hash buat verifikasi app)
           APK_SHA="$(sha256sum /tmp/app.apk | cut -d' ' -f1)"
